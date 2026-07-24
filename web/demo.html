@@ -1,0 +1,259 @@
+<!doctype html>
+<!-- Tsubaki in the browser: drawing + a game loop + keyboard/mouse input, the
+     MVP game-engine slice. Wires gpu/'s existing WebGPU render pipeline
+     (async setup only, done ONCE here, before Tsubaki ever runs -- see the
+     "why" note below) to a handful of Tsubaki builtins (bin/gpuBridge.ml:
+     clear_screen/draw_rect/draw_rects/key_down/mouse_x/mouse_y/on_frame),
+     then drives a real requestAnimationFrame loop.
+
+     Serve from the REPO ROOT (`python3 -m http.server` at the top level,
+     not from web/) so the relative paths below -- ../gpu/pkg/tsubaki_gpu.js
+     and ../_build/default/bin/main.bc.wasm.js -- resolve; open
+     /web/demo.html. -->
+<meta charset="utf-8" />
+<title>tsubaki web demo</title>
+<canvas id="canvas" width="480" height="320" style="border: 1px solid #444; background: #000"></canvas>
+<pre id="out">loading...</pre>
+<script type="module">
+  import init, {
+    gpu_init,
+    configure_canvas,
+    create_render_pipeline,
+    create_buffer,
+    write_buffer,
+    begin_frame,
+    draw_frame,
+    end_frame,
+  } from "../gpu/pkg/tsubaki_gpu.js";
+
+  const out = document.getElementById("out");
+  const log = (s) => (out.textContent += "\n" + s);
+  const canvas = document.getElementById("canvas");
+
+  // A single reusable "solid rect" shader -- every draw_rect (and
+  // clear_screen, which is just a full-canvas rect under the hood) reuses
+  // this ONE pipeline. No vertex buffer, same convention every gpu/ demo
+  // already uses: 6 vertices (2 triangles) built from @builtin(vertex_index),
+  // positioned/colored by a small uniform written fresh before each draw.
+  const RECT_WGSL = `
+    struct RectParams {
+      x0: f32, y0: f32, x1: f32, y1: f32,
+      r: f32, g: f32, b: f32, a: f32,
+    };
+    @group(0) @binding(0) var<uniform> params: RectParams;
+
+    struct VertexOutput {
+      @builtin(position) position: vec4<f32>,
+    };
+
+    @vertex
+    fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
+      var corners = array<vec2<f32>, 6>(
+        vec2<f32>(params.x0, params.y0),
+        vec2<f32>(params.x1, params.y0),
+        vec2<f32>(params.x0, params.y1),
+        vec2<f32>(params.x0, params.y1),
+        vec2<f32>(params.x1, params.y0),
+        vec2<f32>(params.x1, params.y1),
+      );
+      var out: VertexOutput;
+      out.position = vec4<f32>(corners[idx], 0.0, 1.0);
+      return out;
+    }
+
+    @fragment
+    fn fs_main() -> @location(0) vec4<f32> {
+      return vec4<f32>(params.r, params.g, params.b, params.a);
+    }
+  `;
+
+  // keyboard/mouse state -- plain JS globals, queried synchronously by
+  // host_key_down/host_mouse_x/host_mouse_y (Tsubaki never sees DOM events
+  // directly, only these three sync queries, same reasoning as keeping the
+  // OCaml side entirely synchronous: no new bridging shape needed).
+  const keysDown = new Set();
+  window.addEventListener("keydown", (e) => keysDown.add(e.key));
+  window.addEventListener("keyup", (e) => keysDown.delete(e.key));
+  let mouseX = 0, mouseY = 0;
+  canvas.addEventListener("mousemove", (e) => {
+    const rect = canvas.getBoundingClientRect();
+    mouseX = e.clientX - rect.left;
+    mouseY = e.clientY - rect.top;
+  });
+  // mouse button state, backing bin/gpuBridge.ml's mouse_down -- same
+  // level-triggered "is it held" convention as keysDown above (click/drag
+  // are userland Tsubaki logic built on top of this plus mouseX/mouseY).
+  const mouseButtonNames = { 0: "left", 1: "middle", 2: "right" };
+  const mouseButtonsDown = new Set();
+  canvas.addEventListener("mousedown", (e) => mouseButtonsDown.add(mouseButtonNames[e.button] ?? String(e.button)));
+  window.addEventListener("mouseup", (e) => mouseButtonsDown.delete(mouseButtonNames[e.button] ?? String(e.button)));
+
+  // Audio -- one AudioContext for the whole page, backing
+  // bin/audioBridge.ml's play_tone. Browsers block audio before a user
+  // gesture, so resume() on the first keydown/mousemove (this page already
+  // listens for both, right above).
+  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  window.addEventListener("keydown", () => audioCtx.resume(), { once: true });
+  canvas.addEventListener("mousemove", () => audioCtx.resume(), { once: true });
+
+  try {
+    await init();
+    out.textContent = "wasm loaded, requesting GPU...";
+    await gpu_init(undefined, canvas);
+    configure_canvas(canvas, canvas.width, canvas.height, "opaque");
+    const pipeline = await create_render_pipeline(RECT_WGSL, "vs_main", "fs_main", ["uniform"], "triangle-list", "replace");
+    log("gpu ready, pipeline=" + pipeline);
+
+    // Per-draw uniform buffer pool -- begin_frame/draw_frame/end_frame batch
+    // every draw of a frame into ONE command encoder that only actually runs
+    // at end_frame's single queue.submit, but write_buffer (queue.write_buffer)
+    // runs eagerly, in call order, ahead of that submit. A single reused
+    // paramsBuf therefore holds only the LAST draw's params by the time any
+    // of the frame's draws execute on the GPU -- every rect in a frame would
+    // render with the last rect's position/color. Fix: one buffer per draw,
+    // reset to the front of the pool at the start of each frame (see
+    // `paramsBufIndex = 0` in `tick` below), growing on demand.
+    const paramsBufs = [];
+    let paramsBufIndex = 0;
+    const nextParamsBuf = () => {
+      if (paramsBufIndex >= paramsBufs.length) paramsBufs.push(create_buffer(8 * 4, "uniform")); // 8 f32 fields
+      return paramsBufs[paramsBufIndex++];
+    };
+
+    // pixel-space (top-left origin, y-down) -> WebGPU clip space (y-up) --
+    // the one piece of coordinate-system translation Tsubaki scripts never
+    // have to think about.
+    const toNdc = (x, y, w, h) => {
+      const x0 = (x / canvas.width) * 2 - 1;
+      const x1 = ((x + w) / canvas.width) * 2 - 1;
+      const y0 = 1 - (y / canvas.height) * 2;
+      const y1 = 1 - ((y + h) / canvas.height) * 2;
+      return [x0, y0, x1, y1];
+    };
+
+    const drawRect = (x, y, w, h, r, g, b, a) => {
+      const [x0, y0, x1, y1] = toNdc(x, y, w, h);
+      const buf = nextParamsBuf();
+      write_buffer(buf, new Float32Array([x0, y0, x1, y1, r, g, b, a]));
+      draw_frame(pipeline, new Uint32Array([buf]), 6, 1);
+    };
+
+    // --- the sync host_* functions bin/gpuBridge.ml calls into ---
+    globalThis.host_gpu_clear = (r, g, b) => drawRect(0, 0, canvas.width, canvas.height, r, g, b, 1.0);
+    globalThis.host_gpu_draw_rect = (x, y, w, h, r, g, b, a) => drawRect(x, y, w, h, r, g, b, a);
+    // bin/gpuBridge.ml's draw_rects: one FFI crossing for N rects instead of
+    // N (matters once entity counts get into the hundreds) -- `flat` is a
+    // Float64Array of [x,y,w,h,r,g,b,a] repeated per rect, same field order
+    // and units as draw_rect above, just concatenated.
+    globalThis.host_gpu_draw_rects = (flat) => {
+      for (let i = 0; i + 8 <= flat.length; i += 8) {
+        drawRect(flat[i], flat[i + 1], flat[i + 2], flat[i + 3], flat[i + 4], flat[i + 5], flat[i + 6], flat[i + 7]);
+      }
+    };
+    globalThis.host_key_down = (name) => keysDown.has(name);
+    globalThis.host_mouse_x = () => mouseX;
+    globalThis.host_mouse_y = () => mouseY;
+    globalThis.host_mouse_down = (button) => mouseButtonsDown.has(button);
+
+    // --- the sync host_audio_tone bin/audioBridge.ml calls into ---
+    globalThis.host_audio_tone = (freq, duration, volume, wave) => {
+      log(`tone: ${freq}Hz for ${duration}s`); // visual trace even if you can't hear it
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = wave;
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(volume, audioCtx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + duration);
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+      osc.start();
+      osc.stop(audioCtx.currentTime + duration);
+    };
+
+    // --- physics/ : the SAME .wasm preload.js loads for Node (raw
+    // wasm32-unknown-unknown, no wasm-bindgen needed -- no web-sys/DOM
+    // dependency), just fetched here instead of read from disk. See
+    // bin/physicsBridge.ml for the Tsubaki-facing side. ---
+    const physicsBytes = await (await fetch("../physics/target/wasm32-unknown-unknown/release/tsubaki_physics.wasm")).arrayBuffer();
+    const { instance: physicsInstance } = await WebAssembly.instantiate(physicsBytes, {});
+    const {
+      wasm_alloc: physicsAlloc,
+      physics_world_new,
+      physics_add_circle,
+      physics_add_box,
+      physics_set_velocity,
+      physics_remove,
+      physics_body_count,
+      physics_step,
+      physics_get_bodies,
+      memory: physicsMemory,
+    } = physicsInstance.exports;
+
+    globalThis.host_physics_world_new = (gx, gy) => physics_world_new(gx, gy);
+    globalThis.host_physics_add_circle = (world, x, y, vx, vy, radius, mass, restitution) =>
+      physics_add_circle(world, x, y, vx, vy, radius, mass, restitution);
+    globalThis.host_physics_add_box = (world, x, y, vx, vy, hw, hh, mass, restitution) =>
+      physics_add_box(world, x, y, vx, vy, hw, hh, mass, restitution);
+    globalThis.host_physics_set_velocity = (world, body, vx, vy) => physics_set_velocity(world, body, vx, vy);
+    globalThis.host_physics_remove = (world, body) => physics_remove(world, body);
+    globalThis.host_physics_body_count = (world) => physics_body_count(world);
+    globalThis.host_physics_step = (world, dt) => physics_step(world, dt);
+    globalThis.host_physics_get_bodies = (world, n) => {
+      const outPtr = physicsAlloc(n * 4 * 8);
+      physics_get_bodies(world, outPtr);
+      const result = new Float64Array(n * 4);
+      result.set(new Float64Array(physicsMemory.buffer, outPtr, n * 4));
+      return result;
+    };
+
+    // Tsubaki's own program text -- fetched from a query param (?src=path.jl)
+    // or falls back to the bundled move_rect demo.
+    const params = new URLSearchParams(location.search);
+    const srcPath = params.get("src") || "../examples/move_rect.jl";
+    globalThis.tsubakiSource = await (await fetch(srcPath)).text();
+    // where that source lives, so Tsubaki's `include("sibling.jl")` can resolve
+    // against it (bin/main.ml reads this; see Eval's include).
+    globalThis.tsubakiSourcePath = srcPath;
+
+    // `include` must hand the interpreter a file's text SYNCHRONOUSLY (it runs
+    // mid-evaluation, and fetch is async), so the browser backs host_read_file
+    // with a synchronous XHR -- the one place a browser can still block on a
+    // read. preload.js backs the same host name with fs.readFileSync for Node.
+    globalThis.host_read_file = (path) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("GET", path, false);
+      xhr.send();
+      if (xhr.status !== 0 && (xhr.status < 200 || xhr.status >= 300))
+        throw new Error("include: HTTP " + xhr.status + " for " + path);
+      return xhr.responseText;
+    };
+
+    log("loading Tsubaki program: " + srcPath);
+
+    // main.bc.wasm.js reads globalThis.tsubakiSource at load time (see
+    // bin/main.ml's browser branch) -- must be set before this loads.
+    const juliaScript = document.createElement("script");
+    juliaScript.src = "../_build/default/bin/main.bc.wasm.js";
+    document.body.appendChild(juliaScript);
+
+    juliaScript.onload = () => {
+      log("tsubaki loaded, starting game loop");
+      let last = 0;
+      const tick = (now) => {
+        // dt in seconds from the rAF timestamp (a performance.now()-style
+        // DOMHighResTimeStamp); first frame gets 0 so nothing integrates a huge step
+        const dt = last ? (now - last) / 1000 : 0;
+        last = now;
+        paramsBufIndex = 0; // reclaim this frame's buffer pool before any drawRect call
+        begin_frame(0, 0, 0, 1);
+        if (typeof globalThis.tsubakiRunFrame === "function") globalThis.tsubakiRunFrame(dt);
+        end_frame();
+        requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    };
+  } catch (e) {
+    log("ERROR: " + e);
+    console.error(e);
+  }
+</script>

@@ -1,0 +1,319 @@
+<!doctype html>
+<!-- Real (browser/system) font rendering on top of web/demo.html's fixed-
+     function 2D renderer -- adds text_texture/draw_texture (bin/gpuBridge.ml)
+     alongside the existing clear_screen/draw_rect(s)/draw_text(bitmap)/
+     key_down/mouse_x/mouse_y/mouse_down/on_frame wiring, which this page
+     copies verbatim from web/demo.html (left untouched) rather than
+     restructuring it.
+
+     text_texture(text, font, size) rasterizes via an offscreen Canvas2D
+     (real font shaping/hinting/antialiasing -- not reimplemented here),
+     uploads the pixels as a GPU texture (gpu/'s own create_texture, same
+     wasm-bindgen export web/gpu-compute-demo.html already uses), and
+     caches by (text,font,size) so a label that doesn't change every frame
+     isn't re-rasterized/re-uploaded every frame. draw_texture(x,y,w,h,
+     handle,r,g,b,a) draws it through a SEPARATE textured-quad render
+     pipeline (TEXT_WGSL below) that tints the sampled texture by (r,g,b,a)
+     -- the texture itself is just a white-ink-on-transparent alpha mask,
+     so the same cached texture can be redrawn in a different color without
+     re-rasterizing.
+
+     Serve from the REPO ROOT (`python3 -m http.server` at the top level,
+     not from web/) so the relative paths below resolve; open
+     /web/text-demo.html. -->
+<meta charset="utf-8" />
+<title>tsubaki text demo</title>
+<canvas id="canvas" width="480" height="320" style="border: 1px solid #444; background: #000"></canvas>
+<pre id="out">loading...</pre>
+<script type="module">
+  import init, {
+    gpu_init,
+    configure_canvas,
+    create_render_pipeline,
+    create_buffer,
+    write_buffer,
+    create_texture,
+    destroy_texture,
+    create_sampler,
+    begin_frame,
+    draw_frame,
+    end_frame,
+  } from "../gpu/pkg/tsubaki_gpu.js";
+
+  const out = document.getElementById("out");
+  const log = (s) => (out.textContent += "\n" + s);
+  const canvas = document.getElementById("canvas");
+
+  // --- same solid-rect pipeline as web/demo.html, verbatim (backs
+  // clear_screen/draw_rect(s)/draw_text) ---
+  const RECT_WGSL = `
+    struct RectParams {
+      x0: f32, y0: f32, x1: f32, y1: f32,
+      r: f32, g: f32, b: f32, a: f32,
+    };
+    @group(0) @binding(0) var<uniform> params: RectParams;
+
+    struct VertexOutput {
+      @builtin(position) position: vec4<f32>,
+    };
+
+    @vertex
+    fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
+      var corners = array<vec2<f32>, 6>(
+        vec2<f32>(params.x0, params.y0),
+        vec2<f32>(params.x1, params.y0),
+        vec2<f32>(params.x0, params.y1),
+        vec2<f32>(params.x0, params.y1),
+        vec2<f32>(params.x1, params.y0),
+        vec2<f32>(params.x1, params.y1),
+      );
+      var out: VertexOutput;
+      out.position = vec4<f32>(corners[idx], 0.0, 1.0);
+      return out;
+    }
+
+    @fragment
+    fn fs_main() -> @location(0) vec4<f32> {
+      return vec4<f32>(params.r, params.g, params.b, params.a);
+    }
+  `;
+
+  // --- NEW: textured-quad pipeline backing text_texture/draw_texture.
+  // Same 6-vertex full-quad trick as RECT_WGSL, plus per-vertex UV so the
+  // fragment stage can sample the glyph texture; (r,g,b,a) in the uniform
+  // TINTS the sampled texture (multiply) rather than describing a solid
+  // fill -- the texture itself is white ink on a transparent background
+  // (see host_text_texture below), so this is how draw_texture actually
+  // colors it. binding_kinds = ["uniform","texture","sampler"], in THAT
+  // order -- must match gpu/src/lib.rs's BindGroupLayoutEntry order
+  // exactly (binding i = binding_kinds[i]), and draw_frame's own
+  // resource_handles array below is built in the same order. Blend mode is
+  // "alpha" (not "replace" like RECT_WGSL) so a glyph's antialiased edges
+  // (partial alpha from Canvas2D's own font rendering) composite over
+  // whatever's already drawn instead of overwriting it. -->
+  const TEXT_WGSL = `
+    struct TextParams {
+      x0: f32, y0: f32, x1: f32, y1: f32,
+      r: f32, g: f32, b: f32, a: f32,
+    };
+    @group(0) @binding(0) var<uniform> params: TextParams;
+    @group(0) @binding(1) var tex: texture_2d<f32>;
+    @group(0) @binding(2) var samp: sampler;
+
+    struct VertexOutput {
+      @builtin(position) position: vec4<f32>,
+      @location(0) uv: vec2<f32>,
+    };
+
+    @vertex
+    fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
+      var corners = array<vec2<f32>, 6>(
+        vec2<f32>(params.x0, params.y0),
+        vec2<f32>(params.x1, params.y0),
+        vec2<f32>(params.x0, params.y1),
+        vec2<f32>(params.x0, params.y1),
+        vec2<f32>(params.x1, params.y0),
+        vec2<f32>(params.x1, params.y1),
+      );
+      // same vertex order as `corners` above: (x0,y0)=top-left -> uv(0,0),
+      // (x1,y0)=top-right -> uv(1,0), (x0,y1)=bottom-left -> uv(0,1) --
+      // matches Canvas2D's own top-row-first pixel layout with no flip.
+      var uvs = array<vec2<f32>, 6>(
+        vec2<f32>(0.0, 0.0),
+        vec2<f32>(1.0, 0.0),
+        vec2<f32>(0.0, 1.0),
+        vec2<f32>(0.0, 1.0),
+        vec2<f32>(1.0, 0.0),
+        vec2<f32>(1.0, 1.0),
+      );
+      var out: VertexOutput;
+      out.position = vec4<f32>(corners[idx], 0.0, 1.0);
+      out.uv = uvs[idx];
+      return out;
+    }
+
+    @fragment
+    fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+      let s = textureSample(tex, samp, in.uv);
+      return vec4<f32>(params.r, params.g, params.b, params.a) * s;
+    }
+  `;
+
+  // keyboard/mouse state -- same as web/demo.html, verbatim.
+  const keysDown = new Set();
+  window.addEventListener("keydown", (e) => keysDown.add(e.key));
+  window.addEventListener("keyup", (e) => keysDown.delete(e.key));
+  let mouseX = 0, mouseY = 0;
+  canvas.addEventListener("mousemove", (e) => {
+    const rect = canvas.getBoundingClientRect();
+    mouseX = e.clientX - rect.left;
+    mouseY = e.clientY - rect.top;
+  });
+  const mouseButtonNames = { 0: "left", 1: "middle", 2: "right" };
+  const mouseButtonsDown = new Set();
+  canvas.addEventListener("mousedown", (e) => mouseButtonsDown.add(mouseButtonNames[e.button] ?? String(e.button)));
+  window.addEventListener("mouseup", (e) => mouseButtonsDown.delete(mouseButtonNames[e.button] ?? String(e.button)));
+
+  try {
+    await init();
+    out.textContent = "wasm loaded, requesting GPU...";
+    await gpu_init(undefined, canvas);
+    configure_canvas(canvas, canvas.width, canvas.height, "opaque");
+    const pipeline = await create_render_pipeline(RECT_WGSL, "vs_main", "fs_main", ["uniform"], "triangle-list", "replace");
+    const textPipeline = await create_render_pipeline(TEXT_WGSL, "vs_main", "fs_main", ["uniform", "texture", "sampler"], "triangle-list", "alpha");
+    // one shared sampler for every drawn text texture -- "linear" (smoothed),
+    // right for antialiased Canvas2D-rendered glyphs (unlike the "nearest"
+    // you'd want for pixel-art, see create_sampler's own doc comment).
+    const textSampler = create_sampler("linear");
+    log("gpu ready, pipeline=" + pipeline + ", textPipeline=" + textPipeline);
+
+    // per-draw uniform buffer pools -- see web/demo.html's own comment on
+    // `nextParamsBuf` for why one buffer per draw (not one reused buffer)
+    // is required; text draws get their OWN pool since they're a different
+    // pipeline/uniform layout than solid rects.
+    const paramsBufs = [];
+    let paramsBufIndex = 0;
+    const nextParamsBuf = () => {
+      if (paramsBufIndex >= paramsBufs.length) paramsBufs.push(create_buffer(8 * 4, "uniform"));
+      return paramsBufs[paramsBufIndex++];
+    };
+    const textParamsBufs = [];
+    let textParamsBufIndex = 0;
+    const nextTextParamsBuf = () => {
+      if (textParamsBufIndex >= textParamsBufs.length) textParamsBufs.push(create_buffer(8 * 4, "uniform"));
+      return textParamsBufs[textParamsBufIndex++];
+    };
+
+    const toNdc = (x, y, w, h) => {
+      const x0 = (x / canvas.width) * 2 - 1;
+      const x1 = ((x + w) / canvas.width) * 2 - 1;
+      const y0 = 1 - (y / canvas.height) * 2;
+      const y1 = 1 - ((y + h) / canvas.height) * 2;
+      return [x0, y0, x1, y1];
+    };
+
+    const drawRect = (x, y, w, h, r, g, b, a) => {
+      const [x0, y0, x1, y1] = toNdc(x, y, w, h);
+      const buf = nextParamsBuf();
+      write_buffer(buf, new Float32Array([x0, y0, x1, y1, r, g, b, a]));
+      draw_frame(pipeline, new Uint32Array([buf]), 6, 1);
+    };
+
+    const drawTexture = (x, y, w, h, textureHandle, r, g, b, a) => {
+      const [x0, y0, x1, y1] = toNdc(x, y, w, h);
+      const buf = nextTextParamsBuf();
+      write_buffer(buf, new Float32Array([x0, y0, x1, y1, r, g, b, a]));
+      draw_frame(textPipeline, new Uint32Array([buf, textureHandle, textSampler]), 6, 1);
+    };
+
+    globalThis.host_gpu_clear = (r, g, b) => drawRect(0, 0, canvas.width, canvas.height, r, g, b, 1.0);
+    globalThis.host_gpu_draw_rect = (x, y, w, h, r, g, b, a) => drawRect(x, y, w, h, r, g, b, a);
+    globalThis.host_gpu_draw_rects = (flat) => {
+      for (let i = 0; i + 8 <= flat.length; i += 8) {
+        drawRect(flat[i], flat[i + 1], flat[i + 2], flat[i + 3], flat[i + 4], flat[i + 5], flat[i + 6], flat[i + 7]);
+      }
+    };
+    globalThis.host_gpu_draw_texture = (x, y, w, h, textureHandle, r, g, b, a) => drawTexture(x, y, w, h, textureHandle, r, g, b, a);
+    globalThis.host_key_down = (name) => keysDown.has(name);
+    globalThis.host_mouse_x = () => mouseX;
+    globalThis.host_mouse_y = () => mouseY;
+    globalThis.host_mouse_down = (button) => mouseButtonsDown.has(button);
+
+    // --- text_texture(text, font, size)'s host side: rasterize with a
+    // REAL font via an offscreen Canvas2D, upload as a texture, cache by
+    // (text,font,size) so a label that isn't changing every frame doesn't
+    // pay rasterization+upload cost every frame. Bounded LRU-ish cache
+    // (Map preserves insertion order; re-inserting on hit moves an entry
+    // to the end, so the front is genuinely least-recently-used) --
+    // evicts+destroy_textures the oldest entry past TEXT_CACHE_MAX so a
+    // script that generates many distinct strings (changing numbers, say)
+    // doesn't leak GPU textures forever. ---
+    const TEXT_CACHE_MAX = 64;
+    const textTextureCache = new Map(); // key -> {handle, width, height}
+    const measureCtx = new OffscreenCanvas(1, 1).getContext("2d");
+    globalThis.host_text_texture = (text, font, size) => {
+      const key = `${size}px ${font}::${text}`;
+      const cached = textTextureCache.get(key);
+      if (cached) {
+        // touch: delete+re-set moves this entry to the end (most-recently-used)
+        textTextureCache.delete(key);
+        textTextureCache.set(key, cached);
+        return [cached.handle, cached.width, cached.height];
+      }
+      measureCtx.font = `${size}px ${font}`;
+      const metrics = measureCtx.measureText(text);
+      const width = Math.max(1, Math.ceil(metrics.width));
+      const height = Math.max(1, Math.ceil(size * 1.2));
+      const rasterCanvas = new OffscreenCanvas(width, height);
+      const ctx = rasterCanvas.getContext("2d");
+      ctx.font = `${size}px ${font}`;
+      ctx.fillStyle = "white"; // opaque white ink -- draw_texture's (r,g,b,a) tints it at draw time
+      ctx.textBaseline = "top";
+      ctx.fillText(text, 0, 0);
+      const rgba = ctx.getImageData(0, 0, width, height).data; // Uint8ClampedArray, straight (non-premultiplied) alpha
+      const handle = create_texture(width, height, new Uint8Array(rgba));
+      if (textTextureCache.size >= TEXT_CACHE_MAX) {
+        const oldestKey = textTextureCache.keys().next().value;
+        destroy_texture(textTextureCache.get(oldestKey).handle);
+        textTextureCache.delete(oldestKey);
+      }
+      textTextureCache.set(key, { handle, width, height });
+      return [handle, width, height];
+    };
+
+    // --- physics/ -- same wiring as web/demo.html, verbatim. ---
+    const physicsBytes = await (await fetch("../physics/target/wasm32-unknown-unknown/release/tsubaki_physics.wasm")).arrayBuffer();
+    const { instance: physicsInstance } = await WebAssembly.instantiate(physicsBytes, {});
+    const {
+      wasm_alloc: physicsAlloc,
+      physics_world_new,
+      physics_add_circle,
+      physics_add_box,
+      physics_set_velocity,
+      physics_step,
+      physics_get_bodies,
+      memory: physicsMemory,
+    } = physicsInstance.exports;
+
+    globalThis.host_physics_world_new = (gx, gy) => physics_world_new(gx, gy);
+    globalThis.host_physics_add_circle = (world, x, y, vx, vy, radius, mass, restitution) =>
+      physics_add_circle(world, x, y, vx, vy, radius, mass, restitution);
+    globalThis.host_physics_add_box = (world, x, y, vx, vy, hw, hh, mass, restitution) =>
+      physics_add_box(world, x, y, vx, vy, hw, hh, mass, restitution);
+    globalThis.host_physics_set_velocity = (world, body, vx, vy) => physics_set_velocity(world, body, vx, vy);
+    globalThis.host_physics_step = (world, dt) => physics_step(world, dt);
+    globalThis.host_physics_get_bodies = (world, n) => {
+      const outPtr = physicsAlloc(n * 4 * 8);
+      physics_get_bodies(world, outPtr);
+      const result = new Float64Array(n * 4);
+      result.set(new Float64Array(physicsMemory.buffer, outPtr, n * 4));
+      return result;
+    };
+
+    const params = new URLSearchParams(location.search);
+    const srcPath = params.get("src") || "../examples/move_rect.jl";
+    globalThis.tsubakiSource = await (await fetch(srcPath)).text();
+
+    log("loading Tsubaki program: " + srcPath);
+
+    const juliaScript = document.createElement("script");
+    juliaScript.src = "../_build/default/bin/main.bc.wasm.js";
+    document.body.appendChild(juliaScript);
+
+    juliaScript.onload = () => {
+      log("tsubaki loaded, starting game loop");
+      const tick = () => {
+        paramsBufIndex = 0;
+        textParamsBufIndex = 0;
+        begin_frame(0, 0, 0, 1);
+        if (typeof globalThis.tsubakiRunFrame === "function") globalThis.tsubakiRunFrame();
+        end_frame();
+        requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    };
+  } catch (e) {
+    log("ERROR: " + e);
+    console.error(e);
+  }
+</script>

@@ -1,0 +1,91 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>tsubaki-gpu smoke test</title>
+<pre id="out">running...</pre>
+<script type="module">
+  import init, {
+    gpu_init,
+    gpu_on_device_lost,
+    create_buffer,
+    write_buffer,
+    read_buffer,
+    destroy_buffer,
+    create_pipeline,
+    destroy_pipeline,
+    dispatch,
+    gpu_shutdown,
+  } from "./pkg/tsubaki_gpu.js";
+
+  const out = document.getElementById("out");
+  const log = (s) => (out.textContent += "\n" + s);
+
+  // Exercises: a uniform buffer (Params.k), an OUTPUT sized differently from
+  // the input (8 in, 4 out -- a pairwise-sum reduction), and a genuinely 2-D
+  // dispatch (workgroups (2,2,1), one invocation each, i = y*2+x) -- not just
+  // 3 numbers threaded through unused.
+  const SHADER = `
+    struct Params { k: f32 };
+
+    @group(0) @binding(0) var<storage, read> input: array<f32>;
+    @group(0) @binding(1) var<uniform> params: Params;
+    @group(0) @binding(2) var<storage, read_write> output: array<f32>;
+
+    @compute @workgroup_size(1, 1, 1)
+    fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+      let i = gid.y * 2u + gid.x;
+      if (i < arrayLength(&output)) {
+        output[i] = (input[i * 2u] + input[i * 2u + 1u]) * params.k;
+      }
+    }
+  `;
+
+  try {
+    await init();
+    out.textContent = "wasm loaded, requesting GPU...";
+    const adapterInfo = await gpu_init("high-performance");
+    log("adapter: " + JSON.stringify(adapterInfo));
+
+    // Registered but deliberately not awaited -- headless Chrome has no
+    // reachable way to actually force real device loss in this test, so this
+    // only proves the watcher can be set up without hanging, not that the
+    // recovery path itself fires.
+    const lost = gpu_on_device_lost();
+    log("device-lost watcher registered: " + (lost instanceof Promise));
+
+    const input = new Float32Array([1, 2, 3, 4, 5, 6, 7, 8]);
+    const k = 10;
+
+    const inputBuf = create_buffer(input.byteLength, "storage-read");
+    const paramsBuf = create_buffer(4, "uniform");
+    const outputBuf = create_buffer(4 * 4, "storage-read-write"); // 4 floats, NOT 8 -- independent size
+
+    write_buffer(inputBuf, input);
+    write_buffer(paramsBuf, new Float32Array([k]));
+
+    const pipelineA = await create_pipeline(SHADER, "main", ["storage-read", "uniform", "storage-read-write"]);
+    const pipelineB = await create_pipeline(SHADER, "main", ["storage-read", "uniform", "storage-read-write"]);
+    log("pipeline cache dedup (same handle both times): " + (pipelineA === pipelineB));
+
+    dispatch(pipelineA, new Uint32Array([inputBuf, paramsBuf, outputBuf]), 2, 2, 1);
+    const result = await read_buffer(outputBuf);
+
+    log("input:  " + Array.from(input).join(", "));
+    log("k: " + k);
+    log("output (pairwise sum * k): " + Array.from(result).join(", "));
+
+    const expected = [1 + 2, 3 + 4, 5 + 6, 7 + 8].map((v) => v * k);
+    const ok = expected.every((v, i) => Math.abs(v - result[i]) < 1e-3);
+
+    destroy_buffer(inputBuf);
+    destroy_buffer(paramsBuf);
+    destroy_buffer(outputBuf);
+    destroy_pipeline(pipelineA);
+    gpu_shutdown();
+    log("teardown (destroy_buffer x3, destroy_pipeline, gpu_shutdown) completed without throwing");
+
+    log(ok ? "PASS" : "FAIL");
+  } catch (e) {
+    log("ERROR: " + e);
+    console.error(e);
+  }
+</script>

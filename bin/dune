@@ -1,0 +1,7 @@
+(executable
+ (name main)
+ (modes byte wasm js)
+ (wasm_of_ocaml
+  (flags
+   (:standard --effects=cps)))
+ (libraries js_of_ocaml))

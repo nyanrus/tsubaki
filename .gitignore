@@ -1,0 +1,9 @@
+_build/
+kernel/target/
+physics/target/
+gpu/target/
+gpu/pkg/
+rust_parser/target/
+scratch/
+*.install
+.merlin

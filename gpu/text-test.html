@@ -1,0 +1,136 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>tsubaki-gpu text rendering</title>
+<canvas id="canvas" width="320" height="120" style="border: 1px solid #444"></canvas>
+<pre id="out">running...</pre>
+<script type="module">
+  import init, {
+    gpu_init,
+    configure_canvas,
+    create_texture,
+    create_sampler,
+    create_render_pipeline,
+    begin_frame,
+    draw_frame,
+    end_frame,
+  } from "./pkg/tsubaki_gpu.js";
+
+  const out = document.getElementById("out");
+  const log = (s) => (out.textContent += "\n" + s);
+
+  // The "font" here is just whatever the browser's own 2-D canvas text
+  // renderer produces -- baked once into a plain RGBA8 image, then handed
+  // to tsubaki-gpu as a texture. tsubaki-gpu doesn't know anything about
+  // glyphs, fonts, or layout; it only knows "here is a 2-D texture, sample
+  // it." That's the actual missing piece text rendering needed (the
+  // buffer-only binding model had no texture/sampler kind at all) -- not a
+  // font/glyph system, which this deliberately does not build.
+  function bakeTextTexture(text) {
+    const c = document.createElement("canvas");
+    c.width = 320;
+    c.height = 120;
+    const ctx = c.getContext("2d", { willReadFrequently: true });
+    ctx.clearRect(0, 0, c.width, c.height);
+    ctx.fillStyle = "white";
+    ctx.font = "bold 48px sans-serif";
+    ctx.textBaseline = "middle";
+    ctx.fillText(text, 12, c.height / 2);
+    const { data } = ctx.getImageData(0, 0, c.width, c.height);
+    return { width: c.width, height: c.height, rgba: new Uint8Array(data.buffer) };
+  }
+
+  // Separately-written WGSL: a full-canvas quad (again no vertex buffer --
+  // 6 hardcoded vertices from @builtin(vertex_index)) sampling the baked
+  // text texture. The "rendering" of glyphs already happened in the 2-D
+  // canvas above; this WGSL's job is just proving a real WebGPU texture
+  // sample pipeline displays it.
+  const TEXT_QUAD_WGSL = `
+    struct VertexOutput {
+      @builtin(position) position: vec4<f32>,
+      @location(0) uv: vec2<f32>,
+    };
+
+    @vertex
+    fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
+      var positions = array<vec2<f32>, 6>(
+        vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(-1.0, 1.0),
+        vec2<f32>(-1.0, 1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0),
+      );
+      var out: VertexOutput;
+      let p = positions[idx];
+      out.position = vec4<f32>(p, 0.0, 1.0);
+      out.uv = vec2<f32>((p.x + 1.0) * 0.5, (1.0 - p.y) * 0.5);
+      return out;
+    }
+
+    @group(0) @binding(0) var glyph_texture: texture_2d<f32>;
+    @group(0) @binding(1) var glyph_sampler: sampler;
+
+    @fragment
+    fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+      return textureSample(glyph_texture, glyph_sampler, in.uv);
+    }
+  `;
+
+  try {
+    await init();
+    out.textContent = "wasm loaded, requesting GPU...";
+    const canvas = document.getElementById("canvas");
+    // Passing canvas here (not just to configure_canvas below) lets
+    // gpu_init fall back to WebGL when WebGPU isn't available.
+    await gpu_init(undefined, canvas);
+    log("gpu_init ok");
+
+    configure_canvas(canvas, canvas.width, canvas.height, "opaque");
+    log("canvas configured");
+
+    const baked = bakeTextTexture("Tsubaki");
+    const texture = create_texture(baked.width, baked.height, baked.rgba);
+    const sampler = create_sampler("linear");
+    log("texture + sampler created (handles " + texture + ", " + sampler + ")");
+
+    // "alpha" blend, not "replace" -- the baked texture's background is
+    // fully transparent (alpha 0) outside the glyphs, so with "alpha"
+    // blend it lets the clear color show through there instead of the
+    // quad's own (0,0,0,0) replacing it outright with black.
+    const pipeline = await create_render_pipeline(
+      TEXT_QUAD_WGSL,
+      "vs_main",
+      "fs_main",
+      ["texture", "sampler"],
+      "triangle-list",
+      "alpha",
+    );
+    log("render pipeline created, handle=" + pipeline);
+
+    begin_frame(0.05, 0.05, 0.08, 1.0);
+    draw_frame(pipeline, [texture, sampler], 6, 1);
+    end_frame();
+    log("rendered one frame");
+
+    // Verify real text landed, not just "no error": sample a pixel inside
+    // where a glyph stroke should be (bright, since the baked text is
+    // white-on-transparent) vs a pixel in a definite gap between letters.
+    const check = document.createElement("canvas");
+    check.width = canvas.width;
+    check.height = canvas.height;
+    const ctx2d = check.getContext("2d", { willReadFrequently: true });
+    ctx2d.drawImage(canvas, 0, 0);
+    const px = (x, y) => Array.from(ctx2d.getImageData(x, y, 1, 1).data);
+    const bg = px(300, 10); // top-right corner, well outside any glyph
+    const strokePixels = [];
+    for (let x = 10; x < 280; x += 2) {
+      strokePixels.push(px(x, 60));
+    }
+    const brightest = strokePixels.reduce((a, b) => (a[0] + a[1] + a[2] > b[0] + b[1] + b[2] ? a : b));
+    log("background pixel (corner): " + bg.join(","));
+    log("brightest pixel along mid-row (a glyph stroke): " + brightest.join(","));
+
+    const bgIsClear = Math.abs(bg[0] - 13) < 20 && Math.abs(bg[2] - 20) < 20;
+    const strokeIsBright = brightest[0] > 150 && brightest[1] > 150 && brightest[2] > 150;
+    log(bgIsClear && strokeIsBright ? "PASS" : "FAIL");
+  } catch (e) {
+    log("ERROR: " + e);
+    console.error(e);
+  }
+</script>

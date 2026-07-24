@@ -1,0 +1,100 @@
+<!doctype html>
+<!-- gpu/'s raw wgpu API, reachable straight from a Tsubaki script now (see
+     bin/async.ml + the new builtins in bin/gpuBridge.ml) -- unlike
+     web/demo.html (the fixed-function 2D rect renderer, left untouched),
+     this page wires host_* forwarders for gpu/'s OWN exported names
+     one-to-one, with no drawing convenience layer in between. Tsubaki's own
+     `gpu_init()`/`create_pipeline(...)`/`read_buffer(...)` calls are what
+     actually drive gpu/test.html's compute-reduction shader here -- see
+     examples/gpu_reduce.jl for the script.
+
+     Serve from the REPO ROOT (`python3 -m http.server` at the top level,
+     not from web/) so the relative paths below resolve; open
+     /web/gpu-compute-demo.html. -->
+<meta charset="utf-8" />
+<title>tsubaki-gpu compute demo</title>
+<canvas id="canvas" width="480" height="480" style="border: 1px solid #444; background: #000"></canvas>
+<pre id="out">loading...</pre>
+<script type="module">
+  import init, {
+    gpu_init,
+    gpu_on_device_lost,
+    create_buffer,
+    write_buffer,
+    read_buffer,
+    destroy_buffer,
+    create_texture,
+    destroy_texture,
+    create_sampler,
+    destroy_sampler,
+    create_pipeline,
+    destroy_pipeline,
+    dispatch,
+    configure_canvas,
+    create_render_pipeline,
+    destroy_render_pipeline,
+    begin_frame,
+    draw_frame,
+    end_frame,
+    gpu_shutdown,
+  } from "../gpu/pkg/tsubaki_gpu.js";
+
+  const out = document.getElementById("out");
+  const log = (s) => (out.textContent += "\n" + s);
+
+  try {
+    await init();
+    out.textContent = "wasm loaded (tsubaki-gpu)";
+
+    // --- the sync/async host_* functions bin/gpuBridge.ml's raw-API
+    // builtins call into -- each one just forwards straight to the
+    // wasm-bindgen export of the same name, no adaptation needed (a
+    // Vec<f32>/Vec<u32> parameter accepts a plain JS Array via its
+    // generated glue's own `TypedArray.prototype.set`, so the plain
+    // Arrays bin/gpuBridge.ml builds cross the boundary as-is). ---
+    globalThis.host_gpu_init = (pref) => gpu_init(pref);
+    globalThis.host_gpu_on_device_lost = () => gpu_on_device_lost();
+    globalThis.host_create_buffer = (sizeBytes, kind) => create_buffer(sizeBytes, kind);
+    globalThis.host_write_buffer = (handle, data) => write_buffer(handle, data);
+    globalThis.host_read_buffer = (handle) => read_buffer(handle);
+    globalThis.host_destroy_buffer = (handle) => destroy_buffer(handle);
+    globalThis.host_create_texture = (width, height, rgba) => create_texture(width, height, rgba);
+    globalThis.host_destroy_texture = (handle) => destroy_texture(handle);
+    globalThis.host_create_sampler = (filter) => create_sampler(filter);
+    globalThis.host_destroy_sampler = (handle) => destroy_sampler(handle);
+    globalThis.host_create_pipeline = (wgsl, entryPoint, bindingKinds) => create_pipeline(wgsl, entryPoint, bindingKinds);
+    globalThis.host_destroy_pipeline = (handle) => destroy_pipeline(handle);
+    globalThis.host_dispatch = (pipeline, handles, wgX, wgY, wgZ) => dispatch(pipeline, handles, wgX, wgY, wgZ);
+    // configure_canvas takes a canvas ELEMENT on gpu/'s own side -- Tsubaki
+    // only ever has a plain String id (there's no DOM element value in this
+    // interpreter), resolved here.
+    globalThis.host_configure_canvas = (canvasId, width, height, alphaMode) =>
+      configure_canvas(document.getElementById(canvasId), width, height, alphaMode);
+    globalThis.host_create_render_pipeline = (wgsl, vertexEntry, fragmentEntry, bindingKinds, topology, blend) =>
+      create_render_pipeline(wgsl, vertexEntry, fragmentEntry, bindingKinds, topology, blend);
+    globalThis.host_destroy_render_pipeline = (handle) => destroy_render_pipeline(handle);
+    globalThis.host_begin_frame = (r, g, b, a) => begin_frame(r, g, b, a);
+    globalThis.host_draw_frame = (pipeline, handles, vertexCount, instanceCount) => draw_frame(pipeline, handles, vertexCount, instanceCount);
+    globalThis.host_end_frame = () => end_frame();
+    globalThis.host_gpu_shutdown = () => gpu_shutdown();
+
+    // Tsubaki's own program text -- fetched from a query param (?src=path.jl)
+    // or falls back to the bundled compute-reduction demo.
+    const params = new URLSearchParams(location.search);
+    const srcPath = params.get("src") || "../examples/gpu_reduce.jl";
+    globalThis.tsubakiSource = await (await fetch(srcPath)).text();
+    log("loading Tsubaki program: " + srcPath);
+
+    // main.bc.wasm.js reads globalThis.tsubakiSource at load time and runs it
+    // once (see bin/main.ml's browser branch) -- must be set before this
+    // loads. No requestAnimationFrame loop here (unlike web/demo.html) --
+    // this is a one-shot script, not a per-frame one.
+    const juliaScript = document.createElement("script");
+    juliaScript.src = "../_build/default/bin/main.bc.wasm.js";
+    juliaScript.onload = () => log("tsubaki finished (see console for println output)");
+    document.body.appendChild(juliaScript);
+  } catch (e) {
+    log("ERROR: " + e);
+    console.error(e);
+  }
+</script>

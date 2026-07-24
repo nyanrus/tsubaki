@@ -1,0 +1,123 @@
+<!doctype html>
+<!-- Runs a Tsubaki script's own to_glsl output on a REAL WebGL2 context, with
+     nothing but the plain browser WebGL2 API in between -- no wgpu, no
+     gpu/pkg import at all (contrast web/gpu-compute-demo.html, which forwards
+     to the wasm-bindgen'd wgpu crate). The host_webgl_* globals below are the
+     JS side of bin/webglBridge.ml's builtins: Tsubaki calls webgl_program/
+     webgl_uniform/webgl_clear/webgl_draw, and those land here as real
+     gl.compileShader/linkProgram/uniform*/drawArrays calls.
+
+     Serve from the REPO ROOT (`python3 -m http.server` at the top level, not
+     from web/) so the relative paths resolve; open
+     /web/webgl-demo.html (defaults to examples/webgl_triangle.jl) or
+     /web/webgl-demo.html?src=../examples/your_script.jl -->
+<meta charset="utf-8" />
+<title>tsubaki WebGL2 demo</title>
+<canvas id="canvas" width="480" height="480" style="border: 1px solid #444; background: #000"></canvas>
+<pre id="out">loading...</pre>
+<script>
+  const out = document.getElementById("out");
+  const log = (s) => (out.textContent += "\n" + s);
+
+  const canvas = document.getElementById("canvas");
+  const gl = canvas.getContext("webgl2");
+  if (!gl) {
+    out.textContent = "ERROR: this browser has no WebGL2 context";
+    throw new Error("no webgl2");
+  }
+  out.textContent = "WebGL2 context ready";
+
+  // integer handle -> linked WebGLProgram; Tsubaki only ever holds the Int.
+  const programs = [];
+
+  function compile(type, src, label) {
+    const sh = gl.createShader(type);
+    gl.shaderSource(sh, src);
+    gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+      const info = gl.getShaderInfoLog(sh);
+      gl.deleteShader(sh);
+      throw new Error(label + " shader failed to compile:\n" + info);
+    }
+    return sh;
+  }
+
+  // --- the JS side of bin/webglBridge.ml. Every one is synchronous, matching
+  //     WebGL2's own fully-synchronous API. ---
+
+  globalThis.host_webgl_program = (vertexSrc, fragmentSrc) => {
+    const vs = compile(gl.VERTEX_SHADER, vertexSrc, "vertex");
+    const fs = compile(gl.FRAGMENT_SHADER, fragmentSrc, "fragment");
+    const prog = gl.createProgram();
+    gl.attachShader(prog, vs);
+    gl.attachShader(prog, fs);
+    gl.linkProgram(prog);
+    gl.deleteShader(vs);
+    gl.deleteShader(fs);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+      const info = gl.getProgramInfoLog(prog);
+      gl.deleteProgram(prog);
+      throw new Error("program failed to link:\n" + info);
+    }
+    programs.push(prog);
+    return programs.length - 1;
+  };
+
+  globalThis.host_webgl_clear = (r, g, b, a) => {
+    gl.clearColor(r, g, b, a);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+  };
+
+  // the value's LENGTH selects the call -- exactly to_glsl's uniform types.
+  globalThis.host_webgl_uniform = (progHandle, name, values) => {
+    const prog = programs[progHandle];
+    gl.useProgram(prog);
+    const loc = gl.getUniformLocation(prog, name);
+    if (loc === null) throw new Error('uniform "' + name + '" not found (unused uniforms are optimized out)');
+    switch (values.length) {
+      case 1: gl.uniform1f(loc, values[0]); break;
+      case 2: gl.uniform2fv(loc, values); break;
+      case 3: gl.uniform3fv(loc, values); break;
+      case 4: gl.uniform4fv(loc, values); break;
+      // WebGL2 honors transpose=true, so a row-major Tsubaki matrix uploads
+      // correctly into GLSL's column-major mat4 (see webglBridge.ml).
+      case 16: gl.uniformMatrix4fv(loc, true, values); break;
+      default: throw new Error("uniform " + name + ": unsupported length " + values.length + " (want 1/2/3/4/16)");
+    }
+  };
+
+  const MODES = {
+    triangles: () => gl.TRIANGLES,
+    triangle_strip: () => gl.TRIANGLE_STRIP,
+    lines: () => gl.LINES,
+    line_strip: () => gl.LINE_STRIP,
+    points: () => gl.POINTS,
+  };
+
+  globalThis.host_webgl_draw = (progHandle, mode, count) => {
+    const m = MODES[mode];
+    if (!m) throw new Error('unknown draw mode "' + mode + '" (want triangles/triangle_strip/lines/line_strip/points)');
+    gl.useProgram(programs[progHandle]);
+    gl.drawArrays(m(), 0, count);
+  };
+
+  (async () => {
+    try {
+      const params = new URLSearchParams(location.search);
+      const srcPath = params.get("src") || "../examples/webgl_triangle.jl";
+      globalThis.tsubakiSource = await (await fetch(srcPath)).text();
+      globalThis.tsubakiSourcePath = srcPath;
+      log("loading Tsubaki program: " + srcPath);
+
+      // main.bc.wasm.js reads globalThis.tsubakiSource at load time and runs it
+      // once (see bin/main.ml's browser branch) -- must be set before it loads.
+      const juliaScript = document.createElement("script");
+      juliaScript.src = "../_build/default/bin/main.bc.wasm.js";
+      juliaScript.onload = () => log("tsubaki finished (see console for println output)");
+      document.body.appendChild(juliaScript);
+    } catch (e) {
+      log("ERROR: " + e);
+      console.error(e);
+    }
+  })();
+</script>

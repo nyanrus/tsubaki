@@ -1,0 +1,8 @@
+z = complex(1.0, 2.0)
+c = complex(3.0, -1.0)
+println(z + c)
+println(z * c)
+println(z^2)
+println(real(z))
+println(imag(z))
+println(abs(complex(3.0, 4.0)))
