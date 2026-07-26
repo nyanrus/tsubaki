@@ -1,0 +1,17 @@
+Vector Array Array
+Array{Named} length 2
+after push!: 3, last label c
+1.0 3.0 2.0
+[2.0, 3.0] [2.0, 3.0]
+Array{Named} length 0
+after push!: 1
+refused: TypeError: Array{Named} cannot hold a Float
+undef vector: 3 first = nothing
+after filling: 7 8 9
+boxed matrix: (2, 2) [1,1].label = corner
+Array{Int} 3
+Vector Array{Named}
+[1.0, 4.0, 9.0, 16.0]
+Matrix (3, 2) grid[1,1] = 11.0, grid[3,2] = 23.0
+[2.0, 4.0, 6.0]
+[3.0, 2.0, 1.0]

@@ -1,0 +1,11 @@
+7.5
+a float / an int / a string
+1.5 2
+[1.0, 2.0, 3.0]
+2 20
+1.5 2.5 3.5
+true true false false
+3.0 4 4.0
+6 3.0
+a float box / an int box
+float64 int64

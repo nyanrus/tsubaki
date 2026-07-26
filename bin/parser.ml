@@ -135,7 +135,7 @@
        category) and `&` with `*`/`/`/`%` (its "times" category) -- not with
        `&&`/`||`, the common mistake coming from C-family languages *)
     | "+" | "-" | "|" | "\xe2\x8a\xbb" -> 3
-    | "*" | "/" | "//" | "%" | ">>>" | "<<" | ">>" | "\xe2\x8b\x85" | "\\" | "&" -> 4
+    | "*" | "/" | "//" | "%" | ">>>" | "<<" | ">>" | "\xe2\x8b\x85" | "\\" | "&" | "\xc3\xb7" -> 4
     | "^" -> 5
     | _ -> -1
 
@@ -496,6 +496,29 @@
         dotted_chain := [];
         advance st;
         e := ECall ("transpose", [ !e ], [], Runtime.Dispatch.new_cache ()))
+      else if at_op st "(" && not (space_before st st.pos) then (
+        (* Calling what the expression so far EVALUATED to: `f()()`,
+           `v[1](x)`, `(x -> x + 1)(3)`.
+
+           A bare `f(x)` never reaches here -- parse_atom's own TIDENT case
+           already took it, as an ECall carrying a name for dispatch to
+           resolve on -- and neither does `Name.member(...)`, taken by the
+           qualified-call branch above while the dotted chain is still a pure
+           run of names. So this only ever fires on shapes that did not parse
+           at all before.
+
+           Requiring NO whitespace before the "(" is what stops it from
+           swallowing a following statement: a line that merely BEGINS with
+           "(" -- `(a, b) = f()` under a preceding expression statement --
+           always has whitespace in front of it, the newline itself. Real
+           Julia draws the same line between `f(x)` and `f (x)`. *)
+        dotted_chain := [];
+        advance st;
+        let args, kwargs = parse_arglist st in
+        expect_op st ")";
+        if kwargs <> [] then
+          raise (Parse_error "keyword arguments need a named function -- a computed callee is a plain closure");
+        e := EApply (!e, args))
       else continue_ := false
     done;
     !e
@@ -503,17 +526,25 @@
   (* real Julia's numeric-literal coefficient juxtaposition (`2x`, `2I`,
      `2(x+1)`): a numeral immediately followed (no space) by an identifier or
      "(" is implicit multiplication. Checked right after the literal atom is
-     produced, and the coefficient's RHS is parsed via parse_postfix (not a
-     wider call) so a further binary operator like `^` still binds around the
-     WHOLE product from the outside -- matching real Julia's own documented
-     `2^3x == 2^(3*x)` / `-2x == -(2*x)` examples exactly, for free, since
-     parse_unary/parse_binary already wrap whatever parse_atom returns. *)
+     produced.
+
+     The coefficient binds TIGHTER than `*`/`+` but LOOSER than `^` -- real
+     Julia's own documented rule ("2x^3 is parsed as 2*(x^3)", alongside
+     "2^3x is parsed as 2^(3x)" and "-2x as -(2x)"). So the RHS is parsed at
+     exactly `^`'s own precedence level: high enough to swallow a following
+     `^`, low enough that a following `*`/`+` still wraps the whole product
+     from the outside, which parse_unary/parse_binary already do.
+
+     This used to call parse_postfix -- one level too tight, which made
+     `3x^2` mean `(3x)^2`: 144 where real Julia says 48. Caught by running
+     the identical file under real Julia 1.12.5 (tests/control.jl, via
+     `make test-julia`), not by reading the code. *)
   and maybe_coeff_mult st lit =
     let tight_follow =
       (match peek st with TIDENT _ -> true | TOP "(" -> true | _ -> false)
       && not (space_before st st.pos)
     in
-    if tight_follow then EBinOp ("*", lit, parse_postfix st, Runtime.Dispatch.new_cache ())
+    if tight_follow then EBinOp ("*", lit, parse_binary st (prec "^"), Runtime.Dispatch.new_cache ())
     else lit
 
   and parse_atom st =
@@ -1199,8 +1230,12 @@
     while not (is_block_end st) do
       if at_op st ";" then advance st
       else (
+        (* where this statement STARTS, captured before parsing it -- see
+           Ast's SLine for why the position rides along as its own marker
+           rather than as a field on every statement variant *)
+        let start_line = fst (line_col st st.pos) in
         match (try `Ok (parse_stmt st) with Parse_error msg -> `Err msg) with
-        | `Ok s -> acc := s :: !acc
+        | `Ok s -> acc := s :: SLine start_line :: !acc
         | `Err msg ->
           let line, col = line_col st st.pos in
           parse_errors := (line, col, msg) :: !parse_errors;

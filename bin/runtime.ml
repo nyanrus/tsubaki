@@ -285,6 +285,57 @@
     let parent : (string, string) Hashtbl.t = Hashtbl.create 32
     let declare child ~parent:p = Hashtbl.replace parent child p
 
+    (* Real Julia spells the two default numeric types `Int64` and `Float64`;
+       Tsubaki's own tags are "Int" and "Float". `Int` is a real Julia alias
+       for `Int64`, so that half already agreed -- but `x::Float64`,
+       `Float64[]`, `Vector{Float64}(undef, n)` and `isa(x, Float64)` were all
+       simply wrong here, and they are the first thing anyone arriving from
+       Julia writes. `Float64[]` was the worst of them: it built a real
+       `Array{Float64}` that then refused every Float it was handed.
+
+       They are accepted as ALIASES rather than renaming the tags: "Int" and
+       "Float" appear as literal strings in about 120 method signatures across
+       runtime/compile/ecs/gpuBridge, and renaming those is a rewrite no type
+       checker would supervise. So a type name written in SOURCE is normalized
+       here, at each of the handful of points where one enters the system
+       (Runtime.resolve_type_name, Eval's ETypeExpr / typed-array and -matrix
+       constructors / `isa` / `::Type{...}` patterns). Nothing downstream --
+       dispatch, `tag`, the hierarchy -- ever sees the alias.
+
+       `typeof(1.0)` still answers "Float", not "Float64": that is the tag,
+       and changing it is the rename above. See tests/known_gaps.jl. *)
+    let alias = function "Float64" -> "Float" | "Int64" -> "Int" | n -> n
+
+    (* like `alias`, but reaching inside a parametric name too, so
+       `Dict{Int64,Float64}` and `Pair{Int64,Box{Float64}}` normalize as
+       whole. Splitting on ',' tracks brace depth -- a nested parameter list
+       has commas of its own that are not this level's separators. *)
+    let rec canonical (n : string) : string =
+      let len = String.length n in
+      match String.index_opt n '{' with
+      | Some i when len > 0 && n.[len - 1] = '}' ->
+        let inner = String.sub n (i + 1) (len - i - 2) in
+        let parts = ref [] and buf = Buffer.create 16 and depth = ref 0 in
+        String.iter
+          (fun c ->
+            match c with
+            | '{' ->
+              incr depth;
+              Buffer.add_char buf c
+            | '}' ->
+              decr depth;
+              Buffer.add_char buf c
+            | ',' when !depth = 0 ->
+              parts := Buffer.contents buf :: !parts;
+              Buffer.clear buf
+            | c -> Buffer.add_char buf c)
+          inner;
+        parts := Buffer.contents buf :: !parts;
+        (* `parts` was built back-to-front, and rev_map puts it right again *)
+        let parts = List.rev_map (fun s -> canonical (String.trim s)) !parts in
+        alias (String.sub n 0 i) ^ "{" ^ String.concat "," parts ^ "}"
+      | _ -> alias n
+
     (* splits a concrete instantiation's name into its base and parameters,
        e.g. "Array{Int}" -> Some ("Array", ["Int"]), "Pair{Int,String}" ->
        Some ("Pair", ["Int"; "String"]), "Any" -> None *)
@@ -538,33 +589,79 @@
       Types.declare concrete ~parent:"Type";
       concrete
 
+  (* How a float is DISPLAYED -- real Julia's own rule, both halves of it.
+     This used to be `%.3f`, which is not a formatting preference but a lie:
+     it printed 1.5e-8 as "0.000", -0.0 as "0.000", and 1e100 as a hundred-
+     and-one digit fixed-point number. This file's own pisum benchmark
+     printed its answer as "1.645" while claiming to match real Julia's
+     1.6449340668 -- true, and unverifiable from the output.
+
+     Julia prints the SHORTEST decimal that reads back as the exact same
+     float (so `0.1 + 0.2` shows its real value, `0.30000000000000004`, not
+     a rounded one), and switches to scientific notation outside decimal
+     exponents -4..5 -- checked against real Julia 1.12.5 across magnitudes
+     from 1e-300 to 1e100, not assumed. A float always keeps a fractional
+     part, so it never reads back as an Int. *)
+  let float_repr (f : float) : string =
+    if Float.is_nan f then "NaN"
+    else if f = Float.infinity then "Inf"
+    else if f = Float.neg_infinity then "-Inf"
+    else if f = 0.0 then if 1.0 /. f < 0.0 then "-0.0" else "0.0"
+    else begin
+      (* fewest significant digits that still round-trips, as normalized
+         "d.ddde±XX" -- 17 always suffices for a binary64 *)
+      let rec shortest p =
+        let s = Printf.sprintf "%.*e" p f in
+        if p >= 16 || float_of_string s = f then s else shortest (p + 1)
+      in
+      let s = shortest 0 in
+      let epos = String.index s 'e' in
+      let mant = String.sub s 0 epos in
+      let exp = int_of_string (String.sub s (epos + 1) (String.length s - epos - 1)) in
+      let neg = mant.[0] = '-' in
+      let mant = if neg then String.sub mant 1 (String.length mant - 1) else mant in
+      let digits = String.concat "" (String.split_on_char '.' mant) in
+      let nd = String.length digits in
+      let sign = if neg then "-" else "" in
+      if exp >= -4 && exp <= 5 then
+        if exp >= 0 then begin
+          let int_len = exp + 1 in
+          if nd <= int_len then sign ^ digits ^ String.make (int_len - nd) '0' ^ ".0"
+          else sign ^ String.sub digits 0 int_len ^ "." ^ String.sub digits int_len (nd - int_len)
+        end
+        else sign ^ "0." ^ String.make ((-exp) - 1) '0' ^ digits
+      else begin
+        let frac = if nd = 1 then "0" else String.sub digits 1 (nd - 1) in
+        Printf.sprintf "%s%c.%se%d" sign digits.[0] frac exp
+      end
+    end
+
   (* shared by VComplex/VComplexVec/VComplexMat's own `show` cases below *)
-  let show_complex_pair re im = Printf.sprintf "%.3f %s %.3fim" re (if im < 0.0 then "-" else "+") (Float.abs im)
+  let show_complex_pair re im =
+    Printf.sprintf "%s %s %sim" (float_repr re) (if im < 0.0 then "-" else "+") (float_repr (Float.abs im))
 
   let rec show = function
     | VInt n -> string_of_int n
-    | VFloat f -> Printf.sprintf "%.3f" f
+    | VFloat f -> float_repr f
     | VBool b -> string_of_bool b
     | VStr s -> s
     | VNothing -> "nothing"
     | VRange (a, 1, b) -> Printf.sprintf "%d:%d" a b
     | VRange (a, s, b) -> Printf.sprintf "%d:%d:%d" a s b
-    | VFRange (a, s, b) when s = 1.0 -> Printf.sprintf "%.3f:%.3f" a b
-    | VFRange (a, s, b) -> Printf.sprintf "%.3f:%.3f:%.3f" a s b
-    | VVec v -> "[" ^ String.concat ", " (Array.to_list (Array.map string_of_float (vecbuf_to_array v))) ^ "]"
-    | VArr { cells; _ } -> "[" ^ String.concat ", " (Array.to_list (Array.map show (arrbuf_to_array cells))) ^ "]"
+    | VFRange (a, s, b) when s = 1.0 -> Printf.sprintf "%s:%s" (float_repr a) (float_repr b)
+    | VFRange (a, s, b) -> Printf.sprintf "%s:%s:%s" (float_repr a) (float_repr s) (float_repr b)
+    | VVec v -> "[" ^ String.concat ", " (Array.to_list (Array.map float_repr (vecbuf_to_array v))) ^ "]"
+    | VArr { cells; _ } -> "[" ^ String.concat ", " (Array.to_list (Array.map show_elem (arrbuf_to_array cells))) ^ "]"
     | VMat rows ->
       "["
       ^ String.concat "; "
           (Array.to_list
-             (Array.map
-                (fun row -> String.concat " " (Array.to_list (Array.map string_of_float row)))
-                rows))
+             (Array.map (fun row -> String.concat " " (Array.to_list (Array.map float_repr row))) rows))
       ^ "]"
     | VGenMat { rows; cols; cells; _ } ->
       "["
       ^ String.concat "; "
-          (List.init rows (fun i -> String.concat " " (List.init cols (fun j -> show cells.((i * cols) + j)))))
+          (List.init rows (fun i -> String.concat " " (List.init cols (fun j -> show_elem cells.((i * cols) + j)))))
       ^ "]"
     | VStruct { kind = "ErrorException"; fields } ->
       (* real Julia's own `ErrorException` shows as just the bare message,
@@ -588,7 +685,7 @@
        | None -> kind)
     | VStruct s ->
       s.kind ^ "("
-      ^ String.concat ", " (Array.to_list (Array.map (fun (n, r) -> n ^ "=" ^ show !r) s.fields))
+      ^ String.concat ", " (Array.to_list (Array.map (fun (n, r) -> n ^ "=" ^ show_elem !r) s.fields))
       ^ ")"
     | VClosure _ -> "#<function>"
     | VDict d ->
@@ -598,14 +695,14 @@
         Hashtbl.fold (fun _ (seq, k, v) acc -> (seq, k, v) :: acc) d.dtbl []
         |> List.sort (fun (a, _, _) (b, _, _) -> compare a b)
       in
-      "Dict(" ^ String.concat ", " (List.map (fun (_, k, v) -> show k ^ " => " ^ show v) pairs) ^ ")"
-    | VTuple vs -> "(" ^ String.concat ", " (Array.to_list (Array.map show vs)) ^ ")"
+      "Dict(" ^ String.concat ", " (List.map (fun (_, k, v) -> show_elem k ^ " => " ^ show_elem v) pairs) ^ ")"
+    | VTuple vs -> "(" ^ String.concat ", " (Array.to_list (Array.map show_elem vs)) ^ ")"
     | VComplex (re, im) -> show_complex_pair re im
     | VRational (n, d) -> Printf.sprintf "%d//%d" n d
     | VSymbol (name, _) -> ":" ^ name
     | VExpr { head; args } ->
       ":(" ^ head ^ " " ^ String.concat " " (Array.to_list (Array.map show args)) ^ ")"
-    | VUniformScaling c -> if c = 1.0 then "I" else Printf.sprintf "%.3f*I" c
+    | VUniformScaling c -> if c = 1.0 then "I" else float_repr c ^ "*I"
     | VComplexVec v ->
       "[" ^ String.concat ", " (Array.to_list (Array.map (fun (re, im) -> show_complex_pair re im) !v)) ^ "]"
     | VComplexMat rows ->
@@ -624,6 +721,29 @@
       Printf.sprintf "%dx%d SparseMatrixCSC with %d stored entries" m n (Array.length rows)
     | VFixedInt { v; _ } -> string_of_int v
     | VType s -> s
+
+  (* An element shown INSIDE a container, where real Julia switches from
+     `print` to `show`: a bare `println("hi")` prints hi, but the same string
+     inside a Vector/Tuple/Dict/struct prints "hi", quotes and all -- which is
+     the difference between reading a container's contents and guessing at
+     them (`(1, a)` gave no way to tell the string "a" from a variable's
+     value). Nothing else displays differently between the two. *)
+  and show_elem = function
+    | VStr s ->
+      let b = Buffer.create (String.length s + 2) in
+      Buffer.add_char b '"';
+      String.iter
+        (fun c ->
+          match c with
+          | '"' -> Buffer.add_string b "\\\""
+          | '\\' -> Buffer.add_string b "\\\\"
+          | '\n' -> Buffer.add_string b "\\n"
+          | '\t' -> Buffer.add_string b "\\t"
+          | c -> Buffer.add_char b c)
+        s;
+      Buffer.add_char b '"';
+      Buffer.contents b
+    | v -> show v
 
   (* --- struct field access, the thing that replaces bespoke record types --- *)
   let get_field v name =
@@ -773,6 +893,78 @@
      Main for the top-level script, pushed/popped by Eval's `include`. *)
   let current_file_dir : string ref = ref ""
 
+  (* Where execution currently IS: the source file's name and the line of the
+     statement being run. `current_line` is set by evaluating an `SLine`
+     marker (see Ast) -- the whole reason those markers exist. Together they
+     turn "MethodError: no method matching describe(String)" into the same
+     message with a place attached.
+
+     The frame stack holds what lies between the top level and here: for each
+     call, the function's name and the line its CALLER was on, which is what
+     makes a traceback readable ("f, called from line 12"). Pushed and popped
+     around every tree-walked call in Eval.
+
+     Two parallel growable arrays, not a list of tuples. A list allocated two
+     blocks on EVERY call, which measured at +14% on `fib(25)` -- this
+     interpreter's most call-dense benchmark -- and that is far too much to
+     pay for something only an error ever reads. A push is now two array
+     writes and an increment; a pop is a decrement; and a real list is built
+     only where one is genuinely wanted, at the moment an error is captured. *)
+  let current_file : string ref = ref ""
+  let current_line : int ref = ref 0
+  let frame_names = ref (Array.make 256 "")
+  let frame_lines = ref (Array.make 256 0)
+  let frame_top = ref 0
+
+  let push_frame name line =
+    let cap = Array.length !frame_names in
+    if !frame_top >= cap then (
+      let names' = Array.make (cap * 2) "" and lines' = Array.make (cap * 2) 0 in
+      Array.blit !frame_names 0 names' 0 cap;
+      Array.blit !frame_lines 0 lines' 0 cap;
+      frame_names := names';
+      frame_lines := lines');
+    !frame_names.(!frame_top) <- name;
+    !frame_lines.(!frame_top) <- line;
+    incr frame_top
+
+  let pop_frame () = if !frame_top > 0 then decr frame_top
+
+  (* the live frames, innermost first *)
+  let frames_snapshot () =
+    List.init !frame_top (fun i ->
+        let j = !frame_top - 1 - i in
+        !frame_names.(j), !frame_lines.(j))
+
+  (* Everything an error report needs is simply where execution stood when the
+     error was raised -- nothing unwinds it on the way out (see Eval's
+     tree_walk_impl), so `current_file`, `current_line` and the frames are
+     still exactly there by the time the top level prints them.
+
+     Which means whoever CATCHES an error is the one who has to put things
+     back: Eval's STry saves this triple on the way in and restores it in its
+     handler, and the REPL does the same around each entry. *)
+  type site = { s_file : string; s_line : int; s_top : int }
+
+  let here () = { s_file = !current_file; s_line = !current_line; s_top = !frame_top }
+
+  let restore_site s =
+    current_file := s.s_file;
+    current_line := s.s_line;
+    frame_top := s.s_top
+
+  (* Whether execution is currently inside a Tsubaki function's body. A frame
+     is pushed only by a tree-walked call, which is exactly the question --
+     used by Eval's `function` declaration to decide whether the name being
+     declared is a local of the call that is running, or a global. *)
+  let inside_function_body () = !frame_top > 0
+
+
+  (* "file:line", "" if unknown (the built-in demo has no file, and nothing
+     has run yet at startup) *)
+  let position_of file line =
+    if line = 0 then "" else if file = "" then Printf.sprintf "line %d" line else Printf.sprintf "%s:%d" file line
+
   (* a side-channel like current_module_prefix above: `Some name` while one
      of struct `name`'s own inner constructors is running (set right before
      running its body, restored right after -- see Eval.SStructDecl), so
@@ -819,6 +1011,9 @@
      placeholder like "T" is never itself a registered type, so it always
      safely falls through unchanged regardless. *)
   let resolve_type_name n =
+    (* real Julia's `Float64`/`Int64` spellings normalize to this file's own
+       tags first, before any module qualification -- see Types.canonical *)
+    let n = Types.canonical n in
     if !current_module_prefix = "" then n
     else (
       match String.index_opt n '{' with
@@ -2222,6 +2417,18 @@
         if float_of_int i <> f then failwith (Printf.sprintf "InexactError: Int(%s) is not an exact integer" (show x));
         VInt i
       | _ -> assert false);
+    (* A conversion is a CALL, not a type annotation, so Types.canonical never
+       sees it -- `Int64(3)` and `Float64(3)` need methods of their own. And
+       widening to Float had no spelling at all before this: `Float(3)` was as
+       absent as `Float64(3)`, so the only way to get a Float from an Int was
+       arithmetic. *)
+    Dispatch.defmethod "Int64" [ [ "Number" ] ] (fun args -> Dispatch.call "Int" args);
+    let to_float = function
+      | [ x ] -> VFloat (as_float x)
+      | _ -> assert false
+    in
+    Dispatch.defmethod "Float" [ [ "Number" ] ] to_float;
+    Dispatch.defmethod "Float64" [ [ "Number" ] ] to_float;
     (* Complex arithmetic, only for mandelperf's needs: +, -, * and ^ with a
        non-negative Int exponent (repeated multiplication -- no general
        floating-point power here, mandel only ever squares) *)
@@ -2268,6 +2475,30 @@
       | _ -> assert false);
     Dispatch.defmethod "^" [ [ "Number" ]; [ "Number" ] ] (function
       | [ a; b ] -> VFloat (as_float a ** as_float b)
+      | _ -> assert false);
+    (* Integer division, all three of real Julia's roundings -- `7 % 2` was
+       here but `div(7, 2)` was not, so there was no way to write the other
+       half of a divmod at all. `÷` is real Julia's own spelling of `div`
+       (U+00F7), lexed as its own operator. Truncated / floored / ceiling,
+       exactly as real Julia defines them: div(-7,2) = -3, fld(-7,2) = -4,
+       cld(7,2) = 4. *)
+    let to_i v = match v with VInt n -> n | VFixedInt { v; _ } -> v | other -> int_of_float (as_float other) in
+    let int2 name f =
+      Dispatch.defmethod name [ [ "Integer" ]; [ "Integer" ] ] (function
+        | [ a; b ] -> (
+          let x = to_i a and y = to_i b in
+          match y with 0 -> failwith "DivideError: integer division error" | _ -> VInt (f x y))
+        | _ -> assert false)
+    in
+    int2 "div" (fun x y -> x / y);
+    int2 "\xc3\xb7" (fun x y -> x / y);
+    int2 "fld" (fun x y -> if x * y < 0 && x mod y <> 0 then (x / y) - 1 else x / y);
+    int2 "cld" (fun x y -> if x * y > 0 && x mod y <> 0 then (x / y) + 1 else x / y);
+    Dispatch.defmethod "sign" [ [ "Integer" ] ] (function
+      | [ a ] -> VInt (compare (to_i a) 0)
+      | _ -> assert false);
+    Dispatch.defmethod "sign" [ [ "Float" ] ] (function
+      | [ VFloat a ] -> VFloat (if a > 0.0 then 1.0 else if a < 0.0 then -1.0 else a)
       | _ -> assert false);
     Dispatch.defmethod "abs" [ [ "Int" ] ] (function
       | [ VInt a ] -> VInt (abs a)
@@ -2353,6 +2584,77 @@
     num2 ">=" (fun a b -> VBool (a >= b)) (fun a b -> VBool (a >= b));
     num2 "==" (fun a b -> VBool (a = b)) (fun a b -> VBool (a = b));
     num2 "!=" (fun a b -> VBool (a <> b)) (fun a b -> VBool (a <> b));
+    (* `==` used to answer for Numbers and NOTHING else, so `true == true`,
+       `"a" == "a"`, `nothing == nothing`, `:a == :a` and comparing two
+       structs all raised a MethodError -- one of the first things anyone
+       sitting down to write a program reaches for.
+
+       Real Julia's `==` falls back to `===`, which for an IMMUTABLE struct
+       compares field by field and for a `mutable struct` is object identity.
+       This mirrors that, and recurses into containers by DISPATCHING each
+       element back through `==`, so a user's own `==` method on their own
+       type still governs its own values, even nested inside a Tuple or an
+       Array. Physical equality short-circuits first, which is also what
+       keeps a self-referential struct (`n.next === n`) from recursing
+       forever. Registered on (Any, Any), the least specific signature there
+       is, so every existing and future more-specific `==` still wins. *)
+    let elem_eq a b = match Dispatch.call "==" [ a; b ] with VBool r -> r | _ -> false in
+    let array_eq xs ys = Array.length xs = Array.length ys && (
+      let ok = ref true in
+      Array.iteri (fun i x -> if !ok && not (elem_eq x ys.(i)) then ok := false) xs;
+      !ok)
+    in
+    let generic_eq a b =
+      if a == b then true
+      else
+        match a, b with
+        | VStr x, VStr y -> String.equal x y
+        | VBool x, VBool y -> x = y
+        | VNothing, VNothing -> true
+        | VSymbol (x, _), VSymbol (y, _) -> String.equal x y
+        | VType x, VType y -> String.equal x y
+        | VRange (a1, s1, b1), VRange (a2, s2, b2) -> a1 = a2 && s1 = s2 && b1 = b2
+        | VTuple xs, VTuple ys -> array_eq xs ys
+        | VArr { cells = xs; _ }, VArr { cells = ys; _ } -> array_eq (arrbuf_to_array xs) (arrbuf_to_array ys)
+        | VVec xs, VVec ys -> vecbuf_to_array xs = vecbuf_to_array ys
+        | VMat xs, VMat ys -> xs = ys
+        | VDict d1, VDict d2 ->
+          dict_length d1 = dict_length d2
+          && List.for_all
+               (fun (k, v) ->
+                 match Hashtbl.find_opt d2.dtbl (dict_key k) with
+                 | Some (_, _, v2) -> elem_eq v v2
+                 | None -> false)
+               (dict_pairs d1)
+        | VStruct s1, VStruct s2 ->
+          String.equal s1.kind s2.kind
+          && (match Hashtbl.find_opt struct_defs s1.kind with
+             (* a mutable struct is compared by identity, which the physical
+                check above already settled -- two distinct ones are not
+                equal however alike their fields look, same as real Julia *)
+             | Some sd when sd.mutable_ -> false
+             | _ ->
+               Array.length s1.fields = Array.length s2.fields
+               && array_eq (Array.map (fun (_, r) -> !r) s1.fields) (Array.map (fun (_, r) -> !r) s2.fields))
+        | _ -> false
+    in
+    Dispatch.defmethod "==" [ [ "Any" ]; [ "Any" ] ] (function
+      | [ a; b ] -> VBool (generic_eq a b)
+      | _ -> assert false);
+    Dispatch.defmethod "!=" [ [ "Any" ]; [ "Any" ] ] (function
+      | [ a; b ] -> VBool (not (generic_eq a b))
+      | _ -> assert false);
+    (* lexicographic String ordering, real Julia's own -- what `sort` on a
+       Vector of names needs, since sorting goes through this `<` *)
+    let str_cmp name op =
+      Dispatch.defmethod name [ [ "String" ]; [ "String" ] ] (function
+        | [ VStr a; VStr b ] -> VBool (op (compare a b) 0)
+        | _ -> assert false)
+    in
+    str_cmp "<" ( < );
+    str_cmp "<=" ( <= );
+    str_cmp ">" ( > );
+    str_cmp ">=" ( >= );
     (* String support: concatenation via "+" too, same name, different signature *)
     Dispatch.defmethod "+" [ [ "String" ]; [ "String" ] ] (function
       | [ VStr a; VStr b ] -> VStr (a ^ b)
@@ -3492,7 +3794,15 @@
     def_math1 "log" log;
     def_math1 "floor" floor;
     def_math1 "ceil" ceil;
-    def_math1 "round" Float.round;
+    (* real Julia's `round` breaks a tie toward the EVEN neighbour
+       (RoundNearest, IEEE-754's default): round(2.5) is 2.0, round(3.5) is
+       4.0. OCaml's own Float.round rounds a tie away from zero, which quietly
+       disagreed on exactly the halves. *)
+    def_math1 "round" (fun x ->
+      let r = Float.round x in
+      if Float.abs (x -. Float.trunc x) <> 0.5 then r
+      else if Float.rem r 2.0 = 0.0 then r
+      else r -. Float.copy_sign 1.0 x);
     Dispatch.defmethod "atan2" [ [ "Number" ]; [ "Number" ] ] (function
       | [ y; x ] -> VFloat (atan2 (as_float y) (as_float x))
       | _ -> assert false);
@@ -3606,6 +3916,14 @@
     Dispatch.defmethod "length" [ [ "Array" ] ] (function
       | [ VArr { cells; _ } ] -> VInt (arrbuf_length cells)
       | _ -> assert false);
+    (* a Range knew how to be summed, maximized and iterated, but not how
+       many elements it has -- `length(1:2:9)` raised a MethodError. Counted,
+       never materialized, and empty when the step points away from the stop
+       (`length(5:1)` is 0, same as real Julia). *)
+    Dispatch.defmethod "length" [ [ "Range" ] ] (function
+      | [ VRange (a, s, b) ] -> VInt (if s = 0 then 0 else max 0 (((b - a) / s) + 1))
+      | [ VFRange (a, s, b) ] -> VInt (if s = 0.0 then 0 else max 0 (int_of_float (Float.floor ((b -. a) /. s)) + 1))
+      | _ -> assert false);
     (* Vector(x::Array)/Array(x::Vector): the missing interop between
        Runtime's two collection types -- VVec (flat numeric, what
        draw_rects/get_data/put_data/push!'s fast path all want) and VArr
@@ -3644,6 +3962,25 @@
       | _ -> assert false);
     Dispatch.defmethod "lowercase" [ [ "String" ] ] (function
       | [ VStr s ] -> VStr (String.lowercase_ascii s)
+      | _ -> assert false);
+    Dispatch.defmethod "uppercase" [ [ "String" ] ] (function
+      | [ VStr s ] -> VStr (String.uppercase_ascii s)
+      | _ -> assert false);
+    (* `length` already answered for every container here EXCEPT the one type
+       most likely to be asked -- `length("hello")` raised a MethodError.
+       Bytes, not codepoints, same as real Julia's own `length`-vs-`sizeof`
+       split resolves for ASCII (which is all this lexer accepts in a string
+       literal anyway). *)
+    Dispatch.defmethod "length" [ [ "String" ] ] (function
+      | [ VStr s ] -> VInt (String.length s)
+      | _ -> assert false);
+    (* real Julia concatenates strings with `*`, not `+` (`+` is deliberately
+       NOT defined for strings there at all, since concatenation isn't
+       commutative). Tsubaki's own pre-existing `+` stays -- removing it would
+       break existing programs for no gain -- but `*` is what someone writing
+       Julia reaches for, and its absence made real Julia source stop dead. *)
+    Dispatch.defmethod "*" [ [ "String" ]; [ "String" ] ] (function
+      | [ VStr a; VStr b ] -> VStr (a ^ b)
       | _ -> assert false);
     (* Expr(head, args) -- real Julia's own quoted-syntax constructor,
        letting a macro body BUILD new quoted syntax (not just inspect what

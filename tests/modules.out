@@ -1,0 +1,15 @@
+Shapes.area(c1) = 3.141592653589793
+Shapes.area(Shapes.Square(3.0)) = 9.0
+bare Circle before using: MethodError: no method matching Circle(Float)
+after using -- area(c2) = 12.566370614359172
+same tag either way: Shapes.Circle / Shapes.Circle
+ring_area(2.0, 1.0) = 9.42477796076938
+Shapes.nope: UndefVarError: Shapes.nope not defined
+Metric saw an Int
+Imperial saw a String
+one level down
+two levels down
+two levels down
+bang
+saw was not imported: MethodError: no method matching saw()
+but Toolbox.saw() still works: zzz

@@ -350,6 +350,36 @@ globalThis.host_physics_body_count = (world) => physics_body_count(world);
 // with a synchronous XHR instead. Eval resolves the path before calling.
 globalThis.host_read_file = (path) => fs.readFileSync(path, "utf8");
 
+// One line from stdin, synchronously, for the REPL (bin/repl.ml). Returns
+// null at end of input (Ctrl-D), which is how the REPL knows to stop.
+//
+// Synchronous on purpose: the interpreter is an ordinary recursive OCaml
+// function with no way to await a callback, and readline's async API would
+// mean restructuring the whole read-eval-print loop around it. So: read one
+// byte at a time off fd 0 until a newline. Slow per byte and entirely
+// irrelevant at human typing speed. EAGAIN can come back from a terminal
+// that has nothing typed yet -- that is not end of input, so it retries.
+// Bytes are collected raw and decoded only at the newline: decoding each byte
+// on its own would mangle every multi-byte character, and Tsubaki source has
+// real ones in it (`÷`, `⊻`, `⋅`, and anything inside a string literal).
+const stdinByte = Buffer.alloc(1);
+globalThis.host_read_line = () => {
+  const bytes = [];
+  for (;;) {
+    let n;
+    try {
+      n = fs.readSync(0, stdinByte, 0, 1, null);
+    } catch (e) {
+      if (e.code === "EAGAIN") continue;
+      if (e.code === "EOF") return bytes.length ? Buffer.from(bytes).toString("utf8") : null;
+      throw e;
+    }
+    if (n === 0) return bytes.length ? Buffer.from(bytes).toString("utf8") : null; // Ctrl-D
+    if (stdinByte[0] === 0x0a) return Buffer.from(bytes).toString("utf8");
+    if (stdinByte[0] !== 0x0d) bytes.push(stdinByte[0]);
+  }
+};
+
 globalThis.host_physics_step = (world, dt) => physics_step(world, dt);
 
 // n = body count (bin/physicsBridge.ml gets it from host_physics_body_count,

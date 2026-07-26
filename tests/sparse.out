@@ -1,0 +1,8 @@
+size = (3, 3), nnz = 4
+S*b = 5.0 5.0 6.0
+S\b = 0.208333 0.2 0.166667
+S*(S\b) = 1.0 1.0 1.0
+spzeros: size = (2, 4), nnz = 0
+sparse(dense): nnz = 2
+Matrix(sparse(D)) = 1.0 0.0 0.0 2.0
+tridiagonal 4x4: nnz = 10, worst residual < 1e-9: true

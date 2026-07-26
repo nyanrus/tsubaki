@@ -109,10 +109,37 @@
 
   let patch b pos i = b.instrs.(pos) <- i
 
+  (* Removes the parser's source-position markers (Ast's SLine) from a body,
+     at every nesting level, before any of the compilers in this file look at
+     it. Everything here decides ELIGIBILITY by matching exact statement
+     shapes -- `[ SExpr (EAssign ...) ]`, a body of exactly one statement, and
+     so on -- and a marker sitting between those would not fail loudly, it
+     would silently stop the body from compiling and quietly hand back the
+     tree-walking interpreter instead. Stripping once, at each entry point,
+     means every shape-match below sees exactly the list it saw before line
+     numbers existed. *)
+  let rec strip_lines (body : stmt list) : stmt list =
+    List.filter_map
+      (function
+        | SLine _ -> None
+        | SIf (branches, else_body) ->
+          Some (SIf (List.map (fun (c, b) -> c, strip_lines b) branches, Option.map strip_lines else_body))
+        | SFor (t, e, b) -> Some (SFor (t, e, strip_lines b))
+        | SWhile (c, b) -> Some (SWhile (c, strip_lines b))
+        | STry (b, name, handler) -> Some (STry (strip_lines b, name, strip_lines handler))
+        | SFuncDecl (n, p, kw, b, cache) -> Some (SFuncDecl (n, p, kw, strip_lines b, cache))
+        | SModuleDecl (n, b) -> Some (SModuleDecl (n, strip_lines b))
+        | SMacroDecl (n, p, b) -> Some (SMacroDecl (n, p, strip_lines b))
+        | SMacroCall (n, s) -> Some (SMacroCall (n, List.hd (strip_lines [ s ])))
+        | ( SExpr _ | SReturn _ | SDestructure _ | SLocalTypedAssign _ | SStructDecl _ | SAbstractDecl _
+          | SUsing _ | SImport _ | SExport _ ) as s -> Some s)
+      body
+
   (* compiles a function body that takes no parameters (see the module
      comment) into bytecode; None if anything in the body falls outside
      the restricted subset above -- never raises to the caller *)
   let try_compile (body : stmt list) : (instr array * int) option =
+    let body = strip_lines body in
     let buf = mk_buf () in
     let slots : (string, int) Hashtbl.t = Hashtbl.create 8 in
     let next_slot = ref 0 in
@@ -466,6 +493,7 @@
       | _ -> failwith (Printf.sprintf "to_wgsl: malformed binding kind %S -- expected \"<kind>\" or \"<kind>:<ElementType>\"" raw)
 
     let try_compile (body : stmt list) (buffers : (string * string) list) : string option =
+      let body = strip_lines body in
       let buffer_info : (string, string * ty) Hashtbl.t = Hashtbl.create 4 in
       List.iter (fun (n, raw) -> Hashtbl.replace buffer_info n (parse_binding raw)) buffers;
       let locals : (string, ty) Hashtbl.t = Hashtbl.create 8 in
@@ -832,6 +860,7 @@
                type_name))
 
     let compile_stage (stage : [ `Vertex | `Fragment ]) (body : stmt list) (uniforms : (string * string) list) : string option =
+      let body = strip_lines body in
       let uniform_ty : (string, ty) Hashtbl.t = Hashtbl.create 4 in
       List.iter (fun (n, t) -> Hashtbl.replace uniform_ty n (parse_uniform_type t)) uniforms;
       let locals : (string, ty) Hashtbl.t = Hashtbl.create 8 in
@@ -1118,7 +1147,9 @@
        a different method entirely. Runaway inlining is bounded at the call
        site instead (inline_depth, below), which costs nothing and can't
        misread a same-named method on other types as recursion. *)
-    let body_expr = match body with [ SExpr e ] -> Some e | [ SReturn (Some e) ] -> Some e | _ -> None in
+    let body_expr =
+      match strip_lines body with [ SExpr e ] -> Some e | [ SReturn (Some e) ] -> Some e | _ -> None
+    in
     match body_expr with
     | Some e when kwparams = [] && params <> [] && List.for_all simple_param params -> (
       let self = List.map (fun p -> p.pname, EVar (p.pname, Runtime.new_var_cache ())) params in
@@ -1133,6 +1164,7 @@
     | _ -> ()
 
   let try_compile_host (body : stmt list) : (Host.program * int) option =
+    let body = strip_lines body in
     let slots : (string, int) Hashtbl.t = Hashtbl.create 8 in
     let next_slot = ref 0 in
     let slot_for name =
