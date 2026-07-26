@@ -121,6 +121,7 @@
 
   and resolve_stmt s (st : stmt) : unit =
     match st with
+    | SLine _ -> () (* a source-position marker binds and references nothing *)
     | SExpr e -> resolve_expr s e
     | SIf (branches, else_body) ->
       List.iter
@@ -278,6 +279,7 @@
 
   and resolve_quoted_stmt s (st : stmt) : unit =
     match st with
+    | SLine _ -> ()
     | SExpr e -> resolve_quoted_expr s e
     | SIf (branches, else_body) ->
       List.iter

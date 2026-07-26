@@ -1,0 +1,8 @@
+handled: this one is handled
+about to fail
+tsubaki: Int is not a struct, has no fields
+  at tests/errors_position.jl:10
+  in:
+    boom, called from line 14
+    middle, called from line 18
+    outer, called from line 29

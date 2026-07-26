@@ -1,0 +1,22 @@
+Tsubaki -- a Julia-like language. Ctrl-D to leave.
+Type an expression to see its value; end a line with ; to keep it quiet.
+tsubaki> tsubaki> tsubaki> tsubaki> tsubaki> tsubaki> tsubaki> tsubaki> tsubaki> 2
+tsubaki> 21
+tsubaki> 42
+tsubaki> 1.4142135623730951
+tsubaki> interpolating 21
+tsubaki>       ..       .. tsubaki> 49
+tsubaki>       ..       ..       .. tsubaki> Point(x=3, y=4)
+tsubaki> 7
+tsubaki> tsubaki> ERROR: UndefVarError: undefined_name not defined
+tsubaki> ERROR: MethodError: no method matching square(Int, Int, Int)
+tsubaki> ERROR: BoundsError: index 9
+tsubaki> 441
+tsubaki>       ..       ..       ..       .. x is big
+tsubaki>       ..       ..   tick 1
+  tick 2
+  tick 3
+tsubaki> [10.0, 20.0, 30.0]
+tsubaki> 30.0
+tsubaki> 3
+tsubaki> 

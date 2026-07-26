@@ -1,0 +1,15 @@
+hi shiro
+3 + 4 = 7
+nested: 11
+adjacent: 34
+quote: "q"
+backslash: \
+tab:	after
+dollar: $name is not interpolated
+ok!!
+["a", "b", "c"]
+3 5
+true false true
+42
+a struct field: y!!
+a bool: true, a float: 0.25

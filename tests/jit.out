@@ -1,0 +1,11 @@
+pisum_small() = 1.6448340718480652
+called twice, same answer: true
+loop_sum() = 5050
+nested_loops() = 3025
+with_branches() = 60
+while_loop() = 10
+1
+2
+2
+scaled() = 6
+total is 5050

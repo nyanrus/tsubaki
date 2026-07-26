@@ -246,6 +246,12 @@
           i := !i + 3
         | _ -> (
           match two with
+          | Some "\xc3\xb7" ->
+            (* unicode division U+00F7, real Julia's own spelling of `div`
+               (integer division, truncated) -- two bytes, not three like
+               the operators above, so it belongs in this branch *)
+            emit (TOP "\xc3\xb7");
+            i := !i + 2
           | Some ("<:" as op) | Some ("::" as op) | Some ("==" as op) | Some ("!=" as op)
           | Some ("<=" as op) | Some (">=" as op) | Some ("->" as op) | Some ("&&" as op)
           | Some ("||" as op) | Some ("+=" as op) | Some ("-=" as op) | Some ("*=" as op)

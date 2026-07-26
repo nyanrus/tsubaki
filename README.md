@@ -39,6 +39,28 @@ All four produce the same answer as real Julia; none are fast.
 
 The honesty practice behind those numbers, in short:
 
+- **A regression suite where two thirds of it runs under real Julia too.**
+  `make test` runs every `tests/*.jl` against its recorded output; `make
+  test-julia` additionally feeds each test marked `# julia: yes` to real
+  Julia 1.12.5 and requires *the same golden file* to match both. So "this
+  behaves like Julia" is not a claim about 13 of the 20 tests — it is a
+  second execution. Writing them turned up real divergences on the first
+  pass: `3x^2` parsing as `(3x)^2` where Julia says `3*(x^2)`, `round(2.5)`
+  rounding away from zero where Julia rounds to even, `==` answering for
+  numbers and nothing else (`true == true` was a `MethodError`), and a
+  factory function handing back the *same* closure twice over rather than
+  two independent ones. Where Tsubaki still differs on purpose, the difference
+  itself is a test: [`tests/known_gaps.jl`](tests/known_gaps.jl) pins the
+  current behavior of each, with real Julia's answer written beside it, so
+  closing one fails the suite instead of passing unnoticed.
+- **Values are printed, not approximated.** A float shows the shortest
+  decimal that reads back as the same float, and switches to scientific
+  notation on real Julia's own thresholds. That sounds cosmetic and wasn't:
+  the previous fixed `%.3f` printed `1.5e-8` as `0.000`, `-0.0` as `0.000`,
+  and this file's own `pisum` benchmark as `1.645` — while the text beside
+  it claimed agreement with Julia's `1.6449340668`, true and unverifiable
+  from the output. It now prints `1.6448340718480652`, and
+  `tests/benchmarks.jl` checks that digit for digit against real Julia.
 - **Bugs found by running real code, not synthetic demos.** Every feature had
   its own passing hand-written demo; the benchmarks (and later, unmodified
   real package source) broke in ways those demos never did — a missing `>>>`
@@ -76,14 +98,90 @@ Requires: OCaml + dune + `wasm_of_ocaml-compiler` (opam), Rust + the
 from Node 22 on).
 
 ```sh
+make repl                      # an interactive prompt
 make run                       # runs bin/main.ml's embedded demo program
 make run FILE=path/to/prog.jl  # runs that file instead
+make test                      # every tests/*.jl against its recorded output
+make test-julia                # ...and the julia-compatible ones under real Julia too
 ```
 
-There's no REPL, but a real `.jl`-style file works:
+The REPL (`--repl`) keeps its state from one line to the next, reads a
+declaration that spans several lines until the last `end` closes it, prints
+what an expression came to (a trailing `;` keeps it quiet, same as real
+Julia), and survives every error — a `MethodError` at one prompt leaves
+everything defined so far still defined:
+
+```
+tsubaki> function square(n)
+      ..     return n * n
+      .. end
+tsubaki> square(7)
+49
+tsubaki> square("nope", 2)
+ERROR: MethodError: no method matching square(String, Int)
+tsubaki> square(7)
+49
+```
+
+A real `.jl`-style file works too:
 `node -r ./preload.js _build/default/bin/main.bc.wasm.js path/to/prog.jl`
 (paths resolve relative to wherever `node` was launched from). With no path,
 it falls back to the fixed demo at the bottom of `bin/main.ml`.
+
+`include("other.jl")` reads a sibling file and runs it right there, resolving
+its argument against the *including file's* directory the way real Julia
+does — so a program can be several files, and `examples/keel_bounce.jl` finds
+`examples/keel.jl` no matter where the process was started from.
+
+### Where an error happened
+
+A runtime error carries its place: the file and line of the statement that
+raised it, then the calls that led there, innermost first. Parse errors have
+had line/column all along, and `parse_stmt_list` recovers across statements —
+one pass reports every independent mistake, each with its own line/col (it
+still won't *run* with any errors, only diagnoses better).
+
+```
+$ make run FILE=tests/errors_position.jl
+about to fail
+tsubaki: Int is not a struct, has no fields
+  at tests/errors_position.jl:10
+  in:
+    boom, called from line 14
+    middle, called from line 18
+    outer, called from line 29
+```
+
+The position rides along as a marker statement the parser puts in front of
+every statement ([`bin/ast.ml`](bin/ast.ml)'s `SLine`) rather than as a field
+on every AST node — see that comment for why, and `Compile.strip_lines` for
+how the bytecode compiler goes on seeing exactly the statement lists it saw
+before. A *caught* error is untouched by any of this — `catch e` still binds
+the same bare value it did before, with no position glued onto its message.
+
+**What it costs, measured.** Between 1.5% and 7%, depending on how much of a
+program is calls: `pisum` +1.5%, `qsort!` +2.7%, `mandelperf` +4.3%, and
+`fib(25)` — which is nothing *but* calls — +6.8% (0.1036 s → 0.1107 s, mean of
+eight runs each). Two earlier versions cost considerably more and were thrown
+away rather than shipped:
+
+- a traceback frame as a `(name, line)` cons cell allocated two blocks on
+  every call: **+14% on `fib(25)`**. Now two parallel growable arrays, an
+  index, and a real list built only where an error actually reads one.
+- unwinding the position carefully on the way out, which meant an exception
+  handler installed on every call. Now nothing unwinds at all: a raised error
+  deliberately leaves the position and the frames exactly where it happened —
+  which is precisely what the report wants to read — and whoever *catches* it
+  puts them back (`STry`, or the top level). One save per `try` instead of one
+  handler per call.
+
+The first number was only found because the original measurement compared
+against a build whose own float display was `%.3f`, which had nowhere near
+the resolution to show it.
+
+Functions declared in an `include`d file report their own file, not the
+caller's, because a function captures the file it was written in the same way
+it already captured its module.
 
 `--frames N` runs a program's `on_frame` callback N times headlessly (fixed
 1/60s dt, no browser) — enough to exercise a frame's *logic* with no pixels.
@@ -369,7 +467,26 @@ real GPU/WebGL2 execution (`examples/wgsl_vec2.jl`, `examples/glsl_triangle.jl`
 `ceil`/`round` (`bin/runtime.ml`) — thin wrappers over OCaml's `Stdlib`,
 accepting `Int` or `Float` uniformly (`pi` is a plain global). Without them,
 anything needing an angle (circular motion, rotation, bearing) had no way to
-be written in Tsubaki at all.
+be written in Tsubaki at all. `round` breaks a tie toward the even neighbour,
+real Julia's `RoundNearest` (`round(2.5)` is `2.0`, `round(3.5)` is `4.0`) —
+OCaml's own `Float.round` rounds a tie away from zero, which disagreed on
+exactly the halves.
+
+Integer division in all three of real Julia's roundings — `div` (truncated,
+also spelled `÷`), `fld` (floored), `cld` (ceiling) — plus `sign`. `%` was
+here already; there had been no way to write the other half of a divmod.
+
+`==`/`!=` answer for **any** two values, not only numbers: strings, `Bool`,
+`nothing`, `Symbol`, first-class types, Tuples, Arrays, Dicts, and structs
+field by field, with a `mutable struct` compared by identity instead — real
+Julia's own split, and verified against it. A user's own `==` method on their
+own type is more specific and still wins, including for a value nested inside
+a container. Strings also order (`<`/`<=`/`>`/`>=`, lexicographic), which is
+what `sort` on a Vector of names goes through.
+
+Strings: `length`, `lowercase`/`uppercase`, and `*` for concatenation —
+real Julia's spelling, and its absence used to stop real Julia source dead.
+The pre-existing `+` still concatenates too.
 
 ## What it can actually do
 
@@ -408,9 +525,19 @@ be written in Tsubaki at all.
 - **Complex numbers**: `complex(re, im)`, `real`, `imag`, and `+`/`-`/`*`/`^`
   on `Complex` (a `Number` subtype) — added to run `examples/mandel.jl`.
 - **Closures**: `x -> expr`, `(a, b) -> expr`, with real lexical capture.
-  Named `function`s declared inside another function close over its locals
-  (read and mutate). One caveat: re-declaring the same named function adds a
-  candidate method rather than replacing it.
+  A named `function` declared inside another function is a real local of the
+  call that is running: it closes over that call's own variables (read and
+  mutate), can recurse by its own name, and calling the enclosing function
+  again makes a genuinely new one. That last part used to be false, silently
+  — an inner function existed only as a method on the global generic function
+  of its name, and defining one with the same signature *replaces* it, so a
+  factory called twice handed back the same closure both times, with the same
+  counter inside. Two limits remain, each falling back to exactly that older
+  behavior rather than anything worse: an inner function with keyword
+  parameters isn't bound locally (the local-closure call path passes only
+  positional arguments), and a call whose arguments don't match re-enters
+  ordinary dispatch, which is what keeps several same-named inner methods
+  choosing by type.
 - **Keyword arguments**: `f(a; k = default)` — a side channel, never part of
   the dispatch signature, matching real Julia.
 - **Control flow**: `if`/`elseif`/`else`, `for x in`/`= <range or vector>`,
@@ -472,6 +599,15 @@ be written in Tsubaki at all.
   conversion (`InexactError` on out-of-range), same-type arithmetic wraps on
   overflow. `f.(container)` broadcast (single-arg). `Int[]`/`Int[1,2,3]` typed
   literals. `Vector{T}(undef, n)` / `Matrix{T}(undef, m, n)`.
+- **`Float64` and `Int64` are accepted everywhere a type name is written** —
+  real Julia's own spellings, normalized to Tsubaki's `Float`/`Int` tags on
+  the way in: annotations, struct fields, `Union{...}` alternatives, typed
+  literals (`Float64[1.0, 2.0]`), `Vector{Float64}(undef, n)`, `isa`,
+  `Box{Float64}` and `::Type{Float64}` dispatch, and the conversions
+  `Float64(x)`/`Int64(x)` (`Float(x)` had no spelling at all before). The
+  tags themselves are unchanged — renaming them means rewriting the ~120
+  method signatures that spell them out as literal strings — so `typeof(1.0)`
+  still answers `Float`. `tests/type_aliases.jl` runs under real Julia too.
 - **First-class type values and `::Type{X}` dispatch** — a bare type name
   evaluates to a `VType`; `f(::Type{Deque{T}}) where T` and `factor(::Type{A},
   n) where {A<:AbstractArray}` dispatch on the type itself, via the existing
@@ -517,12 +653,11 @@ be written in Tsubaki at all.
   `Dict("a" => 1)` doesn't parse (it needs a `Pair` type that collides with
   the demo's own `struct Pair{K,V}`, plus varargs dispatch doesn't have —
   three decisions, not one). Keys are limited to immutable scalar types.
-- **A runtime error names the function, not the line.** `MethodError`/
-  `HostError` name what failed but carry no source position (the AST doesn't
-  carry one). Parse errors *do* have line/column, and `parse_stmt_list`
-  recovers across statements — one pass reports every independent mistake,
-  each with its own line/col (it still won't *run* with any errors, only
-  diagnoses better).
+- **A traceback skips a function that was bytecode-compiled.** A runtime
+  error now names its file, its line, and the chain of calls that reached it
+  (see "Where an error happened" below) — but a zero-parameter function that
+  took the bytecode/Host path doesn't run through the tree-walker and so
+  contributes no frame. The functions it *calls* still do.
 - **`module`/`using`/`import` are a real but narrow subset.** No export lists;
   two modules declaring an unrelated same-named type both `using`'d end up
   treated as related (the same "same name → merged" simplification same-named
@@ -549,8 +684,8 @@ be written in Tsubaki at all.
   classic `js_of_ocaml`. A self-contained pure-OCaml bignum was judged bigger
   than any other single piece of this project's history, and not taken on. See
   `ROADMAP.md`'s "Numeric type genericity."
-- **No REPL, no package system.** One `.jl`-style file per run (or the
-  embedded demo), no multi-file programs beyond `module`/`using`.
+- **No package system.** `include("other.jl")` is the whole of it: no
+  registry, no environments, no `Project.toml`, no versions.
 - **Eleven targeted optimizations plus one static-analysis pass, no more.**
   Variable lookup's depth is resolved statically, but the lookup at that depth
   is still a linear assoc-list scan (interning just makes its comparisons
@@ -584,8 +719,18 @@ be written in Tsubaki at all.
   - `curveBridge.ml`, `physicsBridge.ml`, `audioBridge.ml`, `parallelBridge.ml`,
     `ecs.ml` — the other host bridges (museum curve, physics, audio, worker
     pool, ECS).
-  - `main.ml` — the CLI entry point (run a file, or the built-in demo) and, at
-    the bottom, that demo program.
+  - `repl.ml` — the interactive prompt: reads until every opened block is
+    closed, shows what an expression came to, and never lets an error end the
+    session.
+  - `main.ml` — the CLI entry point (run a file, the REPL, or the built-in
+    demo) and, at the bottom, that demo program.
+- `tests/` — the regression suite: a `NAME.jl` and the `NAME.out` it must
+  print. A test starting `# julia: yes` must produce that same output under
+  real Julia; one named `repl_*` is fed to the REPL on stdin instead of run
+  as a file; [`known_gaps.jl`](tests/known_gaps.jl) pins the places Tsubaki
+  deliberately still differs.
+- `tools/test.py` — runs them (`make test`, `make test-julia`). `--update`
+  re-records the goldens; read its diff before trusting it.
 - `examples/` — real JuliaLang/Microbenchmarks programs plus the GPU/WebGL
   demos (`wgsl_double.jl`, `glsl_triangle.jl`, `webgl_triangle.jl`, the `ecs_gpu_*`
   set). Run browser ones via `web/*.html` (serve the repo root).

@@ -160,6 +160,26 @@
   (* expr and stmt are mutually recursive now: ELambda above carries a real
      stmt list body. *)
   and stmt =
+    | SLine of int
+      (* Not a statement anyone writes -- a source-position marker the parser
+         puts in front of every statement it produces (see
+         Parser.parse_stmt_list), so the evaluator knows which LINE it is
+         currently on and a runtime error can say where it happened. Before
+         this, `MethodError`/`UndefVarError` named the function that failed
+         and nothing else: the AST carried no position at all.
+
+         A marker rather than a position field on every variant, on purpose:
+         a field would have meant touching all ~180 places statements are
+         built and matched across parser/eval/resolve/compile, and quietly
+         changing the shape `compile.ml` matches against (which decides
+         bytecode eligibility by exact statement shape -- a mismatch there
+         doesn't fail, it silently stops compiling). Markers are stripped
+         back out at Compile's own entry points instead (Compile.strip_lines),
+         so that file sees the exact same statement lists it always did.
+
+         Evaluating one sets the current line and yields nothing, so a block's
+         "last expression is the value" rule is unaffected -- a marker always
+         comes BEFORE its statement, never last. *)
     | SExpr of expr
     | SIf of (expr * stmt list) list * stmt list option
     | SFor of for_target * expr * stmt list

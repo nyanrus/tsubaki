@@ -299,7 +299,10 @@
      literal shorthand from ordinary indexing -- see EIndex below, which
      only reaches this check once looking `name` up as a bound variable has
      already failed. *)
-  let is_recognized_elem_type name = Hashtbl.mem Types.parent name
+  (* through Types.canonical, so real Julia's `Float64[1.0, 2.0]` is
+     recognized as a typed-array literal rather than read as indexing into an
+     undefined variable named Float64 *)
+  let is_recognized_elem_type name = Hashtbl.mem Types.parent (Types.canonical name)
 
   let rec take n = function
     | [] -> []
@@ -331,10 +334,13 @@
      Primes.jl's four `factor(::Type{X}, ...) where {X<:Family}` overloads
      each get a genuinely different, correctly-scored alt instead of
      colliding on one identical "any type" pattern. *)
+  (* each name goes through Types.canonical for the same reason every other
+     source-written type name does -- so `f(::Type{Float64})` names the same
+     type `x::Float64` does *)
   let type_pattern_alt = function
-    | TPMatch name -> Printf.sprintf "Type{%s}" name
-    | TPWhole (_, bound) -> Printf.sprintf "Type{%s}" bound
-    | TPNested (outer, _) -> Printf.sprintf "Type{%s{Any}}" outer
+    | TPMatch name -> Printf.sprintf "Type{%s}" (Types.canonical name)
+    | TPWhole (_, bound) -> Printf.sprintf "Type{%s}" (Types.canonical bound)
+    | TPNested (outer, _) -> Printf.sprintf "Type{%s{Any}}" (Types.canonical outer)
 
   let param_sig_alt p =
     match p.ptypepattern with
@@ -372,7 +378,7 @@
            check. A bare type name used as a plain expression (`Vector`,
            `factor(Vector, n)`) becomes a first-class VType this way --
            found necessary for `::Type{X}` dispatch parameters. *)
-        if is_recognized_elem_type n then VType n
+        if is_recognized_elem_type n then VType (Types.canonical n)
         else (
           (* ...and a bare FUNCTION name used as a plain expression is that
              function, as a value. `f = double`, `filter(fell, balls)`,
@@ -394,7 +400,10 @@
           match Hashtbl.find_opt Dispatch.methods n with
           | Some (m :: _) -> VClosure (List.length m.Dispatch.sig_, fun args -> Dispatch.call n args)
           | _ -> failwith msg))
-    | ETypeExpr name -> VType name
+    (* a bare type name as a value -- `Float64`, `Vector`, `Deque{Int64}`.
+       Normalized so a first-class type value and a `::T` annotation agree
+       on what they are naming (see Types.canonical). *)
+    | ETypeExpr name -> VType (Types.canonical name)
     | EBinOp (":", lo, hi, _) -> (
       match eval_expr env lo, eval_expr env hi with
       | VInt a, VInt b -> VRange (a, 1, b)
@@ -455,11 +464,16 @@
       | coll -> VBool (List.exists eq (iter_values coll)))
     | EBinOp (op, a, b, cache) ->
       Dispatch.call_cached cache op [ eval_expr env a; eval_expr env b ]
+    (* real Julia's `println(a, b, c)` puts NOTHING between its arguments.
+       The separator this used to insert meant every program here had to be
+       written around it (`println("x = ", v)` came out as `x =  v`, two
+       spaces) -- and, more to the point, meant no Tsubaki program's output
+       could ever be compared against the same source run under real Julia. *)
     | ECall ("println", args, _, _) ->
-      print_endline (String.concat " " (List.map (fun a -> show (eval_expr env a)) args));
+      print_endline (String.concat "" (List.map (fun a -> show (eval_expr env a)) args));
       VNothing
     | ECall ("print", args, _, _) ->
-      print_string (String.concat " " (List.map (fun a -> show (eval_expr env a)) args));
+      print_string (String.concat "" (List.map (fun a -> show (eval_expr env a)) args));
       VNothing
     | ECall ("typeof", [ x_e ], _, _) -> VStr (tag (eval_expr env x_e))
     | ECall ("isa", [ x_e; EVar (tname, _) ], _, _) ->
@@ -471,7 +485,7 @@
          type name, the same one struct-constructor calls already get, so
          the ubiquitous `isa(x, Int)`/`isa(x, MyStruct)` (never actually
          bound variables) keeps working exactly as before. *)
-      let type_name = match lookup_opt env tname with Some (VType s) -> s | _ -> tname in
+      let type_name = Types.canonical (match lookup_opt env tname with Some (VType s) -> s | _ -> tname) in
       VBool (Types.distance_to (tag (eval_expr env x_e)) type_name <> None)
     | ECall (name, args, kwargs, cache) -> (
       let argv = List.map (eval_expr env) args in
@@ -629,6 +643,9 @@
     | ETypedArrayNew (name, []) when lookup_opt env name <> None ->
       Dispatch.call_cached (Dispatch.new_cache ()) "getindex" [ Option.get (lookup_opt env name) ]
     | ETypedArrayNew (elem_ty, elements) ->
+      (* `Float64[1.0, 2.0]` used to build a real Array{Float64} that then
+         refused every Float handed to it *)
+      let elem_ty = Types.canonical elem_ty in
       let vs = Array.of_list (List.map (eval_expr env) elements) in
       Array.iter
         (fun x ->
@@ -637,10 +654,12 @@
         vs;
       VArr { declared = Some elem_ty; cells = arrbuf_of_array vs }
     | ETypedArrayUndef (elem_ty, n_e) ->
+      let elem_ty = Types.canonical elem_ty in
       let n = (match eval_expr env n_e with VInt n -> n | v -> failwith (Printf.sprintf "Vector{%s}(undef, n): n must be an Int, got %s" elem_ty (tag v))) in
       if n < 0 then failwith (Printf.sprintf "Vector{%s}(undef, n): n must be >= 0, got %d" elem_ty n);
       VArr { declared = Some elem_ty; cells = arrbuf_of_array (Array.make n VNothing) }
     | ETypedMatrixUndef (elem_ty, m_e, n_e) ->
+      let elem_ty = Types.canonical elem_ty in
       let dim what e =
         match eval_expr env e with
         | VInt n -> n
@@ -1046,6 +1065,7 @@
 
   and stmt_to_value env (s : stmt) : value =
     match s with
+    | SLine _ -> VNothing (* filtered out by stmt_list_to_value before it gets here *)
     | SExpr e -> expr_to_value env e
     | SIf (branches, else_body) -> if_stmt_to_value env branches else_body
     | SFor (FVSingle var, iter, body) ->
@@ -1076,6 +1096,10 @@
          declarations, export, nested macro calls, and try/catch can't appear inside a quote)"
 
   and stmt_list_to_value env (stmts : stmt list) : value =
+    (* line markers are scaffolding, not syntax -- a quoted block reifies the
+       statements someone actually wrote, so they are dropped here rather
+       than turning into stray elements of the quoted block *)
+    let stmts = List.filter (function SLine _ -> false | _ -> true) stmts in
     VExpr { head = "block"; args = Array.of_list (List.map (stmt_to_value env) stmts) }
 
   (* --- unquoting: value -> Ast, splicing a macro's returned Symbol/Expr (or
@@ -1359,6 +1383,11 @@
      in eval_expr) needs to call exec_stmt_list, so they're one recursive group. *)
   and exec_stmt env (s : stmt) : value =
     match s with
+    (* the only thing that moves the reported source position -- see Ast's
+       SLine. Yields nothing, so it can never become a block's value. *)
+    | SLine n ->
+      current_line := n;
+      VNothing
     | SExpr e -> eval_expr env e
     | SReturn None -> raise (Return_exc VNothing)
     | SReturn (Some e) -> raise (Return_exc (eval_expr env e))
@@ -1399,12 +1428,21 @@
          why this one choke point covers every `failwith` site in the file
          without touching any of them individually; `e isa DimensionMismatch`
          and `e.msg` both work on the result. *)
+      (* A raised error leaves the source position and the frame stack sitting
+         exactly where it happened -- nothing unwinds them, which is what lets
+         the top level report the place (see tree_walk_impl). So catching one
+         is where they get put back: this handler is already here, and paying
+         for the bookkeeping HERE costs one save per `try`, where doing it on
+         the way out cost one exception handler per call. *)
+      let entered = here () in
       try exec_stmt_list (new_scope env) body with
       | JuliaError v ->
+        restore_site entered;
         let scope = new_scope env in
         Option.iter (fun n -> bind scope n v) catchvar;
         exec_stmt_list scope catch_body
       | Failure msg ->
+        restore_site entered;
         let scope = new_scope env in
         Option.iter (fun n -> bind scope n (exn_of_failure_message msg)) catchvar;
         exec_stmt_list scope catch_body)
@@ -1463,11 +1501,44 @@
          references to another in-module type get resolved consistently
          with this. *)
       let def_prefix = !current_module_prefix in
+      (* which FILE this function was written in, captured the same way the
+         module prefix just above is. A function declared in an `include`d
+         file is called long after that include finished and put the outer
+         file back, so without this its errors would be reported against the
+         caller's file with the callee's line -- a position that belongs to
+         neither. *)
+      let def_file = !current_file in
       let tree_walk_impl argv =
         let call_env = new_scope def_env in
         bind_params call_env params argv;
         List.iter (bind_kwparam call_env) kwparams;
-        let run_body () = try exec_stmt_list call_env body with Return_exc v -> v in
+        let inner () = try exec_stmt_list call_env body with Return_exc v -> v in
+        (* One traceback frame per Tsubaki-level call: this function's name,
+           and the line the CALLER was on when it made the call. The caller's
+           line and file are restored on the way out -- without that, an error
+           in `f(g(x))` raised by `f` would be reported at whatever line `g`
+           finished on.
+
+           Restored only on the way out through a RETURN. An error deliberately
+           leaves all of it exactly as it stood where it was raised, which is
+           what the report wants to read; whoever catches it puts it back
+           (Eval's STry, or the top level in Main/Repl). The first version of
+           this did unwind carefully, snapshotting the stack at the innermost
+           frame -- correct, and it cost an exception handler installed on
+           every single call: +14% on `fib(25)`, measured. Nothing here is
+           worth that, so the handler is gone. *)
+        let run_body () =
+          let caller_line = !current_line and caller_file = !current_file in
+          push_frame name caller_line;
+          (* physical comparison, and skipped entirely in the overwhelmingly
+             common single-file case where both are the same string *)
+          if def_file != caller_file then current_file := def_file;
+          let v = inner () in
+          pop_frame ();
+          current_line := caller_line;
+          if def_file != caller_file then current_file := caller_file;
+          v
+        in
         (* a module-scoped function's body must see its OWN module as
            current (so a bare call inside it resolves within that module,
            regardless of which module the CALLER is currently in) --
@@ -1532,6 +1603,53 @@
       for k = n_required to n_total do
         Dispatch.defmethod (def_prefix ^ name) (take k sig_) impl
       done;
+      (* A `function` declared INSIDE another function's body is ALSO bound as
+         an ordinary local, holding a closure over THIS invocation's scope.
+
+         Without that it exists only as a method on the global generic
+         function of its name -- and `defmethod` replaces a same-signature
+         method, so calling a factory twice does not make two closures, it
+         makes the second replace the first, and every value handed out
+         (before or after) resolves by name to that one:
+
+             function counter()
+                 n = 0
+                 function bump()
+                     n = n + 1
+                     return n
+                 end
+                 return bump
+             end
+             a = counter(); b = counter()
+             a(); a(); b()      # 1, 2, 3 -- one counter, not two
+
+         Both lookup paths already prefer a local binding -- ECall consults
+         lookup_opt_shadow_free before dispatch, EVar consults lookup_cached
+         before falling back to "a bare function name is that function" -- so
+         this needs no new resolution machinery, only the binding itself. The
+         global registration stays exactly as it was, and is what everything
+         below falls back to.
+
+         Two deliberate limits, each falling back to precisely the old
+         behavior rather than to anything worse:
+         - a function with KEYWORD parameters isn't bound locally, because
+           ECall's local-closure branch passes positional arguments only;
+         - a call whose arguments don't match this method's own signature
+           re-enters ordinary dispatch, so several same-named inner methods
+           still choose by type the way they did before.
+
+         Declared inside an `if`/`for` inside a function, the binding lives in
+         that block's scope and is gone after it -- there, the global
+         registration is still the whole story, unchanged. *)
+      if inside_function_body () && kwparams = [] then (
+        let local_impl argv =
+          let k = List.length argv in
+          if k >= n_required && k <= n_total
+             && Dispatch.applicable { Dispatch.sig_ = take k sig_; impl } (List.map tag argv)
+          then impl argv
+          else Dispatch.call (def_prefix ^ name) argv
+        in
+        bind env name (VClosure (n_total, local_impl)));
       VNothing
     | SIf (branches, else_body) ->
       let rec try_branches = function
@@ -1759,10 +1877,20 @@
         let prog = Parser.parse_program src in
         Resolve.resolve_program prog;
         let saved = !current_file_dir in
+        (* the reported source position follows the included file while it
+           runs, and the including file's own line comes back afterwards --
+           otherwise an error inside an included file would name the outer
+           file and a line number belonging to neither *)
+        let entered = here () in
         current_file_dir := Filename.dirname resolved;
-        Fun.protect
-          ~finally:(fun () -> current_file_dir := saved)
-          (fun () -> ignore (exec_stmt_list global prog));
+        current_file := resolved;
+        (* restored on the way out through a RETURN only, the same rule a
+           returning call frame follows: an error propagating out of an
+           included file leaves the position inside that file, which is where
+           it belongs *)
+        ignore (exec_stmt_list global prog);
+        current_file_dir := saved;
+        restore_site entered;
         VNothing
       | _ -> assert false)
 
@@ -1771,3 +1899,16 @@
     let prog = Parser.parse_program src in
     Resolve.resolve_program prog;
     Async.run_effectful (fun () -> ignore (exec_stmt_list global prog))
+
+  (* `run`, but handing back the value of the last statement so the REPL can
+     show it. Runs against the SAME `global` scope every time, which is what
+     makes a REPL a REPL: a function declared at one prompt is still there at
+     the next. Resolve's own global scope persists across calls for the same
+     reason, so a variable introduced earlier resolves at its real depth
+     instead of falling back to a runtime search. *)
+  let eval_toplevel (src : string) : value =
+    let prog = Parser.parse_program src in
+    Resolve.resolve_program prog;
+    let result = ref VNothing in
+    Async.run_effectful (fun () -> result := exec_stmt_list global prog);
+    !result

@@ -1,0 +1,19 @@
+-3 -> negative
+0 -> zero
+5 -> small
+100 -> large
+1+..+5 = 15
+1+3+5+7+9 = 25
+0+.25+.5+.75+1 = 2.5
+ternary: yes
+false && ...: false
+true || ...: true
+  (evaluated &&)
+true && ...: true
+3.5 1 1024 1.4142135623730951
+-1 1
+2 7 24 3
+9
+true true true true
+8 10 48
+a=2 b=6
