@@ -404,6 +404,16 @@
        Normalized so a first-class type value and a `::T` annotation agree
        on what they are naming (see Types.canonical). *)
     | ETypeExpr name -> VType (Types.canonical name)
+    (* calling what an expression evaluated to (see Ast's EApply). Only a
+       closure value can be called this way: dispatch resolves on a NAME, and
+       there isn't one here -- `f()()` has already thrown away every name by
+       the time the second call happens. *)
+    | EApply (callee_e, arg_es) -> (
+      let f = eval_expr env callee_e in
+      let argv = List.map (eval_expr env) arg_es in
+      match f with
+      | VClosure (_, impl) -> impl argv
+      | other -> failwith (Printf.sprintf "MethodError: objects of type %s are not callable" (tag other)))
     | EBinOp (":", lo, hi, _) -> (
       match eval_expr env lo, eval_expr env hi with
       | VInt a, VInt b -> VRange (a, 1, b)
@@ -953,6 +963,12 @@
     | EBinOp (op, a, b, _) ->
       VExpr { head = "call"; args = [| VSymbol (op, !current_hygiene_id); expr_to_value env a; expr_to_value env b |] }
     | ECall (_, _, _ :: _, _) -> failwith "quoting a call with keyword arguments isn't supported"
+    | EApply _ ->
+      (* a quoted "call" carries its callee as a Symbol (below); a computed
+         one has no name to put there, and would need a head of its own on
+         both sides of the quote/unquote pair. Same scope cut as keyword
+         arguments just above. *)
+      failwith "quoting a call on a computed callee (f()(x)) isn't supported"
     | ECall (name, args, [], _) ->
       VExpr
         { head = "call"

@@ -12,6 +12,17 @@
     | ECall of string * expr list * (string * expr) list * Runtime.Dispatch.call_cache
       (* positional args, keyword args, and (like EBinOp) a cache cell owned
          by this one call site *)
+    | EApply of expr * expr list
+      (* calling the RESULT of an expression rather than a name: `f()()`,
+         `v[1](x)`, `(x -> x + 1)(3)`. `ECall` above NAMES its callee, which
+         is what the overwhelmingly common `f(x)` is and what dispatch needs
+         to resolve on; this is the other shape, where the thing being called
+         has to be evaluated first and can only be a closure value.
+
+         Only ever produced by parse_postfix, and only for a "(" that is
+         tight against what precedes it and that the qualified-call path
+         didn't already take (`Name.member(args)` is still EQualifiedCall) --
+         so nothing that parsed before parses any differently now. *)
     | EField of expr * string
     | EAssign of string * expr * Runtime.var_cache
     | EFieldAssign of expr * string * expr

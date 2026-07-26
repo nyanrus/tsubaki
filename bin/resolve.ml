@@ -72,6 +72,9 @@
       List.iter (resolve_expr s) args;
       List.iter (fun (_, e) -> resolve_expr s e) kwargs
     | EField (o, _) -> resolve_expr s o
+    | EApply (f, args) ->
+      resolve_expr s f;
+      List.iter (resolve_expr s) args
     | EAssign (name, rhs, cache) ->
       resolve_expr s rhs;
       resolve_assign s name cache
@@ -231,6 +234,12 @@
     | EInt _ | EFloat _ | EStr _ | EBool _ | ENothing | EEnd | EQuoteSymbol _
     | ETypedArrayUndef _ | ETypedMatrixUndef _ | EVar _ | ETypeExpr _ -> ()
     | ETypedArrayNew (_, elems) -> List.iter (resolve_quoted_expr s) elems
+    (* quoting one is refused outright (see Eval.expr_to_value); this only
+       walks past it, so an `$(...)` interpolation nested inside still gets
+       resolved before that refusal is ever reached *)
+    | EApply (f, args) ->
+      resolve_quoted_expr s f;
+      List.iter (resolve_quoted_expr s) args
     | EBinOp (_, a, b, _) ->
       resolve_quoted_expr s a;
       resolve_quoted_expr s b

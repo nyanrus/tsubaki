@@ -43,7 +43,7 @@ The honesty practice behind those numbers, in short:
   `make test` runs every `tests/*.jl` against its recorded output; `make
   test-julia` additionally feeds each test marked `# julia: yes` to real
   Julia 1.12.5 and requires *the same golden file* to match both. So "this
-  behaves like Julia" is not a claim about 13 of the 20 tests — it is a
+  behaves like Julia" is not a claim about 14 of the 21 tests — it is a
   second execution. Writing them turned up real divergences on the first
   pass: `3x^2` parsing as `(3x)^2` where Julia says `3*(x^2)`, `round(2.5)`
   rounding away from zero where Julia rounds to even, `==` answering for
@@ -538,8 +538,17 @@ The pre-existing `+` still concatenates too.
   positional arguments), and a call whose arguments don't match re-enters
   ordinary dispatch, which is what keeps several same-named inner methods
   choosing by type.
+- **Calling what an expression came to**, not only what a name resolves to:
+  `make_adder(5)(10)`, `fs[1](x)`, `(x -> x * x)(7)`, `d["double"](8)`. A "("
+  tight against the expression before it is a call on that expression's value
+  — which can only be a closure, since dispatch resolves on a name and there
+  isn't one here. A plain `f(x)` and a qualified `Name.member(x)` are both
+  taken earlier and are completely unaffected; and the "(" must be tight, so a
+  statement that merely *begins* with one (a newline in front of it) is still
+  its own statement.
 - **Keyword arguments**: `f(a; k = default)` — a side channel, never part of
-  the dispatch signature, matching real Julia.
+  the dispatch signature, matching real Julia. Not on a computed callee: the
+  local-closure call path passes positional arguments only.
 - **Control flow**: `if`/`elseif`/`else`, `for x in`/`= <range or vector>`,
   `while`, explicit `return` plus "last expression is the value."
 - **`try`/`catch`/`error(msg)`**: user errors and the interpreter's own
@@ -664,7 +673,9 @@ The pre-existing `+` still concatenates too.
   functions already accept); no bare `Name.member` for a non-call member (no
   first-class module value, plain variables aren't namespaced).
 - **Macros/quoting cover a scoped subset of the grammar.** Not quotable
-  (raises a clear error): `Vector{T}(undef, n)` and a bare evaluated block.
+  (raises a clear error): `Vector{T}(undef, n)`, a bare evaluated block, and a
+  call on a computed callee (`f()(x)` -- a quoted call carries its callee as a
+  Symbol, and this shape has no name to put there).
   Macros are namespaced by module and are NOT merged by `using` (unlike
   functions/types). Hygiene renames variable-binding/reference positions only,
   never a call's function/operator name or a `.field` (renaming `+` itself was

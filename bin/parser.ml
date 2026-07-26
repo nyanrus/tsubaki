@@ -496,6 +496,29 @@
         dotted_chain := [];
         advance st;
         e := ECall ("transpose", [ !e ], [], Runtime.Dispatch.new_cache ()))
+      else if at_op st "(" && not (space_before st st.pos) then (
+        (* Calling what the expression so far EVALUATED to: `f()()`,
+           `v[1](x)`, `(x -> x + 1)(3)`.
+
+           A bare `f(x)` never reaches here -- parse_atom's own TIDENT case
+           already took it, as an ECall carrying a name for dispatch to
+           resolve on -- and neither does `Name.member(...)`, taken by the
+           qualified-call branch above while the dotted chain is still a pure
+           run of names. So this only ever fires on shapes that did not parse
+           at all before.
+
+           Requiring NO whitespace before the "(" is what stops it from
+           swallowing a following statement: a line that merely BEGINS with
+           "(" -- `(a, b) = f()` under a preceding expression statement --
+           always has whitespace in front of it, the newline itself. Real
+           Julia draws the same line between `f(x)` and `f (x)`. *)
+        dotted_chain := [];
+        advance st;
+        let args, kwargs = parse_arglist st in
+        expect_op st ")";
+        if kwargs <> [] then
+          raise (Parse_error "keyword arguments need a named function -- a computed callee is a plain closure");
+        e := EApply (!e, args))
       else continue_ := false
     done;
     !e
