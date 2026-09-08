@@ -30,12 +30,17 @@ let read_file path =
    gate the whole thing on it actually being Node. *)
 let () = CurveBridge.init ()
 let () = GpuBridge.init ()
-let () = ActorBridge.init ()
+let () = JsBridge.init ()
 let () = WebglBridge.init ()
 let () = PhysicsBridge.init ()
 let () = AudioBridge.init ()
 let () = Ecs.init ()
 let () = ParallelBridge.init ()
+
+(* last on purpose: this one tells the host Tsubaki is up, and the host's
+   callback runs Tsubaki code straight away -- so every other registration
+   above must already be in place (see ActorBridge.init's own comment) *)
+let () = ActorBridge.init ()
 
 (* the browser path (`is_node = false`): unlike CurveBridge (a self-
    contained toy that only ever registers f/add), a real Tsubaki PROGRAM

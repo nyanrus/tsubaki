@@ -142,6 +142,24 @@
     | Some cell -> Some !cell
     | None -> ( match env.parent with Some p -> lookup_opt p name | None -> None)
 
+  (* "win.document" -> the JS object it names, when the first segment is a
+     bound variable holding a JS handle and every later one is a plain
+     property of it. None for anything else, so a real module keeps the path
+     it always had. Used by EQualifiedCall, which is the shape `obj.meth(x)`
+     parses into when the receiver is a bare name (see Parser's
+     dotted_chain). *)
+  let js_receiver env (dotted : string) : Js_of_ocaml.Js.Unsafe.any option =
+    match String.split_on_char '.' dotted with
+    | [] -> None
+    | first :: rest -> (
+      match lookup_opt env first with
+      | Some v ->
+        List.fold_left
+          (fun acc f -> match acc with Some (VJS _ as o) -> Some (get_field o f) | _ -> None)
+          (Some v) rest
+        |> (function Some (VJS o) -> Some o | _ -> None)
+      | None -> None)
+
   (* like `lookup_opt`, but knows `global` is the one point in any lookup
      chain whose CONTENTS can be proven unchanged since a previous call at
      the SAME AST node (tracked via `global_generation`) -- every scope
@@ -404,16 +422,28 @@
        Normalized so a first-class type value and a `::T` annotation agree
        on what they are naming (see Types.canonical). *)
     | ETypeExpr name -> VType (Types.canonical name)
-    (* calling what an expression evaluated to (see Ast's EApply). Only a
-       closure value can be called this way: dispatch resolves on a NAME, and
-       there isn't one here -- `f()()` has already thrown away every name by
-       the time the second call happens. *)
+    (* calling what an expression evaluated to (see Ast's EApply). A closure
+       value, or a JS function held as a handle: dispatch resolves on a NAME,
+       and there isn't one here -- `f()()` has already thrown away every name
+       by the time the second call happens.
+
+       `obj.meth(...)` is taken apart here rather than evaluated as an
+       ordinary field read, because a JS method must keep its receiver: a
+       get-then-call would lose `this`. *)
     | EApply (callee_e, arg_es) -> (
-      let f = eval_expr env callee_e in
-      let argv = List.map (eval_expr env) arg_es in
-      match f with
-      | VClosure (_, impl) -> impl argv
-      | other -> failwith (Printf.sprintf "MethodError: objects of type %s are not callable" (tag other)))
+      let js_args () = Array.of_list (List.map (fun e -> js_of_value (eval_expr env e)) arg_es) in
+      let call_value f =
+        match f with
+        | VClosure (_, impl) -> impl (List.map (eval_expr env) arg_es)
+        | VJS jf -> value_of_js_shallow (Js_of_ocaml.Js.Unsafe.fun_call jf (js_args ()))
+        | other -> failwith (Printf.sprintf "MethodError: objects of type %s are not callable" (tag other))
+      in
+      match callee_e with
+      | EField (obj_e, meth) -> (
+        match eval_expr env obj_e with
+        | VJS o -> value_of_js_shallow (Js_of_ocaml.Js.Unsafe.meth_call o meth (js_args ()))
+        | obj -> call_value (get_field obj meth))
+      | _ -> call_value (eval_expr env callee_e))
     | EBinOp (":", lo, hi, _) -> (
       match eval_expr env lo, eval_expr env hi with
       | VInt a, VInt b -> VRange (a, 1, b)
@@ -504,6 +534,12 @@
          arrow-lambda syntax without extra ceremony) *)
       match lookup_opt_shadow_free env name cache with
       | Some (VClosure (_, f)) -> f argv
+      | Some (VJS jf) when Js_of_ocaml.Js.to_string (Js_of_ocaml.Js.typeof jf) = "function" ->
+        (* the same shadowing rule, for a JS function held in a variable:
+           `render(h, state)` is handed Preact's own `h`, and the `h(...)`
+           inside the body is that. A handle that ISN'T callable falls
+           through to the ordinary path, and gets the ordinary error. *)
+        value_of_js_shallow (Js_of_ocaml.Js.Unsafe.fun_call jf (Array.of_list (List.map js_of_value argv)))
       | _ ->
         if name = "new" then (
           (* new(...)/new{T}(...) -- only valid while one of a struct's own
@@ -610,7 +646,20 @@
         let result = Dispatch.call_cached cache qualified argv in
         current_kwargs := [];
         result)
-      else failwith (Printf.sprintf "UndefVarError: %s not defined" qualified))
+      else (
+        (* `win.document.getElementById(id)` -- `win` is not a module at all,
+           it is a VARIABLE holding a JS value. Nothing at parse time can
+           tell that apart from `Outer.Inner.f(x)`, so it is decided here:
+           the same lookup-fails-so-reinterpret dispensation EIndex already
+           gets. Only a JS handle takes this path; everything else keeps the
+           exact error it had. *)
+        match js_receiver env modname with
+        | Some o ->
+          if kwargs <> [] then
+            failwith (Printf.sprintf "%s.%s is a JS method, and JS has no keyword arguments" modname member);
+          value_of_js_shallow
+            (Js_of_ocaml.Js.Unsafe.meth_call o member (Array.of_list (List.map js_of_value argv)))
+        | None -> failwith (Printf.sprintf "UndefVarError: %s not defined" qualified)))
     | EField (e, f) -> get_field (eval_expr env e) f
     | EAssign (n, rhs, cache) ->
       let v = eval_expr env rhs in
@@ -1264,7 +1313,8 @@
           (Printf.sprintf "macro expansion: don't know how to un-quote Expr(:%s, ...) with %d arg(s)" head
              (Array.length args))
       | VTuple _ | VStruct _ | VClosure _ | VVec _ | VArr _ | VMat _ | VGenMat _ | VRange _ | VFRange _
-      | VComplex _ | VRational _ | VUniformScaling _ | VComplexVec _ | VComplexMat _ | VSparseMat _ | VDict _ ->
+      | VComplex _ | VRational _ | VUniformScaling _ | VComplexVec _ | VComplexMat _ | VSparseMat _ | VDict _
+      | VJS _ ->
         failwith
           (Printf.sprintf "macro expansion: a macro must return quoted syntax (a Symbol/Expr) or a plain \
                             literal, got a %s"
