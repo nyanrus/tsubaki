@@ -1,0 +1,13 @@
+qualified: 3.141592653589793
+bare after using: 12.566370614359172
+same tag either way: Shapes.Circle / Shapes.Circle
+using twice is still fine: 9.0
+selective import: bang
+saw was not imported: MethodError: no method matching saw()
+but qualified still works: zzz
+nested: two levels down / one level down
+transitive: 3.141592653589793
+mislabelled: import Mislabelled: Mislabelled.jl does not declare `module Mislabelled`
+a knot: import Loop: Loop.jl is still being read (two files asking each other for a module)
+after: and the next one still reads
+a name with nothing behind it: still fine

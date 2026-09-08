@@ -159,6 +159,11 @@
          `parse_type_expr`'s "Dict{Int,String}"). See `tag`'s own case for
          how this integrates with ordinary dispatch, and Types.ancestors
          for why a compound name like "Deque{Int}" can still reach "Any". *)
+    | VPair of value * value
+      (* real Julia's `Pair` (`"a" => 1`) -- what a Dict is written with, and
+         its own value the rest of the time (`p.first`, `p.second`). Deliberately
+         not a 2-Tuple in disguise: `("a", 1)` and `"a" => 1` show differently,
+         dispatch differently, and only one of them means "this goes in a Dict". *)
     | VJS of Js_of_ocaml.Js.Unsafe.any
       (* a JS value held AS IT IS: `document`, a `<browser>` element, Preact's
          `h`. Nothing is copied -- this is the same object the host has, which
@@ -441,6 +446,7 @@
         ; "Symbol", "Any"
         ; "Expr", "Any"
         ; "JSValue", "Any"
+        ; "Pair", "Any"
         ; "UniformScaling", "Any"
         ; (* deliberately "Any", NOT "Vector"/"Matrix" -- every existing
              `[["Vector"]]`/`[["Matrix"]]`-signature method in this file
@@ -522,6 +528,7 @@
   let tag_uint16 = "UInt16"
   let tag_uint32 = "UInt32"
   let tag_jsvalue = "JSValue"
+  let tag_pair = "Pair"
 
   let fixed_int_tag bits signed =
     match bits, signed with
@@ -587,6 +594,7 @@
     | VSymbol _ -> tag_symbol
     | VExpr _ -> tag_expr
     | VJS _ -> tag_jsvalue
+    | VPair _ -> tag_pair
     | VDict _ -> tag_dict
     | VUniformScaling _ -> tag_uniform_scaling
     | VComplexVec _ -> tag_complex_vec
@@ -709,6 +717,7 @@
       in
       "Dict(" ^ String.concat ", " (List.map (fun (_, k, v) -> show_elem k ^ " => " ^ show_elem v) pairs) ^ ")"
     | VTuple vs -> "(" ^ String.concat ", " (Array.to_list (Array.map show_elem vs)) ^ ")"
+    | VPair (a, b) -> show_elem a ^ " => " ^ show_elem b
     | VComplex (re, im) -> show_complex_pair re im
     | VRational (n, d) -> Printf.sprintf "%d//%d" n d
     | VSymbol (name, _) -> ":" ^ name
@@ -797,6 +806,7 @@
     | VVec { vdata; vlen } -> inject (Js.array (Array.init vlen (fun i -> Js.number_of_float vdata.(i))))
     | VArr { cells; _ } -> inject (Js.array (Array.init cells.alen (fun i -> js_of_value cells.adata.(i))))
     | VTuple a -> inject (Js.array (Array.map js_of_value a))
+    | VPair (a, b) -> inject (Js.array [| js_of_value a; js_of_value b |])
     | VDict d ->
       let entries = Hashtbl.fold (fun _ (stamp, k, v) acc -> (stamp, k, v) :: acc) d.dtbl [] in
       let entries = List.sort (fun (a, _, _) (b, _, _) -> compare a b) entries in
@@ -841,6 +851,11 @@
       | "head" -> VSymbol (head, None)
       | "args" -> VArr { declared = None; cells = arrbuf_of_array (Array.copy args) }
       | _ -> failwith (Printf.sprintf "Expr has no field %s (only .head/.args)" name))
+    | VPair (a, b) -> (
+      match name with
+      | "first" -> a
+      | "second" -> b
+      | _ -> failwith (Printf.sprintf "Pair has no field %s (only .first/.second)" name))
     | VJS x ->
       (* a property of a JS object, read at the surface -- `el.value`,
          `win.document`. A method read this way arrives UNBOUND (a plain
@@ -1666,12 +1681,22 @@
     let methods_to_merge =
       Hashtbl.fold (fun k v acc -> if has_prefix k then (bare_of k, v) :: acc else acc) Dispatch.methods []
     in
+    (* the same method record can already be on the bare name -- `using X` twice,
+       or `import X` (which is a `using` here) followed by `using X`. Appending
+       it again would make every call to it ambiguous with itself, so only what
+       isn't already there is merged, and the generation moves only if something
+       really did. *)
+    let merged = ref false in
     List.iter
       (fun (bare, ms) ->
         let existing = Option.value (Hashtbl.find_opt Dispatch.methods bare) ~default:[] in
-        Hashtbl.replace Dispatch.methods bare (ms @ existing))
+        match List.filter (fun m -> not (List.memq m existing)) ms with
+        | [] -> ()
+        | fresh ->
+          merged := true;
+          Hashtbl.replace Dispatch.methods bare (fresh @ existing))
       methods_to_merge;
-    if methods_to_merge <> [] then incr Dispatch.generation;
+    if !merged then incr Dispatch.generation;
     let structs_to_merge =
       Hashtbl.fold (fun k v acc -> if has_prefix k then (bare_of k, v) :: acc else acc) struct_defs []
     in
@@ -1705,12 +1730,22 @@
     let methods_to_merge =
       Hashtbl.fold (fun k v acc -> if has_wanted_prefix k then (bare_of k, v) :: acc else acc) Dispatch.methods []
     in
+    (* the same method record can already be on the bare name -- `using X` twice,
+       or `import X` (which is a `using` here) followed by `using X`. Appending
+       it again would make every call to it ambiguous with itself, so only what
+       isn't already there is merged, and the generation moves only if something
+       really did. *)
+    let merged = ref false in
     List.iter
       (fun (bare, ms) ->
         let existing = Option.value (Hashtbl.find_opt Dispatch.methods bare) ~default:[] in
-        Hashtbl.replace Dispatch.methods bare (ms @ existing))
+        match List.filter (fun m -> not (List.memq m existing)) ms with
+        | [] -> ()
+        | fresh ->
+          merged := true;
+          Hashtbl.replace Dispatch.methods bare (fresh @ existing))
       methods_to_merge;
-    if methods_to_merge <> [] then incr Dispatch.generation;
+    if !merged then incr Dispatch.generation;
     let structs_to_merge =
       Hashtbl.fold (fun k v acc -> if has_wanted_prefix k then (bare_of k, v) :: acc else acc) struct_defs []
     in
@@ -4027,6 +4062,20 @@
       | _ -> assert false);
     Dispatch.defmethod "length" [ [ "Array" ] ] (function
       | [ VArr { cells; _ } ] -> VInt (arrbuf_length cells)
+      | _ -> assert false);
+    (* `a[begin]` and `a[end]`, as ordinary functions -- for when the index is
+       worked out somewhere else. `a[begin + i]` is how an index that came from
+       a 0-origin world (a JS array, Python) is applied without writing the +1
+       by hand, and it says which world the +1 belongs to. Everything indexable
+       here starts at 1, so firstindex is a constant; if that ever stops being
+       true, this is where it stops. *)
+    Dispatch.defmethod "firstindex" [ [ "Vector"; "Array"; "Tuple" ] ] (function
+      | [ _ ] -> VInt 1
+      | _ -> assert false);
+    Dispatch.defmethod "lastindex" [ [ "Vector"; "Array"; "Tuple" ] ] (function
+      | [ VVec r ] -> VInt (vecbuf_length r)
+      | [ VArr { cells; _ } ] -> VInt (arrbuf_length cells)
+      | [ VTuple vs ] -> VInt (Array.length vs)
       | _ -> assert false);
     (* a Range knew how to be summed, maximized and iterated, but not how
        many elements it has -- `length(1:2:9)` raised a MethodError. Counted,
