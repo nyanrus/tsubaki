@@ -19,6 +19,14 @@
     ; line : int array
     ; col : int array
     ; mutable pos : int
+    ; (* how many `[ ... ]` index expressions we are inside. `begin` is two
+         words: inside an index it is the first index (`a[begin + i]`),
+         anywhere else it opens a block (`begin ... end`). `end` needs no such
+         count -- a block's `end` is only ever where a STATEMENT would start,
+         and an index's `end` only ever where an OPERAND would, so those two
+         never meet. Both of `begin`'s meanings want an operand's place, so
+         this is what tells them apart. *)
+      mutable in_index : int
     }
 
   let mk quads =
@@ -27,6 +35,7 @@
     ; line = Array.of_list (List.map (fun (_, _, l, _) -> l) quads)
     ; col = Array.of_list (List.map (fun (_, _, _, c) -> c) quads)
     ; pos = 0
+    ; in_index = 0
     }
 
   let peek st = st.toks.(st.pos)
@@ -480,12 +489,15 @@
       else if at_op st "[" then (
         dotted_chain := [];
         advance st;
+        let outer = st.in_index in
+        st.in_index <- outer + 1;
         let first = parse_expr st in
         let rest = ref [] in
         while at_op st "," do
           advance st;
           rest := parse_expr st :: !rest
         done;
+        st.in_index <- outer;
         expect_op st "]";
         (* a single index (`v[i]`) stays a bare expr, unchanged from before;
            `A[i,j]` (only ever a Matrix's own row/col pair here -- Tsubaki has
@@ -574,9 +586,18 @@
     | TKW "nothing" ->
       advance st;
       ENothing
-    | TKW "begin" ->
+    (* inside `a[ ... ]`: the first index (see the `in_index` comment on state) *)
+    | TKW "begin" when st.in_index > 0 ->
       advance st;
       EBegin
+    (* anywhere else: a block, whose value is its last statement's. It does NOT
+       open a scope -- what is assigned inside is assigned outside too, the same
+       as real Julia's `begin` (`let` is the one that opens a scope). *)
+    | TKW "begin" ->
+      advance st;
+      let body = parse_stmt_list st in
+      expect_kw st "end";
+      EBlock body
     | TKW "end" ->
       advance st;
       EEnd
@@ -1263,6 +1284,10 @@
   and parse_stmt_list st =
     let acc = ref [] in
     while not (is_block_end st) do
+      (* a statement never begins inside an index expression; saying so here is
+         what keeps a parse error that gave up mid-`[` from leaving the count
+         high and turning a later `begin` block into a stray 1 *)
+      st.in_index <- 0;
       if at_op st ";" then advance st
       else (
         (* where this statement STARTS, captured before parsing it -- see

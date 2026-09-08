@@ -19,3 +19,18 @@ println(v[begin], " ", v[end], " ", firstindex(v), " ", lastindex(v))
 
 t = (10, 20, 30)
 println(t[begin], " ", t[end], " ", firstindex(t), " ", lastindex(t))
+
+# the same word in the other place: a block, whose value is its last statement's.
+# It opens no scope -- `m` is still here afterwards.
+n = begin
+    m = length(a)
+    m * 2
+end
+println(n, " ", m)
+
+# and one inside the other, both ways round
+f(x) = begin
+    y = x + 1
+    y * 2
+end
+println(f(3), " ", begin a[begin] end)
