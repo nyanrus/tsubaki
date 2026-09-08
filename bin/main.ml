@@ -30,6 +30,7 @@ let read_file path =
    gate the whole thing on it actually being Node. *)
 let () = CurveBridge.init ()
 let () = GpuBridge.init ()
+let () = ActorBridge.init ()
 let () = WebglBridge.init ()
 let () = PhysicsBridge.init ()
 let () = AudioBridge.init ()
@@ -89,7 +90,11 @@ let rec main () =
   let is_node =
     Js.to_bool (Js.Unsafe.js_expr "!!(globalThis.process && globalThis.process.versions && globalThis.process.versions.node)")
   in
-  if not is_node then (
+  (* a host that drives Tsubaki through the actor bridge (tsubakiEval /
+     tsubakiCall) asks for no CLI and no demo *)
+  let embedded = Js.to_bool (Js.Unsafe.js_expr "globalThis.tsubakiEmbedded === true") in
+  if embedded then ()
+  else if not is_node then (
     let has_source = Js.to_bool (Js.Unsafe.js_expr "typeof globalThis.tsubakiSource === 'string'") in
     (* the host page also tells us where that source came from, so `include`
        can resolve a sibling file against it (see Eval's include) *)
