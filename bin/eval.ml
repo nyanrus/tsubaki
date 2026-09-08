@@ -925,7 +925,13 @@
           (iter_values (eval_expr env iter_e))
       in
       let vs = Array.of_list results in
-      if Array.for_all (function VInt _ | VFloat _ -> true | _ -> false) vs then
+      (* an EMPTY result is an Array, the same answer `[]` already gives: with
+         no elements, "every element is a number" is true of nothing, and
+         calling the result a numeric Vector is a guess that then refuses the
+         first thing put in it. (`[f(x) for x in xs]` over an empty xs, then
+         `vcat` with an Array of anything: found in a real program, a noraneko
+         drop's view, where the strip has no buttons yet.) *)
+      if Array.length vs > 0 && Array.for_all (function VInt _ | VFloat _ -> true | _ -> false) vs then
         VVec (vecbuf_of_array (Array.map as_float vs))
       else mk_arr vs
     | EComprehension (body_e, [ (var1, iter1_e); (var2, iter2_e) ]) ->

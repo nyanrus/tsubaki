@@ -67,3 +67,10 @@ println(double.(nums))
 # sorting and mapping through Tsubaki's own dispatch
 by_value(n::Named) = n.value
 println(map(by_value, sort(items; by = by_value, rev = true)))
+
+# an empty comprehension is an Array, the same answer `[]` gives -- with nothing
+# in it, "all numbers" is true of nothing, and a numeric Vector would then
+# refuse the first thing appended to it
+empty_c = [x * "!" for x in []]
+println(typeof(empty_c), " ", length(empty_c), " ", typeof([]))
+println(vcat(empty_c, ["a"]))
