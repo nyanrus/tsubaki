@@ -159,6 +159,14 @@
          `parse_type_expr`'s "Dict{Int,String}"). See `tag`'s own case for
          how this integrates with ordinary dispatch, and Types.ancestors
          for why a compound name like "Deque{Int}" can still reach "Any". *)
+    | VJS of Js_of_ocaml.Js.Unsafe.any
+      (* a JS value held AS IT IS: `document`, a `<browser>` element, Preact's
+         `h`. Nothing is copied -- this is the same object the host has, which
+         is the whole point (a copy of `document` is `document` lost). Values
+         still cross by copy in the direction where copying is what's wanted:
+         see js_of_value going out. Coming back, a field read or a call result
+         stops at the surface (value_of_js_shallow) and anything that isn't a
+         number/string/boolean/null stays one of these. *)
 
   (* backing storage for VVec/VArr: a physical array that may be BIGGER than
      the logical contents (`vlen`/`alen`), so push! can grow it geometrically
@@ -432,6 +440,7 @@
         ; "Dict", "Any"
         ; "Symbol", "Any"
         ; "Expr", "Any"
+        ; "JSValue", "Any"
         ; "UniformScaling", "Any"
         ; (* deliberately "Any", NOT "Vector"/"Matrix" -- every existing
              `[["Vector"]]`/`[["Matrix"]]`-signature method in this file
@@ -512,6 +521,7 @@
   let tag_uint8 = "UInt8"
   let tag_uint16 = "UInt16"
   let tag_uint32 = "UInt32"
+  let tag_jsvalue = "JSValue"
 
   let fixed_int_tag bits signed =
     match bits, signed with
@@ -576,6 +586,7 @@
     | VRational _ -> tag_rational
     | VSymbol _ -> tag_symbol
     | VExpr _ -> tag_expr
+    | VJS _ -> tag_jsvalue
     | VDict _ -> tag_dict
     | VUniformScaling _ -> tag_uniform_scaling
     | VComplexVec _ -> tag_complex_vec
@@ -688,6 +699,7 @@
       ^ String.concat ", " (Array.to_list (Array.map (fun (n, r) -> n ^ "=" ^ show_elem !r) s.fields))
       ^ ")"
     | VClosure _ -> "#<function>"
+    | VJS x -> "JSValue(" ^ Js_of_ocaml.Js.to_string (Js_of_ocaml.Js.typeof x) ^ ")"
     | VDict d ->
       (* real Julia's own display shape, minus the {K,V} it can't know here.
          Insertion order (see dict_pairs), so this is reproducible. *)
@@ -745,6 +757,73 @@
       Buffer.contents b
     | v -> show v
 
+  (* --- values crossing to the JS host ---------------------------------
+     Two directions, and deliberately not symmetric.
+
+     OUT (`js_of_value`) COPIES, deeply: a Dict becomes a plain object, an
+     Array an Array, a closure a real JS function. That is what a host
+     function -- `h(tag, props, children)`, `addEventListener` -- wants to be
+     handed, and none of it is something Tsubaki still has a claim on
+     afterwards.
+
+     IN (`value_of_js_shallow`) does NOT copy: a number/string/boolean/null
+     becomes the Tsubaki value it obviously is, and everything else stays a
+     `VJS` handle. So a field read and a call result both stop at the
+     surface, and `document` survives being touched. `fromjs(x)` (see
+     JsBridge) is the deep read, for a JS object that really is only data. *)
+  let value_of_js_shallow (x : Js_of_ocaml.Js.Unsafe.any) : value =
+    let open Js_of_ocaml in
+    match Js.to_string (Js.typeof x) with
+    | "number" ->
+      let f = Js.float_of_number (Js.Unsafe.coerce x) in
+      if Float.is_integer f && Float.abs f < 9007199254740992.0 then VInt (int_of_float f) else VFloat f
+    | "string" -> VStr (Js.to_string (Js.Unsafe.coerce x))
+    | "boolean" -> VBool (Js.to_bool (Js.Unsafe.coerce x))
+    | "undefined" -> VNothing
+    | _ -> if x == Js.Unsafe.inject Js.null then VNothing else VJS x
+
+  let rec js_of_value (v : value) : Js_of_ocaml.Js.Unsafe.any =
+    let open Js_of_ocaml in
+    let inject = Js.Unsafe.inject in
+    let num f = inject (Js.number_of_float f) in
+    match v with
+    | VInt i -> num (float_of_int i)
+    | VFloat f -> num f
+    | VFixedInt { v; _ } -> num (float_of_int v)
+    | VBool b -> inject (Js.bool b)
+    | VStr s -> inject (Js.string s)
+    | VNothing -> inject Js.null
+    | VJS x -> x
+    | VVec { vdata; vlen } -> inject (Js.array (Array.init vlen (fun i -> Js.number_of_float vdata.(i))))
+    | VArr { cells; _ } -> inject (Js.array (Array.init cells.alen (fun i -> js_of_value cells.adata.(i))))
+    | VTuple a -> inject (Js.array (Array.map js_of_value a))
+    | VDict d ->
+      let entries = Hashtbl.fold (fun _ (stamp, k, v) acc -> (stamp, k, v) :: acc) d.dtbl [] in
+      let entries = List.sort (fun (a, _, _) (b, _, _) -> compare a b) entries in
+      let key = function VStr s -> s | VSymbol (s, _) -> s | k -> show k in
+      Js.Unsafe.obj (Array.of_list (List.map (fun (_, k, v) -> (key k, js_of_value v)) entries))
+    | VStruct { kind; fields } ->
+      Js.Unsafe.obj
+        (Array.append
+           [| ("__type", inject (Js.string kind)) |]
+           (Array.map (fun (n, r) -> (n, js_of_value !r)) fields))
+    | VClosure (arity, impl) ->
+      (* handed over as a real JS function -- an event listener, a Preact
+         `onClick`. JS calls it with whatever it likes; the closure receives
+         exactly as many arguments as it declared (any it doesn't get is
+         `nothing`), so `() -> refresh()` survives being called with an
+         event. *)
+      inject
+        (Js.Unsafe.callback_with_arguments (fun (args : Js.Unsafe.any_js_array) ->
+             let args : Js.Unsafe.any Js.js_array Js.t = Js.Unsafe.coerce args in
+             let arg i =
+               match Js.Optdef.to_option (Js.array_get args i) with
+               | Some a -> value_of_js_shallow a
+               | None -> VNothing
+             in
+             js_of_value (impl (List.init arity arg))))
+    | other -> inject (Js.string (show other))
+
   (* --- struct field access, the thing that replaces bespoke record types --- *)
   let get_field v name =
     match v with
@@ -762,6 +841,13 @@
       | "head" -> VSymbol (head, None)
       | "args" -> VArr { declared = None; cells = arrbuf_of_array (Array.copy args) }
       | _ -> failwith (Printf.sprintf "Expr has no field %s (only .head/.args)" name))
+    | VJS x ->
+      (* a property of a JS object, read at the surface -- `el.value`,
+         `win.document`. A method read this way arrives UNBOUND (a plain
+         handle to the function); calling it as `obj.meth(...)` keeps the
+         receiver instead, which is why Eval takes that shape apart itself
+         rather than reading the field first. *)
+      value_of_js_shallow (Js_of_ocaml.Js.Unsafe.get x (Js_of_ocaml.Js.string name))
     | _ -> failwith (Printf.sprintf "%s is not a struct, has no fields" (tag v))
 
   let as_float = function
@@ -859,6 +945,31 @@
     |> List.map (fun (_, k, v) -> k, v)
 
   let mk_dict () : value = VDict { dtbl = Hashtbl.create 8; dnext = 0 }
+
+  (* the deep read coming IN -- the counterpart of what js_of_value already
+     does going out. Reached only when asked for (`fromjs`), never behind the
+     reader's back: an object becomes a Dict, an all-numeric Array a Vector.
+     A function stays a handle, because there is nothing to copy it into. *)
+  let rec value_of_js (x : Js_of_ocaml.Js.Unsafe.any) : value =
+    let open Js_of_ocaml in
+    let is_array () = Js.to_bool (Js.Unsafe.fun_call (Js.Unsafe.js_expr "Array.isArray") [| x |]) in
+    if Js.to_string (Js.typeof x) <> "object" || x == Js.Unsafe.inject Js.null then value_of_js_shallow x
+    else if is_array () then (
+      let arr = Js.to_array (Js.Unsafe.coerce x) in
+      let all_numbers = Array.for_all (fun e -> Js.to_string (Js.typeof e) = "number") arr in
+      if all_numbers then VVec (vecbuf_of_array (Array.map (fun e -> Js.float_of_number (Js.Unsafe.coerce e)) arr))
+      else (
+        let cells = Array.map value_of_js arr in
+        VArr { declared = None; cells = { adata = cells; alen = Array.length cells; atag = None } }))
+    else (
+      let d = { dtbl = Hashtbl.create 8; dnext = 0 } in
+      let keys = Js.to_array (Js.Unsafe.fun_call (Js.Unsafe.js_expr "Object.keys") [| x |]) in
+      Array.iter
+        (fun k ->
+          let ks = Js.to_string k in
+          dict_set d (VStr ks) (value_of_js (Js.Unsafe.get x (Js.string ks))))
+        keys;
+      VDict d)
 
   (* an inferred (not `Matrix{T}(undef,...)`-declared) generic Matrix -- what
      an elementwise op on VGenMat operands produces *)
@@ -1520,6 +1631,7 @@
         in
         r := newv
       | None -> failwith (Printf.sprintf "type %s has no field %s" s.kind name))
+    | VJS x -> Js_of_ocaml.Js.Unsafe.set x (Js_of_ocaml.Js.string name) (js_of_value newv)
     | _ -> failwith (Printf.sprintf "%s is not a struct, has no fields" (tag v))
 
   (* `using Name` -- merges everything `Name` declared into the bare/global

@@ -30,11 +30,17 @@ let read_file path =
    gate the whole thing on it actually being Node. *)
 let () = CurveBridge.init ()
 let () = GpuBridge.init ()
+let () = JsBridge.init ()
 let () = WebglBridge.init ()
 let () = PhysicsBridge.init ()
 let () = AudioBridge.init ()
 let () = Ecs.init ()
 let () = ParallelBridge.init ()
+
+(* last on purpose: this one tells the host Tsubaki is up, and the host's
+   callback runs Tsubaki code straight away -- so every other registration
+   above must already be in place (see ActorBridge.init's own comment) *)
+let () = ActorBridge.init ()
 
 (* the browser path (`is_node = false`): unlike CurveBridge (a self-
    contained toy that only ever registers f/add), a real Tsubaki PROGRAM
@@ -89,7 +95,11 @@ let rec main () =
   let is_node =
     Js.to_bool (Js.Unsafe.js_expr "!!(globalThis.process && globalThis.process.versions && globalThis.process.versions.node)")
   in
-  if not is_node then (
+  (* a host that drives Tsubaki through the actor bridge (tsubakiEval /
+     tsubakiCall) asks for no CLI and no demo *)
+  let embedded = Js.to_bool (Js.Unsafe.js_expr "globalThis.tsubakiEmbedded === true") in
+  if embedded then ()
+  else if not is_node then (
     let has_source = Js.to_bool (Js.Unsafe.js_expr "typeof globalThis.tsubakiSource === 'string'") in
     (* the host page also tells us where that source came from, so `include`
        can resolve a sibling file against it (see Eval's include) *)

@@ -1,0 +1,12 @@
+JSValue
+3 9
+9
+Float true
+JSValue
+{"name":"tsubaki","n":2}
+[1,2,3]
+Dict [1.0, 2.0] hi
+[2.0, 4.0, 6.0]
+43
+hello
+caught: UndefVarError: this host has no global named no_such_global_here

@@ -628,6 +628,16 @@ The pre-existing `+` still concatenates too.
 - **A real cross-module FFI boundary**: `*` on `(Matrix, Vector)` and
   `rotate(vec2, angle)` call the separate Rust/faer wasm module, copying bytes
   across the GC↔linear-memory boundary by hand.
+- **JS values held as they are** (`JSValue`) — `jsglobal("document")` hands
+  back the host's own object rather than a copy, and ordinary Tsubaki syntax
+  reaches into it: `doc.getElementById("panel")` (a real method call, with the
+  receiver kept), `el.hidden = true`, a closure handed to `addEventListener`
+  arriving on the other side as a real JS function. The copying is one-way on
+  purpose — going out, a `Dict` becomes a plain object and an `Array` an
+  `Array`; coming back, a number/string/boolean/null becomes the obvious
+  Tsubaki value and everything else stays a handle, with `fromjs(x)` the deep
+  read for a JS value that really is only data. See `bin/jsBridge.ml` and
+  `tests/js_values.jl`.
 - **`LinearAlgebra` compatibility** (faer does the numerical heavy lifting;
   see [`ROADMAP.md`](ROADMAP.md) for the staged plan and where full parity
   isn't reachable in principle):
