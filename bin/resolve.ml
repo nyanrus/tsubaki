@@ -56,7 +56,7 @@
 
   let rec resolve_expr s (e : expr) : unit =
     match e with
-    | EInt _ | EFloat _ | EStr _ | EBool _ | ENothing | EEnd | EQuoteSymbol _ | ETypedArrayNew _ | ETypeExpr _ -> ()
+    | EInt _ | EFloat _ | EStr _ | EBool _ | ENothing | EBegin | EEnd | EQuoteSymbol _ | ETypedArrayNew _ | ETypeExpr _ -> ()
     | ETypedArrayUndef (_, n_e) -> resolve_expr s n_e
     | ETypedMatrixUndef (_, m_e, n_e) ->
       resolve_expr s m_e;
@@ -231,7 +231,7 @@
     | EInterpAssign (target, rhs) ->
       resolve_expr s target;
       resolve_expr s rhs
-    | EInt _ | EFloat _ | EStr _ | EBool _ | ENothing | EEnd | EQuoteSymbol _
+    | EInt _ | EFloat _ | EStr _ | EBool _ | ENothing | EBegin | EEnd | EQuoteSymbol _
     | ETypedArrayUndef _ | ETypedMatrixUndef _ | EVar _ | ETypeExpr _ -> ()
     | ETypedArrayNew (_, elems) -> List.iter (resolve_quoted_expr s) elems
     (* quoting one is refused outright (see Eval.expr_to_value); this only

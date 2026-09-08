@@ -460,6 +460,11 @@
       | VBool true -> eval_expr env t
       | VBool false -> eval_expr env f
       | _ -> failwith "ternary condition must be Bool")
+    (* every indexable here starts at 1 (there is no offset array), so `begin`
+       is a constant -- unlike `end`, which is the length of what is being
+       indexed and so has to be carried in `current_end`. If an indexable with
+       another first index ever arrives, this is the line that grows. *)
+    | EBegin -> VInt 1
     | EEnd -> VInt !current_end
     (* short-circuit: the right side must not even be evaluated when the left
        side already decides the result -- this can't be plain Dispatch.call,
@@ -1132,7 +1137,7 @@
         { head = "macrocall"
         ; args = Array.of_list (VSymbol (name, !current_hygiene_id) :: List.map (expr_to_value env) arg_exprs)
         }
-    | EEnd | ETypedArrayUndef _ | ETypedMatrixUndef _ | EBlock _ ->
+    | EBegin | EEnd | ETypedArrayUndef _ | ETypedMatrixUndef _ | EBlock _ ->
       failwith
         "quoting this kind of expression isn't supported (Vector{T}(undef, n), Matrix{T}(undef, m, n), \
          and a bare evaluated block can't appear inside a quote)"

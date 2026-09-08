@@ -574,6 +574,9 @@
     | TKW "nothing" ->
       advance st;
       ENothing
+    | TKW "begin" ->
+      advance st;
+      EBegin
     | TKW "end" ->
       advance st;
       EEnd

@@ -9,7 +9,7 @@
     | TEOF
 
   let keywords =
-    [ "function"; "end"; "struct"; "mutable"; "abstract"; "type"; "if"; "elseif"; "else"
+    [ "function"; "begin"; "end"; "struct"; "mutable"; "abstract"; "type"; "if"; "elseif"; "else"
     ; "for"; "while"; "true"; "false"; "nothing"; "in"; "return"; "try"; "catch"
     ; "module"; "using"; "import"; "macro"; "quote"; "export"; "where"; "const"
     ]

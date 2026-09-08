@@ -49,6 +49,7 @@
          Eval.eval_expr's EVar case) -- so an ordinary variable named the
          same as a type still shadows it, same as everywhere else in this
          interpreter. *)
+    | EBegin (* only meaningful inside a `[...]` index expression: firstindex *)
     | EEnd (* only meaningful inside a `[...]` index expression *)
     | ETernary of expr * expr * expr
     | ERangeStep of expr * expr * expr (* start:step:stop *)

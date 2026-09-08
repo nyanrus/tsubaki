@@ -4043,6 +4043,20 @@
     Dispatch.defmethod "length" [ [ "Array" ] ] (function
       | [ VArr { cells; _ } ] -> VInt (arrbuf_length cells)
       | _ -> assert false);
+    (* `a[begin]` and `a[end]`, as ordinary functions -- for when the index is
+       worked out somewhere else. `a[begin + i]` is how an index that came from
+       a 0-origin world (a JS array, Python) is applied without writing the +1
+       by hand, and it says which world the +1 belongs to. Everything indexable
+       here starts at 1, so firstindex is a constant; if that ever stops being
+       true, this is where it stops. *)
+    Dispatch.defmethod "firstindex" [ [ "Vector"; "Array"; "Tuple" ] ] (function
+      | [ _ ] -> VInt 1
+      | _ -> assert false);
+    Dispatch.defmethod "lastindex" [ [ "Vector"; "Array"; "Tuple" ] ] (function
+      | [ VVec r ] -> VInt (vecbuf_length r)
+      | [ VArr { cells; _ } ] -> VInt (arrbuf_length cells)
+      | [ VTuple vs ] -> VInt (Array.length vs)
+      | _ -> assert false);
     (* a Range knew how to be summed, maximized and iterated, but not how
        many elements it has -- `length(1:2:9)` raised a MethodError. Counted,
        never materialized, and empty when the step points away from the stop
