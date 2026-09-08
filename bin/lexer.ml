@@ -252,6 +252,10 @@
                the operators above, so it belongs in this branch *)
             emit (TOP "\xc3\xb7");
             i := !i + 2
+          (* `=>`, real Julia's Pair -- how a Dict literal is written
+             (`Dict("a" => 1)`). Two bytes, and never ambiguous with `=`
+             followed by `>`: Julia has no such sequence. *)
+          | Some ("=>" as op)
           | Some ("<:" as op) | Some ("::" as op) | Some ("==" as op) | Some ("!=" as op)
           | Some ("<=" as op) | Some (">=" as op) | Some ("->" as op) | Some ("&&" as op)
           | Some ("||" as op) | Some ("+=" as op) | Some ("-=" as op) | Some ("*=" as op)

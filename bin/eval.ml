@@ -480,6 +480,7 @@
         | VBool r -> VBool r
         | _ -> failwith "|| operand must be Bool")
       | _ -> failwith "|| operand must be Bool")
+    | EBinOp ("=>", a, b, _) -> VPair (eval_expr env a, eval_expr env b)
     | EBinOp ("===", a, b, _) -> VBool (is_identical (eval_expr env a) (eval_expr env b))
     | EBinOp ("!==", a, b, _) -> VBool (not (is_identical (eval_expr env a) (eval_expr env b)))
     | EBinOp ("<:", EVar (sub, _), EVar (sup, _), _) ->
@@ -516,6 +517,22 @@
       print_string (String.concat "" (List.map (fun a -> show (eval_expr env a)) args));
       VNothing
     | ECall ("typeof", [ x_e ], _, _) -> VStr (tag (eval_expr env x_e))
+    | ECall ("Dict", (_ :: _ as arg_es), [], _) ->
+      (* real Julia's `Dict("a" => 1, "b" => 2)`, and `Dict(pairs)` for a list
+         of them. Taken here rather than as a Dispatch method for the same
+         reason println is: it is variadic, and a method carries one fixed
+         arity. The 0-argument `Dict()` stays an ordinary method. *)
+      let d = { dtbl = Hashtbl.create 8; dnext = 0 } in
+      let put = function
+        | VPair (k, v) -> dict_set d k v
+        | VTuple [| k; v |] -> dict_set d k v
+        | other -> failwith (Printf.sprintf "Dict: expected `key => value` pairs, got a %s" (tag other))
+      in
+      (match List.map (eval_expr env) arg_es with
+      | [ VArr { cells; _ } ] -> Array.iter put (arrbuf_to_array cells)
+      | [ VVec _ ] -> failwith "Dict: expected `key => value` pairs, got numbers"
+      | args -> List.iter put args);
+      VDict d
     | ECall ("isa", [ x_e; EVar (tname, _) ], _, _) ->
       (* tname is looked up ONLY to check for a genuinely bound first-class
          VType (e.g. a `::Type{X}`-dispatched where-var used as
@@ -1314,7 +1331,7 @@
              (Array.length args))
       | VTuple _ | VStruct _ | VClosure _ | VVec _ | VArr _ | VMat _ | VGenMat _ | VRange _ | VFRange _
       | VComplex _ | VRational _ | VUniformScaling _ | VComplexVec _ | VComplexMat _ | VSparseMat _ | VDict _
-      | VJS _ ->
+      | VJS _ | VPair _ ->
         failwith
           (Printf.sprintf "macro expansion: a macro must return quoted syntax (a Symbol/Expr) or a plain \
                             literal, got a %s"

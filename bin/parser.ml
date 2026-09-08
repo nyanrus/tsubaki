@@ -253,7 +253,14 @@
 
   let rec parse_expr st =
     let lhs = parse_range st in
-    if at_op st "?" then (
+    if at_op st "=>" then (
+      (* real Julia's Pair. Right-associative, and lower than every arithmetic
+         and comparison operator, so `"n" => a + 1` pairs the whole right-hand
+         side rather than pairing `a` and then adding. *)
+      advance st;
+      let rhs = parse_expr st in
+      EBinOp ("=>", lhs, rhs, Runtime.Dispatch.new_cache ()))
+    else if at_op st "?" then (
       advance st;
       (* the true-branch deliberately uses parse_binary, not parse_expr/parse_range --
          otherwise a bare ":" ending the true-branch (`cond ? a : b`) gets
@@ -779,9 +786,37 @@
                   else raise (Parse_error "matrix row: not a clean whitespace-sensitive parse"))
             with
             | Some row -> row
-            | None ->
-              used_comma := false; (* position is back where `first`'s own parse left it, a lone element *)
-              [ first ]
+            | None -> (
+              (* The whitespace-sensitive grammar handles none of ternaries,
+                 ranges or pairs, so a row holding one of those lands here --
+                 and until this, a row like `[x, cond ? a : b]` quietly became
+                 the single element `x` and then failed at the comma. If the
+                 row is comma-separated (an ordinary Vector literal, never a
+                 matrix row), the FULL expression grammar can take it, spacing
+                 and all. A trailing comma is allowed here, as real Julia
+                 allows one. *)
+              match
+                try_parse st (fun () ->
+                    restore st start_pos;
+                    let saw_comma = ref false in
+                    let rec loop acc =
+                      let e = parse_expr st in
+                      if at_op st "," then (
+                        saw_comma := true;
+                        advance st;
+                        if at_op st "]" then List.rev (e :: acc) else loop (e :: acc))
+                      else List.rev (e :: acc)
+                    in
+                    let row = loop [] in
+                    if !saw_comma && at_op st "]" then row
+                    else raise (Parse_error "array literal: not a comma-separated row"))
+              with
+              | Some row ->
+                used_comma := true;
+                row
+              | None ->
+                used_comma := false; (* position is back where `first`'s own parse left it, a lone element *)
+                [ first ])
           in
           if at_op st ";" then (
             (* a Matrix literal -- rows are semicolon-separated *)
@@ -909,38 +944,35 @@
     | _ -> raise (Parse_error (Printf.sprintf "expected expression at %s" (ctx st)))
 
   and parse_arglist st : expr list * (string * expr) list =
-    let positional =
-      if at_op st ")" || at_op st ";" then []
-      else (
-        let rec loop acc =
-          let e = parse_expr st in
-          let acc = e :: acc in
-          if at_op st "," then (
-            advance st;
-            loop acc)
-          else List.rev acc
-        in
-        loop [])
+    (* real Julia: inside a call, `name = value` is ALWAYS a keyword argument,
+       with or without the `;` that may separate them -- `f(a; b = 1)` and
+       `f(a, b = 1)` mean the same thing. Before this, only the `;` form was
+       read as one and the other quietly became a positional ASSIGNMENT
+       expression, which is how `AppState(width = 400)` ended up calling the
+       positional constructor with one argument. Both spellings land in the
+       same two lists here, and a trailing comma is allowed either side. *)
+    let positional = ref [] and kwargs = ref [] in
+    let at_kwarg () = match peek st, peek_at st 1 with TIDENT _, TOP "=" -> true | _ -> false in
+    let parse_one () =
+      if at_kwarg () then (
+        let n = ident st in
+        expect_op st "=";
+        kwargs := (n, parse_expr st) :: !kwargs)
+      else positional := parse_expr st :: !positional
     in
-    let kwargs =
-      if at_op st ";" then (
-        advance st;
-        if at_op st ")" then []
-        else (
-          let rec loop acc =
-            let n = ident st in
-            expect_op st "=";
-            let e = parse_expr st in
-            let acc = (n, e) :: acc in
-            if at_op st "," then (
-              advance st;
-              loop acc)
-            else List.rev acc
-          in
-          loop []))
-      else []
+    let parse_list () =
+      if not (at_op st ")" || at_op st ";") then (
+        parse_one ();
+        while at_op st "," do
+          advance st;
+          if not (at_op st ")" || at_op st ";") then parse_one ()
+        done)
     in
-    positional, kwargs
+    parse_list ();
+    if at_op st ";" then (
+      advance st;
+      parse_list ());
+    List.rev !positional, List.rev !kwargs
 
   (* do-block sugar: a call immediately followed by `do <params>` on the same
      line, then a statement body, then `end`, desugars to appending an

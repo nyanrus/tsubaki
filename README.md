@@ -563,11 +563,22 @@ The pre-existing `+` still concatenates too.
   shape they were handed; ordering goes through Tsubaki's own `<` dispatch.
 - **A named function is a value.** `f = double`, `filter(fell, balls)` — the
   value is the whole generic function, dispatched on the arguments it receives.
-- **`Dict`**: `Dict()` then `d[k] = v` / `d[k]` (missing key raises
-  `KeyError`; `get(d, k, default)` doesn't), plus `haskey`/`delete!`/`keys`/
-  `values`/`length` and `for (k, v) in d`. Keys are Int/Float/Bool/String/
-  Symbol/nothing (`d[1]` and `d[1.0]` are the same entry); insertion-ordered.
-  No `=>` literal (see "does not do").
+- **`Dict`**: `Dict("a" => 1, "b" => 2)`, `Dict(list_of_pairs)`, or `Dict()`
+  then `d[k] = v` / `d[k]` (missing key raises `KeyError`; `get(d, k, default)`
+  doesn't), plus `haskey`/`delete!`/`keys`/`values`/`length` and
+  `for (k, v) in d`. Keys are Int/Float/Bool/String/Symbol/nothing (`d[1]` and
+  `d[1.0]` are the same entry); insertion-ordered.
+- **`Pair`**: `"a" => 1` is a value of its own — `p.first`, `p.second`, shown
+  the way it is written, right-associative and lower-binding than every
+  arithmetic and comparison operator. `Dict` is the variadic call that takes
+  them (the one place a fixed-arity method can't reach, so it is handled the
+  way `println` already is).
+- **What a `[...]` literal and a call can hold.** A ternary or a range inside a
+  comma-separated literal (`[a, open ? b : c]`, `[1:3, 5:6]`) — the
+  whitespace-sensitive matrix grammar can read neither, so such a row is
+  re-read with the full expression grammar. A trailing comma, in a literal and
+  in a call. And `f(a, b = 1)`: inside a call, `name = value` is a keyword
+  argument with or without the `;` that may separate them, as in real Julia.
 - **`Array`: a Vector that can hold anything.** A literal is a numeric
   `Vector` only if non-empty and every element is a number; otherwise (or if
   empty, Julia's `Vector{Any}`) it's an `Array`. Same `push!`/`length`/`v[i]`/
@@ -668,10 +679,12 @@ The pre-existing `+` still concatenates too.
 
 ## What it deliberately does not do
 
-- **`Dict` has no `=>` literal.** `Dict()` then `d[k] = v` is the only way;
-  `Dict("a" => 1)` doesn't parse (it needs a `Pair` type that collides with
-  the demo's own `struct Pair{K,V}`, plus varargs dispatch doesn't have —
-  three decisions, not one). Keys are limited to immutable scalar types.
+- **`Pair` is one name, shared.** A program that declares its own
+  `struct Pair` (the demo does, `Pair{K,V}`) keeps working — its concrete
+  types are `Pair{Int,String}` and so on — but the base name is the same one
+  the built-in `"a" => 1` answers to, so a method on `::Pair` accepts both.
+  The built-in one carries no `{K,V}` type parameters. Dict keys are still
+  limited to immutable scalar types.
 - **A traceback skips a function that was bytecode-compiled.** A runtime
   error now names its file, its line, and the chain of calls that reached it
   (see "Where an error happened" below) — but a zero-parameter function that
