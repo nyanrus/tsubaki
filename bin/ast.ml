@@ -1,17 +1,25 @@
 (* ============================= AST ============================= *)
+  (* パースが失敗したという報せ。raise するのは Parser だけれど、受け止める
+     のは Parser を持たない build もある(actorBridge の tsubakiEval)。それで
+     ここに置いてある -- 「AST を組めなかった」は AST の側の話なので。 *)
+  exception Parse_error of string
+
   type expr =
     | EInt of int
     | EFloat of float
     | EStr of string
     | EBool of bool
     | ENothing
-    | EVar of string * Runtime.var_cache
-    | EBinOp of string * expr * expr * Runtime.Dispatch.call_cache
-      (* the cache cell belongs to this one AST node -- allocated once at
-         parse time, reused across every evaluation of this call site *)
-    | ECall of string * expr list * (string * expr) list * Runtime.Dispatch.call_cache
-      (* positional args, keyword args, and (like EBinOp) a cache cell owned
-         by this one call site *)
+    | EVar of string * int (* var_cache の番号 -- 表は Runtime 側 *)
+    | EBinOp of string * expr * expr * int
+      (* 末尾は call_cache の番号。セルそのものは Runtime.Dispatch の表に
+         あって、この番号がその一つを指す -- 番号は parse 時に一度配られ、
+         この呼び出し場所が評価されるたび同じセルに行き着く。ノードが
+         セルを抱えていた頃と同じ意味で、抱えていないだけ(そのおかげで
+         AST は Runtime を知らないただのデータでいられる)。 *)
+    | ECall of string * expr list * (string * expr) list * int
+      (* positional args, keyword args, and (like EBinOp) the number of the
+         cache cell owned by this one call site *)
     | EApply of expr * expr list
       (* calling the RESULT of an expression rather than a name: `f()()`,
          `v[1](x)`, `(x -> x + 1)(3)`. `ECall` above NAMES its callee, which
@@ -24,7 +32,7 @@
          didn't already take (`Name.member(args)` is still EQualifiedCall) --
          so nothing that parsed before parses any differently now. *)
     | EField of expr * string
-    | EAssign of string * expr * Runtime.var_cache
+    | EAssign of string * expr * int
     | EFieldAssign of expr * string * expr
     | EArrayLit of expr list
     | ELambda of string list * stmt list
@@ -78,7 +86,7 @@
          above, building the generic boxed `Matrix{T}` container (see
          Runtime.VGenMat) rather than the numeric `VMat`. Every cell starts
          as VNothing, same convention as ETypedArrayUndef. *)
-    | EQualifiedCall of string * string * expr list * (string * expr) list * Runtime.Dispatch.call_cache
+    | EQualifiedCall of string * string * expr list * (string * expr) list * int
       (* Name.member(args) -- a struct constructor or dispatch call qualified
          by module name. Single-level only (not Outer.Inner.member): a
          narrower, purpose-built node rather than generalizing ECall's
@@ -196,11 +204,12 @@
     | SIf of (expr * stmt list) list * stmt list option
     | SFor of for_target * expr * stmt list
     | SWhile of expr * stmt list
-    | SFuncDecl of string * param list * (string * string list * expr) list * stmt list * Runtime.funcdecl_cache
+    | SFuncDecl of string * param list * (string * string list * expr) list * stmt list * int
       (* name, positional params, keyword params (name, declared type --
          `["Any"]` if untyped, same convention as a param's own `ptype` --
          and a default-value expr), body, and a JIT-style bytecode-compile
-         cache owned by this exact declaration site (see Runtime.funcdecl_cache) *)
+         cache の番号。宣言の場所ひとつにセルひとつ、というのは前と同じ
+         (表は Runtime.funcdecl_cache_table) *)
     | SStructDecl of
         { mutable_ : bool
         ; name : string

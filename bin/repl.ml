@@ -94,7 +94,7 @@ let eval_and_show src =
   | v ->
     if not (ends_with_semicolon src) then print_endline (Runtime.show v);
     finish ()
-  | exception Parser.Parse_error msg ->
+  | exception Ast.Parse_error msg ->
     print_endline ("ERROR: " ^ msg);
     finish ()
   | exception Runtime.JuliaError v ->

@@ -2,7 +2,6 @@
   open Ast
   open Lexer
 
-  exception Parse_error of string
 
   (* every statement-level parse error gets recorded here (line, col, message)
      instead of aborting the whole parse on the first one -- see
@@ -268,7 +267,7 @@
          side rather than pairing `a` and then adding. *)
       advance st;
       let rhs = parse_expr st in
-      EBinOp ("=>", lhs, rhs, Runtime.Dispatch.new_cache ()))
+      EBinOp ("=>", lhs, rhs, Caches.fresh_call ()))
     else if at_op st "?" then (
       advance st;
       (* the true-branch deliberately uses parse_binary, not parse_expr/parse_range --
@@ -284,7 +283,7 @@
       advance st;
       let rhs = parse_expr st in
       match lhs with
-      | EVar (n, _) -> EAssign (n, rhs, Runtime.new_var_cache ())
+      | EVar (n, _) -> EAssign (n, rhs, Caches.fresh_var ())
       | EField (o, f) -> EFieldAssign (o, f, rhs)
       | EIndex (o, idx) -> EIndexAssign (o, idx, rhs)
       | EInterp inner -> EInterpAssign (inner, rhs)
@@ -295,9 +294,9 @@
          is lost by taking the ETypedArrayNew one: `Float[] = v` was never a
          legal assignment target anyway. *)
       | ETypedArrayNew (name, []) ->
-        ECall ("setindex!", [ EVar (name, Runtime.new_var_cache ()); rhs ], [], Runtime.Dispatch.new_cache ())
+        ECall ("setindex!", [ EVar (name, Caches.fresh_var ()); rhs ], [], Caches.fresh_call ())
       | ECall ("getindex", [ obj ], [], _) ->
-        ECall ("setindex!", [ obj; rhs ], [], Runtime.Dispatch.new_cache ())
+        ECall ("setindex!", [ obj; rhs ], [], Caches.fresh_call ())
       | _ -> raise (Parse_error "invalid assignment target"))
     else
       match peek st with
@@ -305,16 +304,16 @@
         advance st;
         let rhs = parse_expr st in
         let base_op = String.sub op 0 (String.length op - 1) in
-        let combined = EBinOp (base_op, lhs, rhs, Runtime.Dispatch.new_cache ()) in
+        let combined = EBinOp (base_op, lhs, rhs, Caches.fresh_call ()) in
         (match lhs with
-        | EVar (n, _) -> EAssign (n, combined, Runtime.new_var_cache ())
+        | EVar (n, _) -> EAssign (n, combined, Caches.fresh_var ())
         | EField (o, f) -> EFieldAssign (o, f, combined)
         | EIndex (o, idx) -> EIndexAssign (o, idx, combined)
         (* `score[] += hits` -- same two shapes as the plain `=` case above *)
         | ETypedArrayNew (name, []) ->
-          ECall ("setindex!", [ EVar (name, Runtime.new_var_cache ()); combined ], [], Runtime.Dispatch.new_cache ())
+          ECall ("setindex!", [ EVar (name, Caches.fresh_var ()); combined ], [], Caches.fresh_call ())
         | ECall ("getindex", [ obj ], [], _) ->
-          ECall ("setindex!", [ obj; combined ], [], Runtime.Dispatch.new_cache ())
+          ECall ("setindex!", [ obj; combined ], [], Caches.fresh_call ())
         | _ -> raise (Parse_error "invalid compound-assignment target"))
       | _ -> lhs
 
@@ -329,7 +328,7 @@
         advance st;
         let hi = parse_binary st 0 in
         ERangeStep (lo, mid, hi))
-      else EBinOp (":", lo, mid, Runtime.Dispatch.new_cache ()))
+      else EBinOp (":", lo, mid, Caches.fresh_call ()))
     else lo
 
   and parse_binary st min_prec =
@@ -351,7 +350,7 @@
              && (st.pos = 0 || fst (line_col st st.pos) = fst (line_col st (st.pos - 1))) ->
         advance st;
         let rhs = parse_binary st (prec op + 1) in
-        lhs := EBinOp (op, !lhs, rhs, Runtime.Dispatch.new_cache ())
+        lhs := EBinOp (op, !lhs, rhs, Caches.fresh_call ())
       (* `x in y` as an ordinary boolean expression (membership test),
          outside a `for`/comprehension header (which consumes its own `in`
          directly via expect_kw, never reaching here) -- found in Primes.jl,
@@ -366,7 +365,7 @@
         when 2 >= min_prec && (st.pos = 0 || fst (line_col st st.pos) = fst (line_col st (st.pos - 1))) ->
         advance st;
         let rhs = parse_range st in
-        lhs := EBinOp ("in", !lhs, rhs, Runtime.Dispatch.new_cache ())
+        lhs := EBinOp ("in", !lhs, rhs, Caches.fresh_call ())
       | _ -> continue_ := false
     done;
     !lhs
@@ -390,7 +389,7 @@
         | TOP op when prec op >= 0 && prec op >= min_prec ->
           advance st;
           let rhs = go (prec op + 1) in
-          lhs := EBinOp (op, !lhs, rhs, Runtime.Dispatch.new_cache ())
+          lhs := EBinOp (op, !lhs, rhs, Caches.fresh_call ())
         | _ -> continue_ := false
       done;
       !lhs
@@ -401,14 +400,14 @@
     if at_op st "-" then (
       advance st;
       let e = parse_unary st in
-      EBinOp ("-", EInt 0, e, Runtime.Dispatch.new_cache ()))
+      EBinOp ("-", EInt 0, e, Caches.fresh_call ()))
     else if at_op st "!" then (
       (* logical not -- reuses ordinary ECall/dispatch (a "!" method on
          Bool) rather than a dedicated AST node, the same way real Julia's
          own `!x` is just a call to the function named `!` *)
       advance st;
       let e = parse_unary st in
-      ECall ("!", [ e ], [], Runtime.Dispatch.new_cache ()))
+      ECall ("!", [ e ], [], Caches.fresh_call ()))
     else parse_postfix st
 
   and parse_postfix st =
@@ -446,7 +445,7 @@
           let bvar = "##bcast" in
           e :=
             EComprehension
-              ( ECall (name, [ EVar (bvar, Runtime.new_var_cache ()) ], [], Runtime.Dispatch.new_cache ())
+              ( ECall (name, [ EVar (bvar, Caches.fresh_var ()) ], [], Caches.fresh_call ())
               , [ (FVSingle bvar, container) ] )
         | _ -> raise (Parse_error "broadcast dot-call (f.(...)) requires a bare function name"))
       else if at_op st "." then (
@@ -461,7 +460,7 @@
           let args, kwargs = parse_arglist st in
           expect_op st ")";
           let modname = String.concat "." (List.rev !dotted_chain) in
-          e := EQualifiedCall (modname, f, args, kwargs, Runtime.Dispatch.new_cache ());
+          e := EQualifiedCall (modname, f, args, kwargs, Caches.fresh_call ());
           dotted_chain := [])
         else (
           (if !dotted_chain <> [] then dotted_chain := f :: !dotted_chain);
@@ -485,7 +484,7 @@
            was, the same lookup-fails-so-reinterpret dispensation the non-empty
            case gets. Anything that isn't a bare name (`scene.collisions[]`)
            was never a type name, so it can only be this. *)
-        | obj -> e := ECall ("getindex", [ obj ], [], Runtime.Dispatch.new_cache ()))
+        | obj -> e := ECall ("getindex", [ obj ], [], Caches.fresh_call ()))
       else if at_op st "[" then (
         dotted_chain := [];
         advance st;
@@ -514,7 +513,7 @@
            this is unambiguous with no lookahead needed *)
         dotted_chain := [];
         advance st;
-        e := ECall ("transpose", [ !e ], [], Runtime.Dispatch.new_cache ()))
+        e := ECall ("transpose", [ !e ], [], Caches.fresh_call ()))
       else if at_op st "(" && not (space_before st st.pos) then (
         (* Calling what the expression so far EVALUATED to: `f()()`,
            `v[1](x)`, `(x -> x + 1)(3)`.
@@ -563,7 +562,7 @@
       (match peek st with TIDENT _ -> true | TOP "(" -> true | _ -> false)
       && not (space_before st st.pos)
     in
-    if tight_follow then EBinOp ("*", lit, parse_binary st (prec "^"), Runtime.Dispatch.new_cache ())
+    if tight_follow then EBinOp ("*", lit, parse_binary st (prec "^"), Caches.fresh_call ())
     else lit
 
   and parse_atom st =
@@ -661,7 +660,7 @@
         let e = parse_expr st in
         expect_op st ")";
         EInterp e)
-      else EInterp (EVar (ident st, Runtime.new_var_cache ()))
+      else EInterp (EVar (ident st, Caches.fresh_var ()))
     | TKW "function" ->
       (* anonymous, multi-statement form: function (args) ... end -- as
          opposed to the named `function name(args) ... end` declaration,
@@ -906,7 +905,7 @@
         expect_op st "(";
         let args, kwargs = parse_arglist st in
         expect_op st ")";
-        ECall ("new", args, kwargs, Runtime.Dispatch.new_cache ()))
+        ECall ("new", args, kwargs, Caches.fresh_call ()))
       else if at_op st "{" then (
         (* Name{T}(...) / Name{T} -- parsed once, THEN decided by whether a
            call's own "(" actually follows the closing "}": Array{T}()/
@@ -946,7 +945,7 @@
           | ("Array" | "Vector"), [ elem_ty ], [ EVar ("undef", _); n ] -> ETypedArrayUndef (elem_ty, n)
           | ("Array" | "Vector"), [ elem_ty ], _ ->
             raise (Parse_error (Printf.sprintf "%s{%s}(...): only () or (undef, n) is supported" name elem_ty))
-          | _ -> ECall (name, args, kwargs, Runtime.Dispatch.new_cache ())))
+          | _ -> ECall (name, args, kwargs, Caches.fresh_call ())))
       else if at_op st "->" then (
         advance st;
         let body = parse_expr st in
@@ -962,9 +961,9 @@
            what a reader coming from Julia expects. Every do-block call site
            today passes no other positional argument (`play() do dt`), so which
            end it lands on is not a change to any of them. *)
-        | Some closure -> ECall (name, closure :: args, kwargs, Runtime.Dispatch.new_cache ())
-        | None -> ECall (name, args, kwargs, Runtime.Dispatch.new_cache ()))
-      else EVar (name, Runtime.new_var_cache ())
+        | Some closure -> ECall (name, closure :: args, kwargs, Caches.fresh_call ())
+        | None -> ECall (name, args, kwargs, Caches.fresh_call ()))
+      else EVar (name, Caches.fresh_var ())
     | _ -> raise (Parse_error (Printf.sprintf "expected expression at %s" (ctx st)))
 
   and parse_arglist st : expr list * (string * expr) list =
@@ -1071,7 +1070,7 @@
         if !depth <> 0 then failwith "unterminated $(...) in string interpolation";
         let inner = String.sub s (!i + 2) (!j - !i - 2) in
         let e = parse_expr (mk (tokenize inner)) in
-        pieces := ECall ("string", [ e ], [], Runtime.Dispatch.new_cache ()) :: !pieces;
+        pieces := ECall ("string", [ e ], [], Caches.fresh_call ()) :: !pieces;
         i := !j + 1)
       else if s.[!i] = '$' && !i + 1 < n && is_ident_start s.[!i + 1] then (
         flush_lit ();
@@ -1082,7 +1081,7 @@
         let name = intern (String.sub s (!i + 1) (!j - !i - 1)) in
         pieces :=
           ECall
-            ("string", [ EVar (name, Runtime.new_var_cache ()) ], [], Runtime.Dispatch.new_cache ())
+            ("string", [ EVar (name, Caches.fresh_var ()) ], [], Caches.fresh_call ())
           :: !pieces;
         i := !j)
       else if s.[!i] = '\001' then (
@@ -1097,7 +1096,7 @@
     | [] -> EStr ""
     | [ (EStr _ as only) ] -> only
     | first :: rest ->
-      List.fold_left (fun acc e -> EBinOp ("+", acc, e, Runtime.Dispatch.new_cache ())) first rest
+      List.fold_left (fun acc e -> EBinOp ("+", acc, e, Caches.fresh_call ())) first rest
 
   (* one or more comma-separated expressions -- `a` alone stays a plain expr,
      `a, b, ...` becomes a Tuple. Used by `return a, b` and by the right side
@@ -1336,7 +1335,7 @@
       let params = strip_where_param_types where_vars params |> finalize_type_patterns where_vars in
       let body = parse_stmt_list st in
       expect_kw st "end";
-      SFuncDecl (name, params, kwparams, body, Runtime.new_funcdecl_cache ())
+      SFuncDecl (name, params, kwparams, body, Caches.fresh_funcdecl ())
     | TKW "if" ->
       advance st;
       parse_if st
@@ -1531,7 +1530,7 @@
               name, params, kwparams, e)
         with
         | Some (name, params, kwparams, e) ->
-          SFuncDecl (name, params, kwparams, [ SExpr e ], Runtime.new_funcdecl_cache ())
+          SFuncDecl (name, params, kwparams, [ SExpr e ], Caches.fresh_funcdecl ())
         | None -> (
           (* mid-function typed local assignment: x::T = expr *)
           match

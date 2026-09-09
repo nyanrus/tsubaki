@@ -1,7 +1,58 @@
+; 二本のビルドが、同じモジュールを共有する。片方は CLI と REPL と橋を全部
+; つれてくる開発用、もう片方は drop に積むほう -- actor の戸だけ。
+; ファイルは動かしていない。何がどちらに行くかを、ここで言っているだけ。
+
+; 言語の後ろ半分 -- 値と、dispatch と、AST を走らせるところ。ここに Parser も
+; Compile も居ない(Eval が口を開けていて、Frontend が差し込む)。
+(library
+ (name tsubaki)
+ (wrapped false)
+ (modules hints caches runtime ast bytecode eval vm async jsBridge actorBridge)
+ (libraries js_of_ocaml))
+
+; 前半分 -- ソースを読んで AST にするところと、AST をもっと速い形に落とす
+; ところ。ビルド時にだけ要るものが、いずれ全部こちら側に来る。
+(library
+ (name tsubaki_frontend)
+ (wrapped false)
+ (modules lexer parser resolve compile tocode frontend)
+ (libraries js_of_ocaml tsubaki))
+
+; 外の世界につながる橋。drop はどれも使わない。
+(library
+ (name tsubaki_bridges)
+ (wrapped false)
+ (modules
+  curveBridge gpuBridge webglBridge physicsBridge audioBridge
+  parallelBridge ecs)
+ (libraries js_of_ocaml tsubaki tsubaki_frontend))
+
 (executable
  (name main)
+ (modules main repl)
  (modes byte wasm js)
  (wasm_of_ocaml
   (flags
    (:standard --effects=cps)))
- (libraries js_of_ocaml))
+ (libraries js_of_ocaml tsubaki tsubaki_frontend tsubaki_bridges))
+
+(executable
+ (name drop)
+ (modules drop)
+ (modes byte wasm js)
+ (wasm_of_ocaml
+  (flags
+   (:standard --effects=cps)))
+ (libraries js_of_ocaml tsubaki tsubaki_frontend))
+
+; .tsb だけを走らせるほう。tsubaki_frontend をリンクしないので、lexer も
+; parser も resolve も compile も入らない -- 渡す道(.tsb)ができたので、
+; もう要らない。
+(executable
+ (name dropvm)
+ (modules dropvm)
+ (modes byte wasm js)
+ (wasm_of_ocaml
+  (flags
+   (:standard --effects=cps)))
+ (libraries js_of_ocaml tsubaki))

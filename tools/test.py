@@ -16,7 +16,13 @@ one, are not).
     python3 tools/test.py                # run everything
     python3 tools/test.py dispatch mac   # only tests whose name contains one of these
     python3 tools/test.py --julia        # also cross-check the `# julia: yes` ones
+    python3 tools/test.py --vm           # run through the bytecode VM instead
     python3 tools/test.py --update       # rewrite goldens from current output
+
+--vm runs each test through --vm (fold to .tsb, read it back, execute) and
+compares against the SAME golden. A test whose shapes Tocode can't fold yet
+says so and is counted separately -- that count, and what it names, is the
+map of what the VM still needs. See bin/tocode.ml.
 
 --update exists so a deliberate change doesn't mean hand-editing 20 files.
 It records whatever comes out, including a regression -- read the diff it
@@ -48,13 +54,24 @@ def run(cmd, timeout=180, stdin=None):
     return (p.stdout + p.stderr).rstrip("\n")
 
 
-def run_tsubaki(path):
+def run_tsubaki(path, vm=False):
     # a test named repl_* is fed to the REPL on stdin instead of run as a
     # file -- same golden mechanism, exercising the interactive path
     if os.path.basename(path).startswith("repl"):
         with open(os.path.join(ROOT, path)) as f:
             return run(["node", "-r", "./preload.js", BINARY, "--repl"], stdin=f.read())
-    return run(["node", "-r", "./preload.js", BINARY, path])
+    flags = ["--vm"] if vm else []
+    return run(["node", "-r", "./preload.js", BINARY] + flags + [path])
+
+
+NOT_YET = "tsubaki: --vm cannot fold "
+
+
+def not_yet_reason(output):
+    """The shape Tocode stopped on, or None if it didn't stop."""
+    if not output.startswith(NOT_YET):
+        return None
+    return output[len(NOT_YET):].split(" yet (")[0]
 
 
 def run_julia(path):
@@ -84,6 +101,7 @@ def main():
     ap.add_argument("filters", nargs="*", help="substring match on test name")
     ap.add_argument("--update", action="store_true", help="rewrite goldens")
     ap.add_argument("--julia", action="store_true", help="cross-check julia-compatible tests")
+    ap.add_argument("--vm", action="store_true", help="run through the bytecode VM (see bin/vm.ml)")
     args = ap.parse_args()
 
     if not os.path.exists(os.path.join(ROOT, BINARY)):
@@ -100,6 +118,7 @@ def main():
         return 1
 
     passed, failed, crosschecked, skipped = 0, [], 0, 0
+    not_yet = []  # (test name, the shape Tocode stopped on) -- --vm only
 
     for name in names:
         # repo-relative, not absolute: a test whose expected output includes a
@@ -107,13 +126,23 @@ def main():
         # machine's home directory into its golden
         jl = os.path.join("tests", name + ".jl")
         golden_path = os.path.join(TESTS, name + ".out")
-        actual = run_tsubaki(jl)
+        if args.vm and name.startswith("repl"):
+            # the REPL reads a line at a time; there is no .tsb to fold
+            continue
+        actual = run_tsubaki(jl, vm=args.vm)
 
         if args.update:
             with open(golden_path, "w") as f:
                 f.write(actual + "\n")
             print("%supdated%s %s" % (YELLOW, RESET, name))
             continue
+
+        if args.vm:
+            reason = not_yet_reason(actual)
+            if reason is not None:
+                print("%snot yet%s %s %s(%s)%s" % (YELLOW, RESET, name, DIM, reason, RESET))
+                not_yet.append((name, reason))
+                continue
 
         if not os.path.exists(golden_path):
             print("%sno golden%s %s -- run with --update once you've read its output"
@@ -156,9 +185,20 @@ def main():
         line += ", %d also verified against real Julia" % crosschecked
     if skipped:
         line += ", %d without a golden" % skipped
+    if not_yet:
+        line += ", %d the VM can't fold yet" % len(not_yet)
     if failed:
         line += ", %s%d failed%s: %s" % (RED, len(failed), RESET, ", ".join(failed))
     print(line)
+    if not_yet:
+        # what the VM still needs, most-wanted first
+        counts = {}
+        for _, reason in not_yet:
+            counts[reason] = counts.get(reason, 0) + 1
+        print("")
+        print("still to fold:")
+        for reason, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+            print("  %2d  %s" % (n, reason))
     return 1 if failed else 0
 
 

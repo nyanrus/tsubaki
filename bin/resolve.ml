@@ -61,7 +61,7 @@
     | ETypedMatrixUndef (_, m_e, n_e) ->
       resolve_expr s m_e;
       resolve_expr s n_e
-    | EVar (name, cache) -> resolve_var s name cache
+    | EVar (name, cache_id) -> resolve_var s name (Runtime.var_cache_at cache_id)
     | EBinOp (_, a, b, _) ->
       resolve_expr s a;
       resolve_expr s b
@@ -75,9 +75,9 @@
     | EApply (f, args) ->
       resolve_expr s f;
       List.iter (resolve_expr s) args
-    | EAssign (name, rhs, cache) ->
+    | EAssign (name, rhs, cache_id) ->
       resolve_expr s rhs;
-      resolve_assign s name cache
+      resolve_assign s name (Runtime.var_cache_at cache_id)
     | EFieldAssign (o, _, rhs) ->
       resolve_expr s o;
       resolve_expr s rhs
@@ -174,7 +174,7 @@
       List.iter
         (fun (target, _ty) ->
           match target with
-          | EVar (name, cache) -> resolve_assign s name cache
+          | EVar (name, cache_id) -> resolve_assign s name (Runtime.var_cache_at cache_id)
           | (EField _ | EIndex _) as target -> resolve_expr s target
           | _ -> ())
         targets

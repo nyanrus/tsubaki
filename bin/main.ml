@@ -28,6 +28,7 @@ let read_file path =
    this module is instead loaded as a browser library (e.g. from
    museum.atfedi.de). Node is the only real caller of that CLI surface, so
    gate the whole thing on it actually being Node. *)
+let () = Frontend.install ()
 let () = CurveBridge.init ()
 let () = GpuBridge.init ()
 let () = JsBridge.init ()
@@ -77,11 +78,56 @@ let report_runtime_error msg =
     print_endline "  in:";
     List.iter (fun (name, line) -> print_endline (Printf.sprintf "    %s, called from line %d" name line)) frames
 
-let run_or_report src =
-  match Eval.run src with
+(* --vm: 木を歩く代わりに、いったん命令列に畳んでから走らせる(段階3)。
+   まだ畳める形が限られているので、畳めなければ Tocode がそう言って止まる。
+   ふだんの道(Eval.run)はそのまま、隣に置いてあるだけ。 *)
+let run_via_vm src =
+  let prog = Parser.parse_program src in
+  Resolve.resolve_program prog;
+  (* わざと一度バイトにして、読み戻してから走らせている。渡す道が本当に
+     通っていることを、走らせるたびに確かめたいので。ここを素通しにすると、
+     .tsb を書けているつもりで書けていない、が起こりうる *)
+  let tsb = Bytecode.to_bytes (Tocode.compile_program prog) in
+  if Sys.getenv_opt "TSUBAKI_TSB_SIZE" <> None then
+    prerr_endline (Printf.sprintf "[tsb] %d bytes" (String.length tsb));
+  ignore (Vm.run (Bytecode.of_bytes tsb) Eval.global)
+
+(* --emit-tsb: 何枚かのソースを、一つの .tsb に畳んで書き出す。走らせる側は
+   これだけ読めればよく、parser を持たなくていい -- drop に配るのはこの形。
+
+   ファイルをまたいで一つの流れとして parse して resolve する: cache のセルを
+   指す番号は、その流れの中で一つずつ配られるので *)
+let emit_tsb out (files : string list) =
+  let parsed =
+    List.map
+      (fun f ->
+        let src = read_file f in
+        Runtime.current_file := f;
+        Runtime.current_file_dir := Filename.dirname f;
+        f, Parser.parse_program src)
+      files
+  in
+  Resolve.resolve_program (List.concat_map snd parsed);
+  let tsb = Bytecode.to_bytes (Tocode.compile_files parsed) in
+  let oc = open_out_bin out in
+  output_string oc tsb;
+  close_out oc;
+  prerr_endline (Printf.sprintf "%s: %d bytes" out (String.length tsb))
+
+let read_tsb path =
+  let ic = open_in_bin path in
+  let s = really_input_string ic (in_channel_length ic) in
+  close_in ic;
+  s
+
+let run_or_report ?(vm = false) src =
+  match (if vm then run_via_vm src else Eval.run src) with
   | () -> ()
-  | exception Parser.Parse_error msg ->
+  | exception Ast.Parse_error msg ->
     print_endline ("tsubaki: " ^ msg);
+    exit 1
+  | exception Tocode.Not_yet what ->
+    print_endline ("tsubaki: --vm cannot fold " ^ what ^ " yet (see bin/tocode.ml)");
     exit 1
   | exception Runtime.JuliaError v ->
     report_runtime_error (Runtime.show v);
@@ -117,7 +163,10 @@ let rec main () =
      at all and fall silently through to the embedded demo below -- the demo
      runs, prints happily, and the file you asked for never runs at all. A
      mis-typed CLI must say so, not do something else convincingly. *)
-  let usage = "usage: tsubaki [--repl | [--frames N] path/to/file.jl]" in
+  let usage =
+    "usage: tsubaki [--repl | --emit-tsb out.tsb file.jl... | --run-tsb file.tsb \
+     | [--frames N] [--vm] path/to/file.jl]"
+  in
   let die msg =
     print_endline ("tsubaki: " ^ msg);
     print_endline usage;
@@ -126,10 +175,24 @@ let rec main () =
   let frames = ref None in
   let path = ref None in
   let repl = ref false in
+  let vm = ref false in
+  let emit_out = ref None in
+  let more_paths = ref [] in
+  let run_tsb = ref false in
   let rec parse = function
     | [] -> ()
     | "--repl" :: rest ->
       repl := true;
+      parse rest
+    | "--vm" :: rest ->
+      vm := true;
+      parse rest
+    | "--emit-tsb" :: out :: rest ->
+      emit_out := Some out;
+      parse rest
+    | [ "--emit-tsb" ] -> die "--emit-tsb wants a path to write"
+    | "--run-tsb" :: rest ->
+      run_tsb := true;
       parse rest
     | "--frames" :: n_str :: rest ->
       (match int_of_string_opt n_str with
@@ -139,11 +202,32 @@ let rec main () =
     | [ "--frames" ] -> die "--frames wants a frame count"
     | arg :: _ when String.length arg > 0 && arg.[0] = '-' -> die ("unknown option " ^ arg)
     | arg :: rest ->
-      if !path <> None then die ("more than one script given (" ^ Option.get !path ^ " and " ^ arg ^ ")");
+      (* --emit-tsb だけは何枚も受ける。drop の ops は、順に読まれる何枚かで
+         一つのまとまりなので *)
+      if !path <> None && !emit_out = None then
+        die ("more than one script given (" ^ Option.get !path ^ " and " ^ arg ^ ")");
       path := Some arg;
+      more_paths := arg :: !more_paths;
       parse rest
   in
   parse (List.tl (Array.to_list Sys.argv));
+  (match !emit_out with
+  | Some out -> (
+    match List.rev !more_paths with
+    | [] -> die "--emit-tsb wants at least one file to fold"
+    | files -> (
+      match emit_tsb out files with
+      | () -> exit 0
+      | exception Ast.Parse_error msg ->
+        print_endline ("tsubaki: " ^ msg);
+        exit 1
+      | exception Tocode.Not_yet what ->
+        print_endline ("tsubaki: cannot fold " ^ what ^ " yet (see bin/tocode.ml)");
+        exit 1
+      | exception Sys_error msg ->
+        print_endline ("error: " ^ msg);
+        exit 1))
+  | None -> ());
   if !repl then (
     if !path <> None then die "--repl takes no script (it reads from the prompt)";
     if !frames <> None then die "--repl and --frames are different things to do";
@@ -153,6 +237,27 @@ let rec main () =
   | None ->
     if !frames <> None then die "--frames needs a script to run";
     demo ()
+  (* --run-tsb: もう畳んであるものを走らせる。ここは parser を通らない --
+     drop のなかで起きることと、同じ道 *)
+  | Some path when !run_tsb -> (
+    Runtime.current_file_dir := Filename.dirname path;
+    Runtime.current_file := path;
+    match read_tsb path with
+    | exception Sys_error msg ->
+      print_endline ("error: " ^ msg);
+      exit 1
+    | tsb -> (
+      match Vm.run (Bytecode.of_bytes tsb) Eval.global with
+      | _ -> ()
+      | exception Bytecode.Bad_tsb msg ->
+        print_endline ("tsubaki: " ^ path ^ " is not a .tsb (" ^ msg ^ ")");
+        exit 1
+      | exception Runtime.JuliaError v ->
+        report_runtime_error (Runtime.show v);
+        exit 1
+      | exception Failure msg ->
+        report_runtime_error msg;
+        exit 1))
   | Some path -> (
     match read_file path with
     | exception Sys_error msg ->
@@ -161,7 +266,7 @@ let rec main () =
     | src -> (
       Runtime.current_file_dir := Filename.dirname path;
       Runtime.current_file := path;
-      run_or_report src;
+      run_or_report ~vm:!vm src;
       match !frames with
       | None ->
         (* a worker runs the very same script -- that is how it comes to know the

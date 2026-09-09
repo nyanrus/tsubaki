@@ -1126,10 +1126,10 @@
     | EField (o, f) -> Option.map (fun o' -> EField (o', f)) (subst_expr env o)
     | EBinOp (op, a, b, _) -> (
       match subst_expr env a, subst_expr env b with
-      | Some a', Some b' -> Some (EBinOp (op, a', b', Dispatch.new_cache ()))
+      | Some a', Some b' -> Some (EBinOp (op, a', b', Caches.fresh_call ()))
       | _ -> None)
     | ECall (f, args, [], _) ->
-      Option.map (fun args' -> ECall (f, args', [], Dispatch.new_cache ())) (subst_list args)
+      Option.map (fun args' -> ECall (f, args', [], Caches.fresh_call ())) (subst_list args)
     | ETernary (c, t, f) -> (
       match subst_expr env c, subst_expr env t, subst_expr env f with
       | Some c', Some t', Some f' -> Some (ETernary (c', t', f'))
@@ -1152,7 +1152,7 @@
     in
     match body_expr with
     | Some e when kwparams = [] && params <> [] && List.for_all simple_param params -> (
-      let self = List.map (fun p -> p.pname, EVar (p.pname, Runtime.new_var_cache ())) params in
+      let self = List.map (fun p -> p.pname, EVar (p.pname, Caches.fresh_var ())) params in
       match subst_expr self e with
       | None -> () (* body outside the allowed subset, or captures a global -- never inline *)
       | Some _ ->
@@ -1473,7 +1473,7 @@
              && !inline_depth < 8
              && inline_of c <> None ->
         incr inline_depth;
-        let r = compile_expr (ECall ("add_component!", [ obj; Option.get (inline_of c) ], [], Dispatch.new_cache ())) in
+        let r = compile_expr (ECall ("add_component!", [ obj; Option.get (inline_of c) ], [], Caches.fresh_call ())) in
         decr inline_depth;
         r
       (* SoA write: `add_component!(e, K(args...))` where K is SoA-eligible

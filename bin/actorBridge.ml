@@ -6,6 +6,8 @@
      tsubakiEval(src)          run source at top level; state carries over
                                (the same persistent global scope the REPL uses)
      tsubakiCall(name, args)   call a Tsubaki function by name with a JS array
+     tsubakiRunTsb(bytes)      run an already-folded .tsb (a Uint8Array) at top
+                               level -- the same state, without a parser
      tsubakiOnReady            if the host defined this function before the
                                script loaded, it is called once Tsubaki is up
      tsubakiEmbedded = true    tells main.ml not to run the CLI / demo
@@ -33,7 +35,8 @@ let guarded (f : unit -> value) : Js.Unsafe.any =
   | v -> ok v
   | exception Failure msg -> error msg
   | exception JuliaError v -> error (show v)
-  | exception Parser.Parse_error msg -> error msg
+  | exception Ast.Parse_error msg -> error msg
+  | exception Bytecode.Bad_tsb msg -> error ("not a .tsb: " ^ msg)
   | exception e -> error (Printexc.to_string e)
 
 let eval_raw (src : Js.js_string Js.t) : Js.Unsafe.any =
@@ -46,6 +49,15 @@ let call_raw (name : Js.js_string Js.t) (args : Js.Unsafe.any) : Js.Unsafe.any =
     Async.run_effectful (fun () -> result := Dispatch.call (Js.to_string name) args);
     !result)
 
+(* tsubakiRunTsb(bytes) -- もう畳んである命令列を走らせる。ここは parser を
+   通らないので、ソースを配らなくてよくなる(それが .tsb のある理由の全部)。
+   バイト列は Uint8Array のまま受けとる -- 文字にしてから渡すと、そのぶん
+   二度写すことになるので *)
+let run_tsb_raw (bytes : Typed_array.uint8Array Js.t) : Js.Unsafe.any =
+  guarded (fun () ->
+    let s = Typed_array.String.of_uint8Array bytes in
+    Vm.run (Bytecode.of_bytes s) Eval.global)
+
 let () =
   let unwrap =
     Js.Unsafe.js_expr
@@ -54,6 +66,7 @@ let () =
   let export name f = Js.Unsafe.set Js.Unsafe.global name (Js.Unsafe.fun_call unwrap [| Js.Unsafe.inject (Js.wrap_callback f) |]) in
   export "tsubakiEval" eval_raw;
   export "tsubakiCall" call_raw;
+  export "tsubakiRunTsb" run_tsb_raw;
   Js.Unsafe.set Js.Unsafe.global "tsubakiReady" (Js.bool true)
 
 (* Unlike every other bridge's, this `init` does something: it tells the host

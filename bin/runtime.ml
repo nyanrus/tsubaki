@@ -1278,6 +1278,23 @@
 
     let new_cache () : call_cache = { gen = -1; entry = None; shadow_gen = -1; struct_gen = -1 }
 
+    (* 番号 -> セル。AST のノードが持っているのは Caches.fresh_call () で
+       もらった番号だけで、セルはここにある。番号は単調に増えるので、要る
+       ところまで倍々に伸ばす(伸ばすのは初回だけ、あとは配列を引くだけ)。 *)
+    let cache_table : call_cache array ref = ref (Array.init 256 (fun _ -> new_cache ()))
+
+    let grow_cache_table (i : int) : call_cache =
+      let t = !cache_table in
+      let old_n = Array.length t in
+      let n = max (i + 1) (2 * old_n) in
+      let bigger = Array.init n (fun k -> if k < old_n then Array.unsafe_get t k else new_cache ()) in
+      cache_table := bigger;
+      Array.unsafe_get bigger i
+
+    let cache_at (i : int) : call_cache =
+      let t = !cache_table in
+      if i < Array.length t then Array.unsafe_get t i else grow_cache_table i
+
     (* compares cached tags against args WITHOUT building a fresh `List.map
        tag args` list first -- on a cache hit (the overwhelmingly common
        case in a hot loop) this is zero allocations, where the naive
@@ -1317,6 +1334,21 @@
   type var_cache = { mutable depth : int }
 
   let new_var_cache () : var_cache = { depth = 0 }
+
+  (* 同じ形の表を var_cache にも。EVar/EAssign が持つのは番号だけ。 *)
+  let var_cache_table : var_cache array ref = ref (Array.init 256 (fun _ -> { depth = 0 }))
+
+  let grow_var_cache_table (i : int) : var_cache =
+    let t = !var_cache_table in
+    let old_n = Array.length t in
+    let n = max (i + 1) (2 * old_n) in
+    let bigger = Array.init n (fun k -> if k < old_n then Array.unsafe_get t k else { depth = 0 }) in
+    var_cache_table := bigger;
+    Array.unsafe_get bigger i
+
+  let var_cache_at (i : int) : var_cache =
+    let t = !var_cache_table in
+    if i < Array.length t then Array.unsafe_get t i else grow_var_cache_table i
 
   (* funcdecl_cache_state/funcdecl_cache are defined further below, right
      after the Host module -- FC_host_compiled needs Host.program, and Host
@@ -2422,6 +2454,22 @@
   type funcdecl_cache = { mutable fc_state : funcdecl_cache_state }
 
   let new_funcdecl_cache () : funcdecl_cache = { fc_state = FC_unattempted }
+
+  (* SFuncDecl の分。宣言の場所ひとつにセルひとつ、というのは前と同じ。 *)
+  let funcdecl_cache_table : funcdecl_cache array ref =
+    ref (Array.init 64 (fun _ -> { fc_state = FC_unattempted }))
+
+  let grow_funcdecl_cache_table (i : int) : funcdecl_cache =
+    let t = !funcdecl_cache_table in
+    let old_n = Array.length t in
+    let n = max (i + 1) (2 * old_n) in
+    let bigger = Array.init n (fun k -> if k < old_n then Array.unsafe_get t k else { fc_state = FC_unattempted }) in
+    funcdecl_cache_table := bigger;
+    Array.unsafe_get bigger i
+
+  let funcdecl_cache_at (i : int) : funcdecl_cache =
+    let t = !funcdecl_cache_table in
+    if i < Array.length t then Array.unsafe_get t i else grow_funcdecl_cache_table i
 
   (* --- built-in operators/functions, registered the same way user `function`
      declarations are -- there is no privileged syntax, "+" is just a name. --- *)
