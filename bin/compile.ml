@@ -1163,6 +1163,21 @@
         Hashtbl.replace inline_methods name ((sig_, params, e) :: prev))
     | _ -> ()
 
+  (* The operators Eval answers itself, before Dispatch is ever asked (see its
+     own EBinOp cases): short-circuit control flow, a range as a value, and the
+     ones whose meaning is built in rather than carried by a method. HBin goes
+     straight to Dispatch.call_cached, so compiling one of these here asks for
+     a method nobody ever defined -- `f() = "a" => 1` came back as
+     "MethodError: no method matching =>(String, Int)" while the same
+     expression at the top level was a Pair. Not eligible, tree-walk it.
+
+     "&&"/"||" need real lazy control flow, not a plain binop; ":" is only
+     supported as a for-loop's own iterator (see SFor below), not as a
+     standalone value; "=>" is a Pair, "==="/"!==" identity, "<:" a subtype
+     test on two names that are deliberately NOT evaluated, and "in" knows
+     ranges and collections that no method covers. *)
+  let not_a_method = [ "&&"; "||"; ":"; "=>"; "==="; "!=="; "<:"; "in" ]
+
   let try_compile_host (body : stmt list) : (Host.program * int) option =
     let body = strip_lines body in
     let slots : (string, int) Hashtbl.t = Hashtbl.create 8 in
@@ -1432,10 +1447,7 @@
       | EField (obj, name) -> Host.HField (compile_expr obj, name)
       | EArrayLit es -> Host.HMakeArray (List.map compile_expr es)
       | EBinOp (op, a, b, _) ->
-        if op = "&&" || op = "||" || op = ":" then raise Not_eligible
-          (* "&&"/"||" need real lazy control flow, not a plain binop; ":"
-             is only supported as a for-loop's own iterator (see SFor
-             below), not as a standalone value *);
+        if List.mem op not_a_method then raise Not_eligible;
         Host.HBin (op, compile_expr a, compile_expr b, Dispatch.new_cache ())
       (* --- specialized ECS opcodes: skip Dispatch.call_cached's name/
          argument-type resolution entirely for the handful of calls an ECS

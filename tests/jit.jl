@@ -92,3 +92,13 @@ function describe_total()
     return "total is $t"
 end
 println(describe_total())
+
+# the operators the interpreter answers itself, inside an eligible shape. The
+# compiled path sends a binop straight to dispatch, where these have no method
+# at all -- so `pair()` used to be "MethodError: no method matching
+# =>(String, Int)" while the very same expression at the top level was a Pair.
+pair() = "a" => 1
+same() = 1 === 1
+differs() = 1 !== 2
+member() = 3 in 1:5
+println(pair(), " ", same(), " ", differs(), " ", member())
