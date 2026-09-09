@@ -378,6 +378,10 @@
       Some (String.sub s plen (String.length s - plen - 1))
     else None
 
+  (* the module files being read right now, innermost first -- two files that
+     ask each other for a module would otherwise read each other forever *)
+  let loading_modules : string list ref = ref []
+
   let rec eval_expr env (e : expr) : value =
     match e with
     | EInt n -> VInt n
@@ -1787,9 +1791,11 @@
       current_module_prefix := saved;
       VNothing
     | SUsing name ->
+      ensure_module name;
       use_module name;
       VNothing
     | SImport (name, members) ->
+      ensure_module name;
       import_module name members;
       VNothing
     | SMacroDecl (name, params, body) ->
@@ -1854,6 +1860,98 @@
     | s :: rest ->
       ignore (exec_stmt env s);
       exec_stmt_list env rest
+
+  (* ---- a module that lives in a file of its own --------------------------
+     `using Shapes` / `import Shapes` when no `module Shapes` has been declared:
+     read `Shapes.jl` (or `Shapes.tsubaki`) beside the file that asked, run it
+     as its own top level, and carry on as if the module had been written right
+     there. So a program can be several files that each own a namespace, not
+     just several files spliced together the way `include` does it.
+
+     Where to look is the one rule `include` already keeps -- next to the file
+     doing the asking -- and there is no search path beyond it. The files of one
+     program find each other; nothing else is reachable, and no environment or
+     manifest decides anything.
+
+     A module that is already there is never read from a file, so asking twice
+     costs nothing and two files asking for the same one get the same one. And
+     when there is no such file either, this stays what it has always been: a
+     no-op, which is how `using LinearAlgebra` gets past its first line. *)
+
+  (* is there a module by this name? -- a module here is a prefix on the tables,
+     not a value, so this asks the tables *)
+  and module_declared name =
+    let qp = name ^ "." in
+    let qplen = String.length qp in
+    let starts k = String.length k > qplen && String.equal (String.sub k 0 qplen) qp in
+    let has : 'a. (string, 'a) Hashtbl.t -> bool =
+      fun tbl -> Hashtbl.fold (fun k _ acc -> acc || starts k) tbl false
+    in
+    has Dispatch.methods || has struct_defs || has Types.parent || has macros
+
+  and read_source path =
+    try
+      Some
+        (Js_of_ocaml.Js.to_string
+           (Js_of_ocaml.Js.Unsafe.fun_call
+              (Js_of_ocaml.Js.Unsafe.get Js_of_ocaml.Js.Unsafe.global "host_read_file")
+              [| Js_of_ocaml.Js.Unsafe.inject (Js_of_ocaml.Js.string path) |]))
+    with _ -> None
+
+  (* run another file's text here. `own_top`: a module's own file IS a top level
+     (a `module Shapes` in it is Shapes, even when the `import` was written
+     inside a module body), where an `include` splices and keeps the prefix it
+     was called in. The reported position follows the file while it runs and
+     comes back on the way out through a return only -- an error propagating out
+     of it leaves the position inside, which is where it belongs. *)
+  and run_source_file ~own_top resolved src =
+    let prog = Parser.parse_program src in
+    Resolve.resolve_program prog;
+    let saved_dir = !current_file_dir in
+    let saved_prefix = !current_module_prefix in
+    let entered = here () in
+    current_file_dir := Filename.dirname resolved;
+    current_file := resolved;
+    if own_top then current_module_prefix := "";
+    ignore (exec_stmt_list global prog);
+    current_module_prefix := saved_prefix;
+    current_file_dir := saved_dir;
+    restore_site entered
+
+  and load_module_file name =
+    let dir = !current_file_dir in
+    let beside ext = if dir = "" then name ^ ext else Filename.concat dir (name ^ ext) in
+    let rec first = function
+      | [] -> None
+      | p :: rest -> (match read_source p with Some src -> Some (p, src) | None -> first rest)
+    in
+    match first [ beside ".jl"; beside ".tsubaki" ] with
+    | None -> () (* no such file: the no-op this always was *)
+    | Some (resolved, src) ->
+      if List.mem resolved !loading_modules then
+        failwith
+          (Printf.sprintf "import %s: %s is still being read (two files asking each other for a module)"
+             name (Filename.basename resolved));
+      loading_modules := resolved :: !loading_modules;
+      (try run_source_file ~own_top:true resolved src
+       with e ->
+         loading_modules := List.tl !loading_modules;
+         raise e);
+      loading_modules := List.tl !loading_modules;
+      if not (module_declared name) then
+        failwith
+          (Printf.sprintf "import %s: %s does not declare `module %s`" name (Filename.basename resolved) name)
+
+  and ensure_module dotted =
+    if not (module_declared dotted) then (
+      (* `using Outer.Inner` names a file by its FIRST segment: the rest is
+         nesting inside whatever that file declared *)
+      let root = match String.index_opt dotted '.' with Some i -> String.sub dotted 0 i | None -> dotted in
+      if not (module_declared root) then load_module_file root;
+      if root <> dotted && module_declared root && not (module_declared dotted) then
+        failwith
+          (Printf.sprintf "using %s: %s has no %s" dotted root
+             (String.sub dotted (String.length root + 1) (String.length dotted - String.length root - 1))))
 
   (* eval(quoted) -- runs a Symbol/Expr (or plain literal) as real code in
      the global scope, real Julia's actual `eval`. `expansion_id:(-1)` is a
@@ -1964,27 +2062,12 @@
     Dispatch.defmethod "include" [ [ "String" ] ] (function
       | [ VStr path ] ->
         let resolved = if !current_file_dir = "" then path else Filename.concat !current_file_dir path in
-        let src =
-          try Js.to_string (Js.Unsafe.fun_call (Js.Unsafe.get Js.Unsafe.global "host_read_file") [| Js.Unsafe.inject (Js.string resolved) |])
-          with _ -> failwith (Printf.sprintf "include: could not read %s" resolved)
-        in
-        let prog = Parser.parse_program src in
-        Resolve.resolve_program prog;
-        let saved = !current_file_dir in
-        (* the reported source position follows the included file while it
-           runs, and the including file's own line comes back afterwards --
-           otherwise an error inside an included file would name the outer
-           file and a line number belonging to neither *)
-        let entered = here () in
-        current_file_dir := Filename.dirname resolved;
-        current_file := resolved;
-        (* restored on the way out through a RETURN only, the same rule a
-           returning call frame follows: an error propagating out of an
-           included file leaves the position inside that file, which is where
-           it belongs *)
-        ignore (exec_stmt_list global prog);
-        current_file_dir := saved;
-        restore_site entered;
+        (match read_source resolved with
+        | None -> failwith (Printf.sprintf "include: could not read %s" resolved)
+        (* spliced, not a top level of its own: a `module` inside an included
+           file lands under whatever prefix the `include` was written in.
+           `import` reads a file the other way (see run_source_file). *)
+        | Some src -> run_source_file ~own_top:false resolved src);
         VNothing
       | _ -> assert false)
 

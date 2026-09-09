@@ -133,6 +133,14 @@ its argument against the *including file's* directory the way real Julia
 does — so a program can be several files, and `examples/keel_bounce.jl` finds
 `examples/keel.jl` no matter where the process was started from.
 
+`import Shapes` (or `using Shapes`) does the same lookup for a module that
+hasn't been declared: `Shapes.jl`, then `Shapes.tsubaki`, beside the file that
+asked. The file runs as its own top level — a `module Shapes` in it is
+`Shapes`, even when the `import` was written inside another module's body —
+and from then on it is an ordinary module. `tests/imports.jl` walks the whole
+of it, including what happens when the file isn't what it was asked to be, and
+when two files ask each other.
+
 ### Where an error happened
 
 A runtime error carries its place: the file and line of the statement that
@@ -510,7 +518,16 @@ The pre-existing `+` still concatenates too.
   (`using Outer.Inner`). `Name.member(...)` is a strict qualified call, no
   `using` needed, any chain length. `import Name: a, b` binds only the named
   members bare. Constructing a type qualified vs. bare produces the identical
-  runtime tag.
+  runtime tag. **A module can live in a file of its own**: `using Shapes` /
+  `import Shapes`, with no `module Shapes` declared, reads `Shapes.jl` (then
+  `Shapes.tsubaki`) *beside the file that asked* and runs it as its own top
+  level. Same one rule `include` keeps, and no path beyond it — the files of
+  one program find each other, nothing else is reachable. A module already
+  there is never read from a file, so asking twice costs nothing and merges
+  nothing twice; two files asking each other raises instead of reading
+  forever; a file that doesn't declare the module it was named for says so.
+  A name with neither a module nor a file behind it stays the no-op it always
+  was (which is how `using LinearAlgebra` gets past its first line).
 - **Macros, with real hygiene, `gensym`, `esc`** — `:( expr )` / `quote ...
   end` quote code as `Symbol`/`Expr` values; `$(expr)` / `$name` splice;
   `macro name(args...) ... end` (args arrive unevaluated, matched by count) +
@@ -691,10 +708,14 @@ The pre-existing `+` still concatenates too.
   took the bytecode/Host path doesn't run through the tree-walker and so
   contributes no frame. The functions it *calls* still do.
 - **`module`/`using`/`import` are a real but narrow subset.** No export lists;
-  two modules declaring an unrelated same-named type both `using`'d end up
-  treated as related (the same "same name → merged" simplification same-named
-  functions already accept); no bare `Name.member` for a non-call member (no
-  first-class module value, plain variables aren't namespaced).
+  no `as` (neither `import Foo as F` nor `import Foo: a as b`); bare
+  `import Foo` isn't distinguished from `using Foo` (there is no enforced
+  qualification to model the difference against); two modules declaring an
+  unrelated same-named type both `using`'d end up treated as related (the same
+  "same name → merged" simplification same-named functions already accept); no
+  bare `Name.member` for a non-call member (no first-class module value, plain
+  variables aren't namespaced). Reading a module from a file needs the host to
+  offer `host_read_file`, so it works under the CLI and not in a browser.
 - **Macros/quoting cover a scoped subset of the grammar.** Not quotable
   (raises a clear error): `Vector{T}(undef, n)`, a bare evaluated block, and a
   call on a computed callee (`f()(x)` -- a quoted call carries its callee as a
@@ -718,8 +739,10 @@ The pre-existing `+` still concatenates too.
   classic `js_of_ocaml`. A self-contained pure-OCaml bignum was judged bigger
   than any other single piece of this project's history, and not taken on. See
   `ROADMAP.md`'s "Numeric type genericity."
-- **No package system.** `include("other.jl")` is the whole of it: no
-  registry, no environments, no `Project.toml`, no versions.
+- **No package system.** `include("other.jl")` splices a file in; `import Foo`
+  reads `Foo.jl` beside the asking file as a module of its own. That is the
+  whole of it: no registry, no environments, no `Project.toml`, no versions,
+  and no search path — a module that isn't beside you can't be named.
 - **Eleven targeted optimizations plus one static-analysis pass, no more.**
   Variable lookup's depth is resolved statically, but the lookup at that depth
   is still a linear assoc-list scan (interning just makes its comparisons

@@ -1681,12 +1681,22 @@
     let methods_to_merge =
       Hashtbl.fold (fun k v acc -> if has_prefix k then (bare_of k, v) :: acc else acc) Dispatch.methods []
     in
+    (* the same method record can already be on the bare name -- `using X` twice,
+       or `import X` (which is a `using` here) followed by `using X`. Appending
+       it again would make every call to it ambiguous with itself, so only what
+       isn't already there is merged, and the generation moves only if something
+       really did. *)
+    let merged = ref false in
     List.iter
       (fun (bare, ms) ->
         let existing = Option.value (Hashtbl.find_opt Dispatch.methods bare) ~default:[] in
-        Hashtbl.replace Dispatch.methods bare (ms @ existing))
+        match List.filter (fun m -> not (List.memq m existing)) ms with
+        | [] -> ()
+        | fresh ->
+          merged := true;
+          Hashtbl.replace Dispatch.methods bare (fresh @ existing))
       methods_to_merge;
-    if methods_to_merge <> [] then incr Dispatch.generation;
+    if !merged then incr Dispatch.generation;
     let structs_to_merge =
       Hashtbl.fold (fun k v acc -> if has_prefix k then (bare_of k, v) :: acc else acc) struct_defs []
     in
@@ -1720,12 +1730,22 @@
     let methods_to_merge =
       Hashtbl.fold (fun k v acc -> if has_wanted_prefix k then (bare_of k, v) :: acc else acc) Dispatch.methods []
     in
+    (* the same method record can already be on the bare name -- `using X` twice,
+       or `import X` (which is a `using` here) followed by `using X`. Appending
+       it again would make every call to it ambiguous with itself, so only what
+       isn't already there is merged, and the generation moves only if something
+       really did. *)
+    let merged = ref false in
     List.iter
       (fun (bare, ms) ->
         let existing = Option.value (Hashtbl.find_opt Dispatch.methods bare) ~default:[] in
-        Hashtbl.replace Dispatch.methods bare (ms @ existing))
+        match List.filter (fun m -> not (List.memq m existing)) ms with
+        | [] -> ()
+        | fresh ->
+          merged := true;
+          Hashtbl.replace Dispatch.methods bare (fresh @ existing))
       methods_to_merge;
-    if methods_to_merge <> [] then incr Dispatch.generation;
+    if !merged then incr Dispatch.generation;
     let structs_to_merge =
       Hashtbl.fold (fun k v acc -> if has_wanted_prefix k then (bare_of k, v) :: acc else acc) struct_defs []
     in
