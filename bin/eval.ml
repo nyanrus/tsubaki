@@ -18,7 +18,10 @@
      Compile が「その形は無理」と言ったときと同じ道を通るだけ -- つまり
      tree-walking で走る。意味は変わらない、速さだけが変わる。 *)
   let compile_bytecode : (stmt list -> (float array * int) option) ref = ref (fun _ -> None)
-  let compile_host : (stmt list -> (Host.program * int) option) ref = ref (fun _ -> None)
+  (* 「その体を、もっと直な形にできたなら、それを呼ぶ関数」。中で何が走るかは
+     ここでは知らない -- Host(bin/host.ml)は ecs を使う人だけのもので、
+     eval はそれを知らなくていい *)
+  let compile_host : (stmt list -> (unit -> value) option) ref = ref (fun _ -> None)
 
   let register_inlinable :
       (string -> param list -> (string * string list * expr) list -> stmt list -> unit) ref =
@@ -1813,7 +1816,7 @@
         if params = [] && kwparams = [] then (
           match fcache.fc_state with
           | FC_compiled (encoded, nslots) -> fun _argv -> run_bytecode encoded nslots
-          | FC_host_compiled (prog, nslots) -> fun _argv -> Host.run prog nslots
+          | FC_host_compiled run -> fun _argv -> run ()
           | FC_ineligible -> tree_walk_impl
           | FC_unattempted -> (
             match !compile_bytecode body with
@@ -1826,9 +1829,9 @@
                  path before giving up to the tree-walking interpreter. See
                  Compile.try_compile_host's own comment for what it accepts. *)
               match !compile_host body with
-              | Some (prog, nslots) ->
-                fcache.fc_state <- FC_host_compiled (prog, nslots);
-                fun _argv -> Host.run prog nslots
+              | Some run ->
+                fcache.fc_state <- FC_host_compiled run;
+                fun _argv -> run ()
               | None ->
                 fcache.fc_state <- FC_ineligible;
                 tree_walk_impl)))

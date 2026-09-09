@@ -21,7 +21,11 @@ let install () =
       match Compile.try_compile body with
       | Some (code, nslots) -> Some (Compile.encode code, nslots)
       | None -> None);
-  Eval.compile_host := Compile.try_compile_host;
+  Eval.compile_host :=
+    (fun body ->
+      match Compile.try_compile_host body with
+      | Some (prog, nslots) -> Some (fun () -> Host.run prog nslots)
+      | None -> None);
   Eval.register_inlinable := Compile.register_inlinable;
   Eval.compile_wgsl := Compile.Wgsl.try_compile;
   Eval.compile_glsl := Compile.Glsl.compile_stage

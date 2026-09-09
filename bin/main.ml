@@ -28,7 +28,9 @@ let read_file path =
    this module is instead loaded as a browser library (e.g. from
    museum.atfedi.de). Node is the only real caller of that CLI surface, so
    gate the whole thing on it actually being Node. *)
+let () = Async.install ()
 let () = Frontend.install ()
+let () = Math.init ()
 let () = CurveBridge.init ()
 let () = GpuBridge.init ()
 let () = JsBridge.init ()
@@ -92,26 +94,12 @@ let run_via_vm src =
     prerr_endline (Printf.sprintf "[tsb] %d bytes" (String.length tsb));
   ignore (Vm.run (Bytecode.of_bytes tsb) Eval.global)
 
-(* --emit-tsb: 何枚かのソースを、一つの .tsb に畳んで書き出す。走らせる側は
-   これだけ読めればよく、parser を持たなくていい -- drop に配るのはこの形。
-
-   ファイルをまたいで一つの流れとして parse して resolve する: cache のセルを
-   指す番号は、その流れの中で一つずつ配られるので *)
+(* --emit-tsb: 何枚かのソースを、一つの .tsb に畳んで書き出す(中身は Tsb)。
+   走らせる側はこれだけ読めればよく、parser を持たなくていい -- drop に配るのは
+   この形。ビルドのときだけ要るので、bin/tsubakic.ml という道具にもなっている *)
 let emit_tsb out (files : string list) =
-  let parsed =
-    List.map
-      (fun f ->
-        let src = read_file f in
-        Runtime.current_file := f;
-        Runtime.current_file_dir := Filename.dirname f;
-        f, Parser.parse_program src)
-      files
-  in
-  Resolve.resolve_program (List.concat_map snd parsed);
-  let tsb = Bytecode.to_bytes (Tocode.compile_files parsed) in
-  let oc = open_out_bin out in
-  output_string oc tsb;
-  close_out oc;
+  let tsb = Tsb.of_files files in
+  Tsb.write_file out tsb;
   prerr_endline (Printf.sprintf "%s: %d bytes" out (String.length tsb))
 
 let read_tsb path =

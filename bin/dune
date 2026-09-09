@@ -10,13 +10,31 @@
  (modules hints caches runtime ast bytecode eval vm async jsBridge actorBridge)
  (libraries js_of_ocaml))
 
+; 行列とベクトルと線形代数。drop の logic は、こういうものを持たない
+; (ボタンを並べて pref を読む仕事に、固有値分解は要らない)。
+(library
+ (name tsubaki_math)
+ (wrapped false)
+ (modules math)
+ (libraries js_of_ocaml tsubaki))
+
+; ecs の system を、AST を歩かずに走らせるほう(hexpr/hstmt の小さな VM と、
+; SoA の列)。Runtime に居たころは、誰も呼ばなくても一緒に配られていた --
+; 要るのは ecs を使う人だけなので、外に出してある。Ast は知らない
+; (Compile がここに向けて組み立てる)。
+(library
+ (name tsubaki_host)
+ (wrapped false)
+ (modules host)
+ (libraries js_of_ocaml tsubaki))
+
 ; 前半分 -- ソースを読んで AST にするところと、AST をもっと速い形に落とす
 ; ところ。ビルド時にだけ要るものが、いずれ全部こちら側に来る。
 (library
  (name tsubaki_frontend)
  (wrapped false)
- (modules lexer parser resolve compile tocode frontend)
- (libraries js_of_ocaml tsubaki))
+ (modules lexer parser resolve compile tocode tsb frontend)
+ (libraries js_of_ocaml tsubaki tsubaki_host))
 
 ; 外の世界につながる橋。drop はどれも使わない。
 (library
@@ -25,7 +43,7 @@
  (modules
   curveBridge gpuBridge webglBridge physicsBridge audioBridge
   parallelBridge ecs)
- (libraries js_of_ocaml tsubaki tsubaki_frontend))
+ (libraries js_of_ocaml tsubaki tsubaki_host tsubaki_frontend))
 
 (executable
  (name main)
@@ -34,7 +52,7 @@
  (wasm_of_ocaml
   (flags
    (:standard --effects=cps)))
- (libraries js_of_ocaml tsubaki tsubaki_frontend tsubaki_bridges))
+ (libraries js_of_ocaml tsubaki tsubaki_math tsubaki_host tsubaki_frontend tsubaki_bridges))
 
 (executable
  (name drop)
@@ -43,16 +61,41 @@
  (wasm_of_ocaml
   (flags
    (:standard --effects=cps)))
- (libraries js_of_ocaml tsubaki tsubaki_frontend))
+ (libraries js_of_ocaml tsubaki tsubaki_host tsubaki_frontend))
 
 ; .tsb だけを走らせるほう。tsubaki_frontend をリンクしないので、lexer も
 ; parser も resolve も compile も入らない -- 渡す道(.tsb)ができたので、
 ; もう要らない。
+;
+; --effects=disabled なのは、effect handler が要るのが gpu/ の async API
+; (await gpu_init() など、bin/async.ml の頭に書いてあります)だけで、それは
+; tsubaki_bridges に居る -- ここはリンクしていないから。cps は全関数を CPS に
+; 書き換えるので、そのぶんが丸ごと要らなくなる: 461,615 -> 350,976 バイト
+; (-24%)。drop は await しないので、失うものは無い。
+;
+; もし drop でも await が要るようになったら、cps に戻すか(+110KB)、jspi に
+; する。jspi は disabled と同じ大きさで、走らせる側の対応も、いまはもう
+; ある -- Firefox 153(2026-07-21)から既定で有効
+; (pref は javascript.options.wasm_js_promise_integration、既定 true)、
+; Node は 24.20.0 から旗なし。dedicated worker では WPT が通っている。
+; ChromeWorker での確認だけは、まだ誰も取っていない。
 (executable
  (name dropvm)
  (modules dropvm)
  (modes byte wasm js)
  (wasm_of_ocaml
   (flags
-   (:standard --effects=cps)))
+   (:standard --effects=disabled)))
  (libraries js_of_ocaml tsubaki))
+
+; .tsubaki を .tsb に畳むだけの道具。ビルドのときにだけ動くので、走らせる側の
+; 言葉(Eval も Vm も、橋も)は要らない -- registry の build がこれを呼んで、
+; drop の ops を一枚にする。
+(executable
+ (name tsubakic)
+ (modules tsubakic)
+ (modes byte wasm js)
+ (wasm_of_ocaml
+  (flags
+   (:standard --effects=disabled)))
+ (libraries js_of_ocaml tsubaki tsubaki_frontend))

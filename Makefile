@@ -1,10 +1,12 @@
 .PHONY: build run repl test test-julia test-vm test-tsb clean build-gpu clean-gpu
 
-# 三本建つ。main は CLI/REPL と橋を全部つれてくる開発用、drop は drop に積む
-# ほう(actor の戸だけ)、dropvm は .tsb だけを走らせるほう(parser が入らない)。
+# 四本建つ。main は CLI/REPL と橋を全部つれてくる開発用、drop は drop に積む
+# ほう(actor の戸だけ)、dropvm は .tsb だけを走らせるほう(parser が入らない)、
+# tsubakic は畳むだけの道具(走らせる側の言葉が入らない)。
 # 何がどちらに行くかは bin/dune。
 build:
-	dune build ./bin/main.bc.wasm.js ./bin/drop.bc.wasm.js ./bin/dropvm.bc.wasm.js --profile release
+	dune build ./bin/main.bc.wasm.js ./bin/drop.bc.wasm.js ./bin/dropvm.bc.wasm.js \
+	  ./bin/tsubakic.bc.wasm.js --profile release
 	cd kernel && cargo build --target wasm32-unknown-unknown --release
 	cd physics && cargo build --target wasm32-unknown-unknown --release
 
@@ -36,11 +38,12 @@ test-vm: build
 	 if [ "$$a" = "$$b" ]; then echo "vm: fib matches the tree-walking answer"; \
 	 else echo "vm: MISMATCH"; echo "  tree: $$a"; echo "  vm:   $$b"; exit 1; fi
 
-# 渡す道を、端から端まで一度通す: ソース -> .tsb -> parser を持たない build。
-# ここが通るなら、drop にソースを配らなくてよくなっている。
+# 渡す道を、端から端まで一度通す: ソース -> tsubakic -> .tsb -> dropvm。
+# registry の build が通る道と、同じ二本です。ここが通るなら、drop にソースを
+# 配らなくてよくなっている。
 test-tsb: build
 	@cp tools/tsb-host.js _build/default/bin/tsb-host.js
-	@node -r ./preload.js $(BIN) --emit-tsb _build/default/bin/fib.tsb examples/fib.jl 2>/dev/null
+	@node _build/default/bin/tsubakic.bc.wasm.js _build/default/bin/fib.tsb examples/fib.jl 2>/dev/null
 	@a=$$(node -r ./preload.js $(BIN) examples/fib.jl 2>/dev/null | head -1); \
 	 b=$$(node -r ./preload.js _build/default/bin/tsb-host.js _build/default/bin/fib.tsb 2>/dev/null | head -1); \
 	 if [ "$$a" = "$$b" ]; then echo "tsb: the parser-less build gives the same answer"; \

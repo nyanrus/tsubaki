@@ -69,5 +69,13 @@ let rec handler =
 (* the two real entry points a Tsubaki program's own await-capable code can
    run through -- Eval.run (top-level script execution) and GpuBridge's
    run_frame (the per-animation-frame re-entry) -- both call this instead of
-   invoking their body directly. *)
-let run_effectful (f : unit -> unit) : unit = ignore (match_with f () handler)
+   invoking their body directly.
+
+   handler を実際に張るのは、await するものがある build だけ。await が
+   出てくるのは gpu/ の橋からで、それを持たない build(drop に積むほう)は
+   ただ呼ぶ -- `--effects=disabled` で建てた wasm では `match_with` 自体が
+   通らないので(「trying to suspend without WebAssembly.promising」)、
+   張らないことが要ります。差し込むのは Async.install、呼ぶのは main.ml。 *)
+let runner : ((unit -> unit) -> unit) ref = ref (fun f -> f ())
+let run_effectful (f : unit -> unit) : unit = !runner f
+let install () = runner := fun f -> ignore (match_with f () handler)
