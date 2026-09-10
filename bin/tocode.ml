@@ -405,14 +405,12 @@ and compile_stmt b cb (s : stmt) : unit =
       ; f_cache = fc
       }
     in
-    emit cb (Defun (add_func b f));
-    emit cb Nothing
+    emit cb (Defun (add_func b f))
   | SStructDecl { mutable_; name; parent; type_params; fields; constructors; kwdefaults } ->
     fold_struct b cb ~mutable_ ~name ~parent ~type_params ~fields ~constructors ~kwdefaults
       ~kwdef:false
   | SAbstractDecl (name, parent) ->
-    emit cb (Defabstract (sym_index b name, sym_index b (Option.value parent ~default:"Any")));
-    emit cb Nothing
+    emit cb (Defabstract (sym_index b name, sym_index b (Option.value parent ~default:"Any")))
   | SLine n -> emit cb (Line n)
   | SFor (target, iter_e, body) ->
     (* 反復を作って、次があるあいだ体を回す。体は同じ命令列の中に居る --
@@ -492,14 +490,11 @@ and compile_stmt b cb (s : stmt) : unit =
     emit cb (Module_enter (sym_index b name));
     compile_stmts b cb body;
     emit cb Pop;
-    emit cb Module_leave;
-    emit cb Nothing
+    emit cb Module_leave
   | SUsing name ->
-    emit cb (Using (sym_index b name));
-    emit cb Nothing
+    emit cb (Using (sym_index b name))
   | SImport (name, members) ->
-    emit cb (Import (sym_index b name, Array.of_list (List.map (sym_index b) members)));
-    emit cb Nothing
+    emit cb (Import (sym_index b name, Array.of_list (List.map (sym_index b) members)))
   | SMacroDecl _ -> raise (Not_yet "a macro declaration")
   | SExport _ -> raise (Not_yet "export")
   | SMacroCall ("kwdef", SStructDecl { mutable_; name; parent; type_params; fields; constructors; kwdefaults })
@@ -563,25 +558,36 @@ and fold_struct b cb ~mutable_ ~name ~parent ~type_params ~fields ~constructors 
                fields)
       }
     in
-    emit cb (Defstruct (add_struct b st));
-    emit cb Nothing
+    emit cb (Defstruct (add_struct b st))
 
-(* 文の並び。最後の値だけ残して、途中のは捨てる。
+(* この文は、値を一つ積んで終わるか。位置の目印と、宣言のたぐいは積まない --
+   積んでいないものを Pop すると、その下にあるものを捨ててしまう *)
+and stmt_pushes (s : stmt) : bool =
+  match s with
+  | SLine _ | SFuncDecl _ | SStructDecl _ | SAbstractDecl _ | SUsing _ | SImport _
+  | SModuleDecl _ ->
+    false
+  | SMacroCall ("kwdef", SStructDecl _) -> false
+  | SMacroCall (name, inner) when Hints.is_inert_hint_macro name -> stmt_pushes inner
+  | _ -> true
 
-   位置の目印(SLine)は値を積まないので、「最後の文」を数えるときにも
-   数に入れない -- 目印は必ず文の前に来るので、並びの最後が目印になることは
-   ないけれど、途中に挟まる分は Pop してはいけない *)
+(* 文の並び。積まれた値のうち、最後のものだけ残す。
+
+   宣言も位置の目印も値を積まないので、「積んで、すぐ捨てる」がここには
+   出てこない。前はどの文も必ず一つ積むことにしていて、そのぶん
+   `Nothing` と `Pop` が並んでいた(webpanel の ops で 91 組)。 *)
 and compile_stmts b cb (stmts : stmt list) : unit =
-  let is_line = function SLine _ -> true | _ -> false in
-  let remaining = ref (List.length (List.filter (fun s -> not (is_line s)) stmts)) in
+  let remaining = ref (List.length (List.filter stmt_pushes stmts)) in
   if !remaining = 0 then (
-    List.iter (compile_stmt b cb) stmts;
+    List.iter (fun s -> ignore (compile_stmt b cb s)) stmts;
+    (* 何も積まれなかった並びの値は nothing -- eval が、宣言だけの本体から
+       VNothing を返すのと同じ *)
     emit cb Nothing)
   else
     List.iter
       (fun s ->
         compile_stmt b cb s;
-        if not (is_line s) then begin
+        if stmt_pushes s then begin
           decr remaining;
           if !remaining > 0 then emit cb Pop
         end)

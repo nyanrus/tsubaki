@@ -1,4 +1,4 @@
-.PHONY: build run repl test test-julia test-vm test-tsb clean build-gpu clean-gpu
+.PHONY: build run repl test test-julia test-vm test-tsb test-tsbvm clean build-gpu clean-gpu
 
 # 四本建つ。main は CLI/REPL と橋を全部つれてくる開発用、drop は drop に積む
 # ほう(actor の戸だけ)、dropvm は .tsb だけを走らせるほう(parser が入らない)、
@@ -48,6 +48,13 @@ test-tsb: build
 	 b=$$(node -r ./preload.js _build/default/bin/tsb-host.js _build/default/bin/fib.tsb 2>/dev/null | head -1); \
 	 if [ "$$a" = "$$b" ]; then echo "tsb: the parser-less build gives the same answer"; \
 	 else echo "tsb: MISMATCH"; echo "  source: $$a"; echo "  .tsb:   $$b"; exit 1; fi
+
+# Rust の VM(tsbvm/)を、tests の golden と突き合わせる。参照は OCaml のほう --
+# 食い違ったら Rust が間違っている。まだ知らない形(builtin もふくめて)は
+# 「まだ」として数えられるだけで、転ばない。
+test-tsbvm: build
+	cd tsbvm && cargo build --lib --target wasm32-unknown-unknown --release
+	python3 tools/test.py --tsbvm $(FILTER)
 
 clean:
 	dune clean

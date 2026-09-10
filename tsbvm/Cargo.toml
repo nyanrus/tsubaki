@@ -1,0 +1,16 @@
+[package]
+name = "tsbvm"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+# 小さく。この VM は配るものなので、速さより先に大きさを見る
+# (opt-level = "z" と panic = "abort" と lto で、3 のときの 125,387 から)
+opt-level = "z"
+panic = "abort"
+lto = true
+codegen-units = 1
+strip = true

@@ -17,12 +17,18 @@ one, are not).
     python3 tools/test.py dispatch mac   # only tests whose name contains one of these
     python3 tools/test.py --julia        # also cross-check the `# julia: yes` ones
     python3 tools/test.py --vm           # run through the bytecode VM instead
+    python3 tools/test.py --tsbvm        # run through the Rust VM (tsbvm/)
     python3 tools/test.py --update       # rewrite goldens from current output
 
 --vm runs each test through --vm (fold to .tsb, read it back, execute) and
 compares against the SAME golden. A test whose shapes Tocode can't fold yet
 says so and is counted separately -- that count, and what it names, is the
 map of what the VM still needs. See bin/tocode.ml.
+
+--tsbvm folds each test with tsubakic and runs the bytes through the Rust VM
+(tsbvm/), comparing against the SAME golden. A test the Rust VM does not know
+enough for yet says so and is counted separately -- that count is the map of
+what it still needs.
 
 --update exists so a deliberate change doesn't mean hand-editing 20 files.
 It records whatever comes out, including a regression -- read the diff it
@@ -74,6 +80,37 @@ def not_yet_reason(output):
     return output[len(NOT_YET):].split(" yet (")[0]
 
 
+TSBVM = os.path.join("_build", "default", "bin", "tsbvm-check.tsb")
+TSUBAKIC = os.path.join("_build", "default", "bin", "tsubakic.bc.wasm.js")
+
+
+def run_tsbvm(path):
+    """Fold with tsubakic, run with the Rust VM. The folding side's own
+    complaint comes back as-is, so a shape neither side has yet is named once."""
+    folded = run(["node", TSUBAKIC, TSBVM, path])
+    if "tsubakic:" in folded:
+        return folded
+    return run(["node", os.path.join("tools", "tsbvm-host.js"), TSBVM])
+
+
+def tsbvm_not_yet(output):
+    """What the Rust VM (or the folder in front of it) still needs, or None."""
+    for marker, cut in (
+        ("tsubakic: cannot fold ", " yet"),
+        ("tsbvm: vm: ", " (line"),
+    ):
+        if marker in output:
+            rest = output.split(marker, 1)[1]
+            return rest.split(cut)[0].replace(" is not supported yet", "").strip()
+    # a builtin this VM was never given is the other kind of "not yet"
+    if "tsbvm: MethodError: no method matching" in output:
+        name = output.split("no method matching ", 1)[1].split("(")[0]
+        return f"the builtin {name}"
+    if "tsbvm: UndefVarError:" in output:
+        return "a name the Rust VM does not have"
+    return None
+
+
 def run_julia(path):
     return run(["julia", "--startup-file=no", path])
 
@@ -102,6 +139,7 @@ def main():
     ap.add_argument("--update", action="store_true", help="rewrite goldens")
     ap.add_argument("--julia", action="store_true", help="cross-check julia-compatible tests")
     ap.add_argument("--vm", action="store_true", help="run through the bytecode VM (see bin/vm.ml)")
+    ap.add_argument("--tsbvm", action="store_true", help="run through the Rust VM (see tsbvm/)")
     args = ap.parse_args()
 
     if not os.path.exists(os.path.join(ROOT, BINARY)):
@@ -126,16 +164,23 @@ def main():
         # machine's home directory into its golden
         jl = os.path.join("tests", name + ".jl")
         golden_path = os.path.join(TESTS, name + ".out")
-        if args.vm and name.startswith("repl"):
+        if (args.vm or args.tsbvm) and name.startswith("repl"):
             # the REPL reads a line at a time; there is no .tsb to fold
             continue
-        actual = run_tsubaki(jl, vm=args.vm)
+        actual = run_tsbvm(jl) if args.tsbvm else run_tsubaki(jl, vm=args.vm)
 
         if args.update:
             with open(golden_path, "w") as f:
                 f.write(actual + "\n")
             print("%supdated%s %s" % (YELLOW, RESET, name))
             continue
+
+        if args.tsbvm:
+            reason = tsbvm_not_yet(actual)
+            if reason is not None:
+                print("%snot yet%s %s %s(%s)%s" % (YELLOW, RESET, name, DIM, reason, RESET))
+                not_yet.append((name, reason))
+                continue
 
         if args.vm:
             reason = not_yet_reason(actual)
@@ -186,7 +231,7 @@ def main():
     if skipped:
         line += ", %d without a golden" % skipped
     if not_yet:
-        line += ", %d the VM can't fold yet" % len(not_yet)
+        line += ", %d the VM can't do yet" % len(not_yet)
     if failed:
         line += ", %s%d failed%s: %s" % (RED, len(failed), RESET, ", ".join(failed))
     print(line)
@@ -196,7 +241,7 @@ def main():
         for _, reason in not_yet:
             counts[reason] = counts.get(reason, 0) + 1
         print("")
-        print("still to fold:")
+        print("still to do:")
         for reason, n in sorted(counts.items(), key=lambda kv: -kv[1]):
             print("  %2d  %s" % (n, reason))
     return 1 if failed else 0

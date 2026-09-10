@@ -227,7 +227,7 @@ let rec exec (p : program) (code : instr array) env0 : value =
          in
          Eval.bind !env bare (VClosure (n_total, local_impl))
        end;
-       push VNothing;
+       (* 宣言は値を積まない -- Tocode がそう畳んでいる(tocode.ml の stmt_pushes) *)
        incr pc
      (* n 個ぶん取って、並びにする。積んだ順がそのまま並びの順 *)
      | Makearr n ->
@@ -244,13 +244,11 @@ let rec exec (p : program) (code : instr array) env0 : value =
        let name = sym s in
        Eval.ensure_module name;
        use_module name;
-       push VNothing;
        incr pc
      | Import (s, members) ->
        let name = sym s in
        Eval.ensure_module name;
        import_module name (List.map sym (Array.to_list members));
-       push VNothing;
        incr pc
      | Module_enter s ->
        outer_prefixes := !current_module_prefix :: !outer_prefixes;
@@ -572,13 +570,11 @@ let rec exec (p : program) (code : instr array) env0 : value =
               (Array.map
                  (fun (f, irep) -> sym f, fun env -> exec p p.ireps.(irep) env)
                  st.st_kwdefaults));
-       push VNothing;
        incr pc
      | Defabstract (n, parent) ->
        declare_abstract
          (!current_module_prefix ^ sym n)
          ~parent:(resolve_type_name (sym parent));
-       push VNothing;
        incr pc
      | Try catch_pc ->
        handlers :=
