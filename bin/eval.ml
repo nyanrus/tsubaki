@@ -4,6 +4,11 @@
 
   exception Return_exc of value
 
+  (* `break` と `continue`。`return` と同じ形で、いちばん内側のループが
+     受け止める -- 途中に何段スコープがあっても、そこは例外が越えてくれる *)
+  exception Break_exc
+  exception Continue_exc
+
   (* ソースを読む道具(Lexer/Parser/Resolve)は、この module の外にある。持って
      いる build が起動時にここへ差し込む。Eval の本体は AST しか見ない -- 
      Parser を呼んでいたのは、もともとソース文字列を受け取る三つの入口だけ
@@ -70,7 +75,9 @@
     (* a Dict iterates as its (key, value) pairs, so `for (k, v) in d` is the
        tuple-destructuring for-target this already had, pointed at a Dict *)
     | VDict d -> List.map (fun (k, v) -> VTuple [| k; v |]) (dict_pairs d)
-    | _ -> failwith "expected a Range, Vector, Array, or Dict to iterate"
+    (* Julia ではタプルも並べられる(`for x in (1, 2)`、`f(t...)`) *)
+    | VTuple vs -> Array.to_list vs
+    | _ -> failwith "expected a Range, Vector, Array, Tuple, or Dict to iterate"
 
   (* same iterables as iter_values, but calling `f` directly on each element
      instead of building an intermediate `value list` first -- SFor's hot
@@ -98,7 +105,8 @@
     | VVec r -> IVals (Array.map (fun x -> VFloat x) (vecbuf_to_array r), ref 0)
     | VArr { cells; _ } -> IVals (arrbuf_to_array cells, ref 0)
     | VDict d -> IVals (Array.of_list (List.map (fun (k, v) -> VTuple [| k; v |]) (dict_pairs d)), ref 0)
-    | _ -> failwith "expected a Range, Vector, Array, or Dict to iterate"
+    | VTuple vs -> IVals (vs, ref 0)
+    | _ -> failwith "expected a Range, Vector, Array, Tuple, or Dict to iterate"
 
   let iter_next (it : iter) : value option =
     match it with
@@ -205,7 +213,13 @@
       match dict_get d k with
       | Some v -> v
       | None -> failwith (Printf.sprintf "KeyError: key %s not found" (show k)))
-    | _ -> failwith "indexing is only supported on Vector, Array, Matrix, or Dict"
+    (* 組み込みの形は、ぜんぶ上で当たっている。ここまで来たものは
+       `getindex(x, i)` の method に訊く -- 自分の中身を並びとして持っている
+       型が、組み込みのものと同じ綴りで書けるように。method が無ければ
+       MethodError で、言っていることは今までの文と同じ。
+       組み込みの形が先に勝つ(`getindex(::Dict, ::Symbol)` を足しても、Dict は
+       上の枝で決まってしまう)。 *)
+    | _ -> Dispatch.call "getindex" [ container; idx ]
 
   let index_set container idx (rhs : unit -> value) =
     match container, idx with
@@ -254,7 +268,9 @@
       let v = rhs () in
       dict_set d k v;
       v
-    | _ -> failwith "indexing is only supported on Vector, Array, Matrix, or Dict"
+    (* 読むほうと同じ。引数の順は Julia の `setindex!(a, v, i)` -- 入れもの、
+       書くもの、どこへ *)
+    | _ -> Dispatch.call "setindex!" [ container; rhs (); idx ]
 
 
   (* `[...]` -- 中身が全部 数なら、FFI に渡しやすい Vector の形のまま持つ。
@@ -605,6 +621,10 @@
      impl -- `bind_params` below pads whatever trailing params argv didn't
      reach from their own defaults), the same way real Julia effectively
      registers one method per optional-arg arity. *)
+  (* `f(a, xs...)` かどうか。`...` は最後の一つにしか付かない(parser が見ている) *)
+  let has_slurp (params : param list) =
+    match List.rev params with p :: _ -> p.pslurp | [] -> false
+
   let param_arity_range (params : param list) : int * int =
     let n_total = List.length params in
     let rec first_default i = function
@@ -688,7 +708,13 @@
            call time. *)
         match Hashtbl.find_opt Dispatch.methods n with
         | Some (m :: _) -> VClosure (List.length m.Dispatch.sig_, fun args -> Dispatch.call n args)
-| _ -> failwith msg)
+        | _ -> (
+          (* `using M` が裸の名前に寄せた、module の中の値 *)
+          match Hashtbl.find_opt module_values n with
+          | Some v -> v
+          (* `module M ... end` そのもの。次の `.` が member を読む
+             (get_field の VModule の枝) *)
+          | None -> if !is_module_name n then VModule n else failwith msg))
 
   (* `Dict("a" => 1, ...)` と `Dict(pairs)`。可変長なので dispatch の
      メソッドにはできない(println と同じ理由) *)
@@ -750,9 +776,12 @@
        ordinary field read, because a JS method must keep its receiver: a
        get-then-call would lose `this`. *)
     | EApply (EField (obj_e, meth), arg_es) ->
-      apply_method (eval_expr env obj_e) meth (List.map (eval_expr env) arg_es)
+      apply_method (eval_expr env obj_e) meth (eval_args env arg_es)
     | EApply (callee_e, arg_es) ->
-      apply_value (eval_expr env callee_e) (List.map (eval_expr env) arg_es)
+      apply_value (eval_expr env callee_e) (eval_args env arg_es)
+    (* `xs...` は引数の並びのところにしか立たない -- そこは eval_args が
+       見ているので、ここに来たということは、置き場所がちがう *)
+    | ESplat _ -> failwith "`...` can only be used in a call's argument list"
     | EBinOp (":", lo, hi, _) -> make_range (eval_expr env lo) (eval_expr env hi)
     | ERangeStep (lo, step, hi) ->
       make_range_step (eval_expr env lo) (eval_expr env step) (eval_expr env hi)
@@ -765,6 +794,13 @@
        is a constant -- unlike `end`, which is the length of what is being
        indexed and so has to be carried in `current_end`. If an indexable with
        another first index ever arrives, this is the line that grows. *)
+    (* `let x = 1 ... end` -- 新しいスコープ。束ねる値は**外**で作ってから
+       中に置く(だから `let x = x` が外の x を捕まえられる)。値は最後の文のもの *)
+    | ELet (binds, body) ->
+      let vs = List.map (fun (n, e) -> n, eval_expr env e) binds in
+      let scope = new_scope env in
+      List.iter (fun (n, v) -> bind scope n v) vs;
+      exec_stmt_list scope body
     | EBegin -> VInt 1
     | EEnd -> VInt !current_end
     (* short-circuit: the right side must not even be evaluated when the left
@@ -806,6 +842,11 @@
          the same way a plain `==` comparison already would. *)
       let item = eval_expr env item_e in
       VBool (value_in item (eval_expr env coll_e))
+    (* `xs .+ 1` -- 一つずつに配る。点の無いほうの演算子を、要素ごとに呼ぶ。
+       片側が並びでないときは、その一つが全部の相手になる(Julia もそう) *)
+    | EBinOp (op, a, b, _) when String.length op > 1 && op.[0] = '.' ->
+      let base = String.sub op 1 (String.length op - 1) in
+      broadcast_binop base (eval_expr env a) (eval_expr env b)
     | EBinOp (op, a, b, cache_id) ->
       Dispatch.call_cached (Dispatch.cache_at cache_id) op [ eval_expr env a; eval_expr env b ]
     (* real Julia's `println(a, b, c)` puts NOTHING between its arguments.
@@ -829,7 +870,7 @@
     | ECall ("isa", [ x_e; EVar (tname, _) ], _, _) -> isa_named env (eval_expr env x_e) tname
     | ECall (name, args, kwargs, cache_id) ->
       let cache = Dispatch.cache_at cache_id in
-      let argv = List.map (eval_expr env) args in
+      let argv = eval_args env args in
       (* kwargs はここで先に値にする -- 呼び先が何であれ(closure、struct、
          ふつうの関数)、この呼び出し場所の kwargs は同じ意味なので。空なら
          何も起きない、というのが圧倒的に多い道 *)
@@ -837,7 +878,7 @@
       call_named env cache name argv kwargv
     | EQualifiedCall (modname, member, args, kwargs, cache_id) ->
       let cache = Dispatch.cache_at cache_id in
-      let argv = List.map (eval_expr env) args in
+      let argv = eval_args env args in
       let kwargv = if kwargs = [] then [] else List.map (fun (k, e) -> k, eval_expr env e) kwargs in
       call_qualified env cache modname member argv kwargv
     | EField (e, f) -> get_field (eval_expr env e) f
@@ -934,23 +975,35 @@
             | exception e ->
               current_module_prefix := saved;
               raise e))
-    | EComprehension (body_e, [ (var, iter_e) ]) ->
+    | EComprehension (body_e, [ (var, iter_e) ], cond) ->
       (* one `for` clause: collect raw values, then decide the result shape
          exactly like an array literal does -- all-numeric stays the
          FFI-friendly Vector, anything else becomes an Array *)
+      (* `if` があれば、その turn を飛ばす -- 値を作る前に決める *)
+      let keep scope =
+        match cond with
+        | None -> true
+        | Some c -> (
+          match eval_expr scope c with
+          | VBool b -> b
+          | v ->
+            failwith (Printf.sprintf "a comprehension's `if` must be Bool, got a %s" (tag v)))
+      in
       let results =
-        List.map
+        List.filter_map
           (fun v ->
             let scope = new_scope env in
             bind_for_target scope var v;
-            eval_expr scope body_e)
+            if keep scope then Some (eval_expr scope body_e) else None)
           (iter_values (eval_expr env iter_e))
       in
       (* 空の結果が Array になるところも、配列リテラルと同じ規則のまま
          (`[f(x) for x in xs]` の xs が空で、そのあと Array と vcat する --
          noraneko の drop の view で、ボタンがまだ一つも無いとき) *)
       make_array_lit (Array.of_list results)
-    | EComprehension (body_e, [ (var1, iter1_e); (var2, iter2_e) ]) ->
+    | EComprehension (_, [ _; _ ], Some _) ->
+      failwith "a comprehension with two for-clauses cannot have an `if` yet"
+    | EComprehension (body_e, [ (var1, iter1_e); (var2, iter2_e) ], None) ->
       (* two `for` clauses, e.g. mandel's [f(r,i) for i=.., r=..] -- a genuine
          2D result, matching real Julia's size (length(clause1), length(clause2))
          with element [a,b] = body(clause1[a], clause2[b]). Same rule as the
@@ -977,7 +1030,7 @@
           vs1
       in
       make_matrix_lit raw_rows
-    | EComprehension (_, _) ->
+    | EComprehension (_, _, _) ->
       failwith "comprehensions support at most 2 for-clauses (no N-dimensional array type)"
     | EQuote inner -> expr_to_value env inner
     | EQuoteSymbol name -> VSymbol (name, !current_hygiene_id)
@@ -1030,6 +1083,37 @@
      書かないため。closure が名前を覆っているとき、`new`、struct をそのまま
      建てるとき、module の中での名前の読みかた -- どれも、木を歩く道と命令列の
      道で違っていたら困るものばかりです。 *)
+  (* broadcast の中身。並びなのはどちらか(あるいは両方か)を見て、要素ごとに
+     呼ぶ。両方とも並びなら、長さが同じでないといけない -- Julia の
+     DimensionMismatch と同じ言いかたにしてある *)
+  and broadcast_binop base (x : value) (y : value) : value =
+    let as_list v = match v with VVec _ | VArr _ | VRange _ | VFRange _ -> Some (iter_values v) | _ -> None in
+    let one a b = Dispatch.call base [ a; b ] in
+    match as_list x, as_list y with
+    | None, None -> one x y
+    | Some xs, None -> make_array_lit (Array.of_list (List.map (fun a -> one a y) xs))
+    | None, Some ys -> make_array_lit (Array.of_list (List.map (fun b -> one x b) ys))
+    | Some xs, Some ys ->
+      let nx = List.length xs and ny = List.length ys in
+      if nx <> ny then
+        failwith
+          (Printf.sprintf
+             "DimensionMismatch: arrays could not be broadcast to a common size; got a dimension with lengths %d and %d"
+             nx ny)
+      else make_array_lit (Array.of_list (List.map2 one xs ys))
+
+  (* 呼び出しの引数を値にする。`xs...` があれば、そこだけ、ばらして並べる --
+     ふつうの引数だけの並び(圧倒的に多い)では、何も余分に起きない *)
+  and eval_args env (args : expr list) : value list =
+    if not (List.exists (function ESplat _ -> true | _ -> false) args) then
+      List.map (eval_expr env) args
+    else
+      List.concat_map
+        (function
+          | ESplat e -> iter_values (eval_expr env e)
+          | e -> [ eval_expr env e ])
+        args
+
   and call_named env cache name (argv : value list) (kwargv : (string * value) list) : value =
     match lookup_opt_shadow_free env name cache with
     | Some (VClosure (_, f)) -> f argv
@@ -1253,7 +1337,7 @@
             Array.of_list
               (List.map (fun p -> VSymbol (p, !current_hygiene_id)) params @ [ stmt_list_to_value env body ])
         }
-    | EComprehension (body_e, clauses) ->
+    | EComprehension (body_e, clauses, _) ->
       (* a clause's own loop variable is a BINDING position too, same as a
          lambda param above -- FVTuple's names are hygiene-tagged the same
          way, wrapped in a "tuple"-headed VExpr matching how SDestructure's
@@ -1284,10 +1368,11 @@
         { head = "macrocall"
         ; args = Array.of_list (VSymbol (name, !current_hygiene_id) :: List.map (expr_to_value env) arg_exprs)
         }
-    | EBegin | EEnd | ETypedArrayUndef _ | ETypedMatrixUndef _ | EBlock _ ->
+    | ESplat _ | ELet _ | EBegin | EEnd | ETypedArrayUndef _ | ETypedMatrixUndef _ | EBlock _ ->
       failwith
-        "quoting this kind of expression isn't supported (Vector{T}(undef, n), Matrix{T}(undef, m, n), \
-         and a bare evaluated block can't appear inside a quote)"
+        "quoting this kind of expression isn't supported (`xs...`, `let ... end`, \
+         Vector{T}(undef, n), Matrix{T}(undef, m, n), and a bare evaluated block \
+         can't appear inside a quote)"
 
   (* an elseif chain quotes as real Julia represents it: nested
      Expr(:if, cond, block, Expr(:if, ...)) rather than one flat node --
@@ -1330,6 +1415,7 @@
             |]
         }
     | SFuncDecl _ | SStructDecl _ | SAbstractDecl _ | STry _ | SModuleDecl _ | SUsing _ | SImport _
+    | SBreak | SContinue
     | SMacroDecl _ | SExport _ | SMacroCall _ | SLocalTypedAssign _ ->
       failwith
         "quoting this kind of statement isn't supported (function/struct/abstract-type/module/macro \
@@ -1368,6 +1454,7 @@
     in
     let rec ve v =
       match v with
+      | VModule n -> failwith (Printf.sprintf "a module (%s) can't be spliced into code" n)
       | VInt n -> EInt n
       | VFloat f -> EFloat f
       | VStr s -> EStr s
@@ -1470,7 +1557,7 @@
                  FVTuple names', ve iter_v
                | _ -> failwith "macro expansion: malformed quoted comprehension clause")
         in
-        EComprehension (ve args.(0), clauses)
+        EComprehension (ve args.(0), clauses, None)
       | VExpr { head = "typedarray"; args } when Array.length args >= 1 -> (
         match args.(0) with
         | VSymbol (tname, _) ->
@@ -1570,6 +1657,9 @@
      prefix. *)
   and bind_params call_env params argv =
     match params, argv with
+    (* `f(a, xs...)` -- 残りをぜんぶ集めて、タプルとして束ねる(Julia もタプル)。
+       残りがゼロ個でも束ねる: `xs` は空のタプル *)
+    | [ p ], _ when p.pslurp -> bind call_env p.pname (VTuple (Array.of_list argv))
     | [], [] -> ()
     | p :: prest, v :: vrest ->
       bind_one_param call_env p v;
@@ -1631,6 +1721,8 @@
       current_line := n;
       VNothing
     | SExpr e -> eval_expr env e
+    | SBreak -> raise Break_exc
+    | SContinue -> raise Continue_exc
     | SReturn None -> raise (Return_exc VNothing)
     | SReturn (Some e) -> raise (Return_exc (eval_expr env e))
     | SDestructure (targets, rhs) -> (
@@ -1719,9 +1811,11 @@
               ~finally:(fun () -> current_constructing_struct := saved)
               (fun () -> try exec_stmt_list call_env body with Return_exc v -> v)
           in
-          for k = n_required to n_total do
-            Dispatch.defmethod full_name (take k sig_) impl
-          done)
+          if has_slurp params then Dispatch.defmethod ~vararg:true full_name sig_ impl
+          else
+            for k = n_required to n_total do
+              Dispatch.defmethod full_name (take k sig_) impl
+            done)
         constructors;
       VNothing
     | SFuncDecl (name, params, kwparams, body, fcache_id) ->
@@ -1842,9 +1936,11 @@
          pads whatever params argv didn't reach from their own defaults,
          however many args this particular arity actually supplies. *)
       let n_required, n_total = param_arity_range params in
-      for k = n_required to n_total do
-        Dispatch.defmethod (def_prefix ^ name) (take k sig_) impl
-      done;
+      if has_slurp params then Dispatch.defmethod ~vararg:true (def_prefix ^ name) sig_ impl
+      else
+        for k = n_required to n_total do
+          Dispatch.defmethod (def_prefix ^ name) (take k sig_) impl
+        done;
       (* A `function` declared INSIDE another function's body is ALSO bound as
          an ordinary local, holding a closure over THIS invocation's scope.
 
@@ -1883,11 +1979,11 @@
          Declared inside an `if`/`for` inside a function, the binding lives in
          that block's scope and is gone after it -- there, the global
          registration is still the whole story, unchanged. *)
-      if inside_function_body () && kwparams = [] then (
+      if inside_function_body () && kwparams = [] && not (has_slurp params) then (
         let local_impl argv =
           let k = List.length argv in
           if k >= n_required && k <= n_total
-             && Dispatch.applicable { Dispatch.sig_ = take k sig_; impl } (List.map tag argv)
+             && Dispatch.applicable { Dispatch.sig_ = take k sig_; vararg = false; impl } (List.map tag argv)
           then impl argv
           else Dispatch.call (def_prefix ^ name) argv
         in
@@ -1907,32 +2003,42 @@
       in
       try_branches branches
     | SFor (target, iter_e, body) ->
-      iter_values_do (eval_expr env iter_e) (fun v ->
-          let scope = new_scope env in
-          bind_for_target scope target v;
-          ignore (exec_stmt_list scope body));
+      (try
+         iter_values_do (eval_expr env iter_e) (fun v ->
+             let scope = new_scope env in
+             bind_for_target scope target v;
+             try ignore (exec_stmt_list scope body) with Continue_exc -> ())
+       with Break_exc -> ());
       VNothing
     | SWhile (cond, body) ->
-      let continue_ = ref true in
-      while !continue_ do
-        match eval_expr env cond with
-        | VBool true -> ignore (exec_stmt_list (new_scope env) body)
-        | VBool false -> continue_ := false
-        | _ -> failwith "while condition must be Bool"
-      done;
+      let going = ref true in
+      (try
+         while !going do
+           match eval_expr env cond with
+           | VBool true -> (
+             try ignore (exec_stmt_list (new_scope env) body) with Continue_exc -> ())
+           | VBool false -> going := false
+           | _ -> failwith "while condition must be Bool"
+         done
+       with Break_exc -> ());
       VNothing
     | SModuleDecl (name, body) ->
       (* run the body's declarations once, under this module's prefix --
          nesting (a `module` inside a `module`) falls out for free, since
          this just concatenates onto whatever prefix was already active.
-         Executed against the SAME env (not a fresh scope): plain variable
-         assignments inside a module body are deliberately not namespaced,
-         so they land wherever they would if the `module ... end` wrapper
-         weren't there at all -- see README. *)
+
+         体は**自分のスコープ**で走る。そこに置かれた値は、この module の
+         member になる(`M.x` で読める)-- Julia の `module M; const x = 1; end`
+         がそうなので。関数と型はもう名前空間を持っていた(Dispatch.methods と
+         struct_defs が "M.name" で覚えている)ので、行き場が無かったのは
+         値の束縛だけだった。 *)
       let saved = !current_module_prefix in
-      current_module_prefix := saved ^ name ^ ".";
-      ignore (exec_stmt_list env body);
+      let prefix = saved ^ name ^ "." in
+      current_module_prefix := prefix;
+      let scope = new_scope env in
+      ignore (exec_stmt_list scope body);
       current_module_prefix := saved;
+      List.iter (fun (n, cell) -> Hashtbl.replace module_values (prefix ^ n) !cell) scope.vars;
       VNothing
     | SUsing name ->
       ensure_module name;
@@ -2203,7 +2309,11 @@
      fs.readFileSync (preload.js), the browser with a synchronous XHR
      (web/demo.html). That's the only part that can't be shared: OCaml's own
      open_in has no filesystem to reach for in a browser. *)
-  let () =
+  (* 登録は、呼ばれたときだけ。drop の build は呼ばない -- worker にファイルは
+     無いし、隣のファイルは `import` で足りている(そちらは build のときに
+     畳まれる)。「この drop にできること」を数えられる形にしておきたいので、
+     読めない戸でも、開いていないほうがいい。CLI(bin/main.ml)は呼ぶ。 *)
+  let install_include () =
     let open Js_of_ocaml in
     Dispatch.defmethod "include" [ [ "String" ] ] (function
       | [ VStr path ] ->

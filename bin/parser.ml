@@ -135,7 +135,7 @@
   (* ":" is deliberately NOT here -- ranges (a:b and a:step:b) aren't a normal
      left-associative binary operator, they're parsed specially by
      parse_range below, since a:b:c has three operands, not two. *)
-  let prec = function
+  let rec prec = function
     | "||" -> 0
     | "&&" -> 1
     | "==" | "!=" | "<" | "<=" | ">" | ">=" | "===" | "!==" | "<:" -> 2
@@ -145,6 +145,9 @@
     | "+" | "-" | "|" | "\xe2\x8a\xbb" -> 3
     | "*" | "/" | "//" | "%" | ">>>" | "<<" | ">>" | "\xe2\x8b\x85" | "\\" | "&" | "\xc3\xb7" -> 4
     | "^" -> 5
+    (* broadcast(`xs .+ 1`)は、点の無いほうと同じ強さ。`.` 一つだけは
+       field の取り出しなので、ここには来ない *)
+    | s when String.length s > 1 && s.[0] = '.' -> prec (String.sub s 1 (String.length s - 1))
     | _ -> -1
 
   (* consumes an optional `where T [<: Bound]` / `where {T [<: Bound], U, ...}`
@@ -366,6 +369,15 @@
         advance st;
         let rhs = parse_range st in
         lhs := EBinOp ("in", !lhs, rhs, Caches.fresh_call ())
+      (* `x isa T` -- Julia writes this between the two, and `isa(x, T)` is
+         the same thing. Not a keyword, so `isa(...)` still reads as the
+         ordinary call it always did: only the position decides. Comparison
+         precedence, like `in` just above. *)
+      | TIDENT "isa"
+        when 2 >= min_prec && (st.pos = 0 || fst (line_col st st.pos) = fst (line_col st (st.pos - 1))) ->
+        advance st;
+        let rhs = parse_range st in
+        lhs := ECall ("isa", [ !lhs; rhs ], [], Caches.fresh_call ())
       | _ -> continue_ := false
     done;
     !lhs
@@ -408,6 +420,11 @@
       advance st;
       let e = parse_unary st in
       ECall ("!", [ e ], [], Caches.fresh_call ()))
+    else if at_op st "~" then (
+      (* bitwise not -- `!` と同じで、`~` という名前の関数を呼ぶだけ *)
+      advance st;
+      let e = parse_unary st in
+      ECall ("~", [ e ], [], Caches.fresh_call ()))
     else parse_postfix st
 
   and parse_postfix st =
@@ -446,7 +463,8 @@
           e :=
             EComprehension
               ( ECall (name, [ EVar (bvar, Caches.fresh_var ()) ], [], Caches.fresh_call ())
-              , [ (FVSingle bvar, container) ] )
+              , [ (FVSingle bvar, container) ]
+              , None )
         | _ -> raise (Parse_error "broadcast dot-call (f.(...)) requires a bare function name"))
       else if at_op st "." then (
         advance st;
@@ -597,6 +615,26 @@
       let body = parse_stmt_list st in
       expect_kw st "end";
       EBlock body
+    (* `let x = 1, y = 2` ... `end` -- 新しいスコープを開く。`begin` と違って
+       中で置いた名前は外に出ない。束ねるところは「名前 = 式」の並びで、
+       一つも書かなくてもいい(`let ... end` はただのスコープ) *)
+    | TKW "let" ->
+      advance st;
+      let binds = ref [] in
+      if not (at_stmt_start st) then (
+        let one () =
+          let n = ident st in
+          expect_op st "=";
+          binds := (n, parse_expr st) :: !binds
+        in
+        one ();
+        while at_op st "," do
+          advance st;
+          one ()
+        done);
+      let body = parse_stmt_list st in
+      expect_kw st "end";
+      ELet (List.rev !binds, body)
     | TKW "end" ->
       advance st;
       EEnd
@@ -617,6 +655,15 @@
       advance st;
       if is_block_end st || at_op st ";" || at_op st ")" || at_op st "," then EBlock [ SReturn None ]
       else EBlock [ SReturn (Some (parse_expr st)) ]
+    (* Julia では、ほとんどの構文が式です -- `x = if c ... end` も
+       `x = try ... catch ... end` も書ける。読みかたは文のときと同じで、
+       包みかただけが違う: EBlock は「文の並びを式として走らせる」ので、
+       その並びの値(最後の文の値)が、そのまま式の値になる。`begin` の
+       すぐ上と、同じ仕組みです。
+
+       `for` と `while` はここに入れていない -- Julia でも nothing しか
+       返さないので、式の位置に書けても書く意味がない。 *)
+    | TKW ("if" | "try") -> EBlock [ parse_stmt st ]
     | TKW "quote" ->
       advance st;
       let body = parse_stmt_list st in
@@ -631,6 +678,18 @@
         expect_op st ")";
         EQuote e
       | TIDENT name ->
+        advance st;
+        EQuoteSymbol name
+      (* `true` / `false` は、この言語では keyword だが Julia では値そのもの。
+         だから `:true` は Symbol ではなく Bool の true(Julia 1.12.7 で確認) *)
+      | TKW (("true" | "false") as b) ->
+        advance st;
+        EBool (b = "true")
+      (* `:type` `:end` `:where` -- 名前が keyword の綴りをしているのは、この
+         言語の都合であって、そのデータの性質ではない。外から来た Dict の鍵が
+         たまたま "type" という名前だった、というだけのことがある。Julia も
+         keyword をぜんぶ quote する *)
+      | TKW name ->
         advance st;
         EQuoteSymbol name
       | TOP op ->
@@ -758,8 +817,10 @@
             else List.rev acc
           in
           let clauses = loop [] in
+          (* `[x for x in xs if cond]` -- Julia の絞り込み *)
+          let cond = if at_kw st "if" then (advance st; Some (parse_expr st)) else None in
           expect_op st "]";
-          EComprehension (first, clauses))
+          EComprehension (first, clauses, cond))
         else (
           (* a row's remaining elements, real Julia's own way: comma-separated
              (like a Vector literal) AND/OR plain whitespace-separated
@@ -981,7 +1042,11 @@
         let n = ident st in
         expect_op st "=";
         kwargs := (n, parse_expr st) :: !kwargs)
-      else positional := parse_expr st :: !positional
+      else (
+        let e = parse_expr st in
+        (* `f(xs...)` -- 後ろの `...` は、その一つを引数の並びにばらす印 *)
+        let e = if at_op st "..." then (advance st; ESplat e) else e in
+        positional := e :: !positional)
     in
     let parse_list () =
       if not (at_op st ")" || at_op st ";") then (
@@ -1205,7 +1270,8 @@
             let pat = parse_type_pattern st in
             let pdefault = if at_op st "=" then (advance st; Some (parse_expr st)) else None in
             let acc =
-              { pname = ""; ptype = [ "Any" ]; pdefault; pdestructure = None; ptypepattern = Some pat } :: acc
+              { pname = ""; ptype = [ "Any" ]; pdefault; pdestructure = None; pslurp = false
+              ; ptypepattern = Some pat } :: acc
             in
             if at_op st "," then (
               advance st;
@@ -1234,8 +1300,15 @@
                 let n, t = parse_typed_ident st in
                 n, t, None)
             in
+            (* `f(a, xs...)` -- 余ったものを集める最後の一つ。後ろに何か
+               続いていたら、そこで止める(Julia も最後だけ) *)
+            let pslurp = if at_op st "..." then (advance st; true) else false in
             let pdefault = if at_op st "=" then (advance st; Some (parse_expr st)) else None in
-            let acc = { pname; ptype; pdefault; pdestructure; ptypepattern = None } :: acc in
+            if pslurp && pdefault <> None then
+              raise (Parse_error "a `...` parameter cannot also have a default");
+            let acc = { pname; ptype; pdefault; pdestructure; pslurp; ptypepattern = None } :: acc in
+            if pslurp && at_op st "," then
+              raise (Parse_error "a `...` parameter must be the last one");
             if at_op st "," then (
               advance st;
               loop acc)
@@ -1361,6 +1434,12 @@
       advance st;
       if is_block_end st || at_op st ";" then SReturn None
       else SReturn (Some (parse_comma_exprs st))
+    | TKW "break" ->
+      advance st;
+      SBreak
+    | TKW "continue" ->
+      advance st;
+      SContinue
     | TKW "try" ->
       advance st;
       let body = parse_stmt_list st in

@@ -20,6 +20,10 @@
     | ECall of string * expr list * (string * expr) list * int
       (* positional args, keyword args, and (like EBinOp) the number of the
          cache cell owned by this one call site *)
+    | ESplat of expr
+      (* `xs...` -- 呼び出しの引数のところだけに立つ。ここにあるものを
+         ばらして、その数だけの引数にする。値ではないので、ほかの場所には
+         現れない(パーサも、そこでしか作らない) *)
     | EApply of expr * expr list
       (* calling the RESULT of an expression rather than a name: `f()()`,
          `v[1](x)`, `(x -> x + 1)(3)`. `ECall` above NAMES its callee, which
@@ -38,7 +42,11 @@
     | ELambda of string list * stmt list
       (* `x -> expr` wraps expr as [SExpr expr]; `function (args) ... end`
          supplies a real multi-statement body directly *)
-    | EComprehension of expr * (for_target * expr) list
+    | EComprehension of expr * (for_target * expr) list * expr option
+      (* the last part is `[x for x in xs if cond]` -- Julia's own filter.
+         Only ever on a single-clause comprehension here: with two `for`
+         clauses the result is a 2-D shape, and a filter would flatten it,
+         which is a different thing and not one anything asks for yet. *)
       (* one clause per `for` -- [x*x for x in r] has one, mandel's
          [f(r,i) for i = ..., r = ...] has two (see Eval for what each count
          does). Each clause's own loop variable can tuple-destructure too,
@@ -57,6 +65,10 @@
          Eval.eval_expr's EVar case) -- so an ordinary variable named the
          same as a type still shadows it, same as everywhere else in this
          interpreter. *)
+    | ELet of (string * expr) list * stmt list
+      (* `let x = 1, y = 2 ... end` -- 新しいスコープを開く一つだけの形
+         (`begin` は開かない)。束ねる値は**外**で作ってから中に置くので、
+         `let x = x` が外の x を捕まえられる。値は最後の文のもの *)
     | EBegin (* only meaningful inside a `[...]` index expression: firstindex *)
     | EEnd (* only meaningful inside a `[...]` index expression *)
     | ETernary of expr * expr * expr
@@ -144,6 +156,10 @@
     ; ptype : string list
     ; pdefault : expr option
     ; pdestructure : string list option
+    ; pslurp : bool
+      (* `f(a, xs...)` -- 最後の一つだけが持てる。呼ばれたときに余ったものを
+         ぜんぶ集めて、タプルとして束ねる(Julia もタプル)。集めるので、
+         `pdefault` とは一緒に立たない *)
     ; ptypepattern : type_pattern option
       (* `Some _` for an UNNAMED `::Type{...}` dispatch parameter (real
          Julia's trait-dispatch-on-the-type-itself idiom, e.g.
@@ -234,6 +250,12 @@
         }
     | SAbstractDecl of string * string option
     | SReturn of expr option
+    | SBreak
+      (* leave the innermost `for`/`while` -- only meaningful inside one, and
+         the folding side (Tocode) is where that is checked: it is the one
+         that knows which loop is innermost, because it is the one building
+         the jump. *)
+    | SContinue (* go on to that loop's next turn *)
     | STry of stmt list * string option * stmt list
     | SDestructure of (expr * string list option) list * expr
       (* x, y = rhs -- targets are full lvalue exprs (EVar/EField/EIndex), not

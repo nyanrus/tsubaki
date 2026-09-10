@@ -137,8 +137,22 @@ fn write(v: &Value, out: &mut String) -> Result<(), String> {
             }
             out.push(']');
         }
+        Value::FRange(a, st, b) => {
+            // 同じ -- 立ち会う数を並べて渡す
+            out.push('[');
+            for (k, x) in crate::vm::frange_values(*a, *st, *b).iter().enumerate() {
+                if k > 0 {
+                    out.push(',');
+                }
+                out.push_str(&float_repr(*x));
+            }
+            out.push(']');
+        }
         Value::Closure(_) | Value::Generic(_) => {
             return Err("a function cannot cross this boundary (it would have to be cloned)".into())
+        }
+        Value::Module(n) => {
+            return Err(format!("a module ({n}) cannot cross this boundary -- pass one of its members"))
         }
     }
     Ok(())

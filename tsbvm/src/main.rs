@@ -38,6 +38,17 @@ fn main() {
         }
         return;
     }
+    // この .tsb が、どの builtin の名前を口にしているか。runtime を二枚に
+    // 分けるかどうかを決めるための数 -- 使っていない言葉も、drop は一緒に
+    // 落としているので(std-tsubaki-runtime は lib drop で、みんなで一枚)
+    if std::env::args().nth(2).as_deref() == Some("--builtins") {
+        let used = tsbvm::vm::builtins_named(&p);
+        println!("{} builtin named in this .tsb:", used.len());
+        for n in used {
+            println!("  {n}");
+        }
+        return;
+    }
     // `--check` の形で呼ばれたら、走らせずに「まだ知らない命令」を数える
     if std::env::args().nth(2).as_deref() == Some("--check") {
         let missing = tsbvm::vm::unsupported(&p);

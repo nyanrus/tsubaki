@@ -64,6 +64,11 @@ type instr =
   | Try of int (* ここから先で投げられたら、その番地へ(投げられた値を積んで) *)
   | Try_end (* 無事に済んだので、その受け止めをやめる *)
   | Makematrix of int * int (* 行, 列。積まれている 行*列 個を、行の順に *)
+  | Call_splat of int * int * int * int
+    (* syms[名前], 積まれている部分の数, どれをばらすかのビット, call cache。
+       `f(a, xs..., b)` -- ばらす印のついた部分だけ、並べられるものとして
+       ほどいてから呼ぶ。ビットにしたのは、ばらすのが引数の一部だけだから *)
+  | Apply_splat of int * int (* 呼ぶもの, 部分… の順に積んで、部分の数, ビット *)
   | Qcall of int * int * int * int (* syms[module], syms[member], 引数の数, call cache *)
   | Apply of int (* 呼ぶもの, 引数… の順に積んで、引数の数 *)
   | Apply_method of int * int (* 受け手, 引数… の順に積んで、syms[名前], 引数の数 *)
@@ -91,6 +96,7 @@ type instr =
   | Range3 (* lo, step, hi の順に積んで、a:s:b *)
   | Iter_new (* 積まれているものから、反復のいまを作る *)
   | Iter_next of int (* 次があれば積む。無ければ反復を降ろして、その番地へ *)
+  | Iter_drop (* 反復を、最後まで行かずに降ろす(break) *)
   | Getfield of int (* 積まれているものの syms[名前] のところ *)
   | Setfield of int (* 値・入れもの の順に積んで、入れものだけ取る。値は残る *)
   | Defstruct of int (* structs[i] を宣言する *)
@@ -108,6 +114,9 @@ type param =
   ; p_default : int
     (* 既定値の irep に 1 を足したもの。0 なら既定値なし -- ここを通る数は
        どれも非負でいてほしいので、一つずらしてある *)
+  ; p_slurp : int
+    (* `f(a, xs...)` の `xs` なら 1。最後の一つにしか立たない。呼ばれたとき、
+       余ったものをぜんぶ集めてタプルにする *)
   }
 
 (* キーワード引数ひとつ。既定値は子 irep -- 呼ばれるたびに、その呼び出しの
@@ -132,7 +141,13 @@ type target = { t_names : int array; t_tuple : bool }
 
 (* `[body for x in ...]`。for 節は一つか二つ。体は子 irep -- 式なので、
    中から `return` で関数を抜けることはない *)
-type comp = { cp_targets : target array; cp_body : int }
+type comp =
+  { cp_targets : target array
+  ; cp_cond : int
+    (* `if` の irep に 1 を足したもの。0 なら絞り込みなし -- ここを通る数は
+       どれも非負でいてほしいので、一つずらしてある *)
+  ; cp_body : int
+  }
 
 (* `x -> ...` と `function (x) ... end`。名前を持たない -- 呼ばれるのは
    値として渡されたときなので、dispatch の表には載らない *)
@@ -173,7 +188,13 @@ type program =
    形式は素直に -- 4 バイトの整数と、長さつきの文字列と、命令ごとの一バイトの
    札。LEB128 のような詰め方はしていない(まず通すことを先に)。 *)
 
-let magic = "TSB1"
+(* 形が変わったら、ここを上げる。走らせる側(tsbvm/src/tsb.rs)が、古いものを
+   古いと言えるように -- 黙って読み違えるのがいちばん困る。
+
+     TSB1  はじめの形
+     TSB2  内包表記に `if` が付いた(comp が cp_cond を持つ)
+     TSB3  引数が `...` を持てるようになった(param が p_slurp を持つ) *)
+let magic = "TSB3"
 
 (* 4 バイト。ここを通る数はどれも非負(棚の番号、引数の数、飛び先、cache の
    番号)。int の幅は走る場所で違う(js_of_ocaml では 32 bit)ので、符号を
@@ -216,7 +237,8 @@ let put_params buf ps =
     (fun (pr : param) ->
       put_nat buf pr.p_name;
       put_nats buf pr.p_types;
-      put_nat buf pr.p_default)
+      put_nat buf pr.p_default;
+      put_nat buf pr.p_slurp)
     ps
 
 let put_kwparams buf ks =
@@ -297,6 +319,7 @@ let to_bytes (p : program) : string =
           put_nats buf t.t_names;
           put_nat buf (if t.t_tuple then 1 else 0))
         c.cp_targets;
+      put_nat buf c.cp_cond;
       put_nat buf c.cp_body)
     p.comps;
   put_nat buf (Array.length p.ireps);
@@ -359,6 +382,8 @@ let to_bytes (p : program) : string =
           | Apply a -> op buf 44 [ a ]
           | Apply_method (a, b) -> op buf 45 [ a; b ]
           | Symbol a -> op buf 62 [ a ]
+          | Call_splat (a, b, c, d) -> op buf 65 [ a; b; c; d ]
+          | Apply_splat (a, b) -> op buf 66 [ a; b ]
           | Typeof -> op buf 34 []
           | Makedict a -> op buf 35 [ a ]
           | Isa a -> op buf 36 [ a ]
@@ -379,6 +404,7 @@ let to_bytes (p : program) : string =
           | Range3 -> op buf 21 []
           | Iter_new -> op buf 22 []
           | Iter_next a -> op buf 23 [ a ]
+          | Iter_drop -> op buf 64 []
           | Getfield a -> op buf 17 [ a ]
           | Setfield a -> op buf 18 [ a ]
           | Defstruct a -> op buf 15 [ a ]

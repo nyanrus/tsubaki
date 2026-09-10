@@ -1,0 +1,7 @@
+Money(200)
+Money(360)
+3 ab true
+Len(40, :px) Len(1.5, :rem)
+Len(32, :px)
+Dict(:width => Len(40, :px), :padding => (Len(4, :px), 0))
+2

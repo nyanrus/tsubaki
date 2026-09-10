@@ -131,8 +131,8 @@
         | SModuleDecl (n, b) -> Some (SModuleDecl (n, strip_lines b))
         | SMacroDecl (n, p, b) -> Some (SMacroDecl (n, p, strip_lines b))
         | SMacroCall (n, s) -> Some (SMacroCall (n, List.hd (strip_lines [ s ])))
-        | ( SExpr _ | SReturn _ | SDestructure _ | SLocalTypedAssign _ | SStructDecl _ | SAbstractDecl _
-          | SUsing _ | SImport _ | SExport _ ) as s -> Some s)
+        | ( SExpr _ | SReturn _ | SBreak | SContinue | SDestructure _ | SLocalTypedAssign _
+          | SStructDecl _ | SAbstractDecl _ | SUsing _ | SImport _ | SExport _ ) as s -> Some s)
       body
 
   (* compiles a function body that takes no parameters (see the module

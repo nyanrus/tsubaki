@@ -12,6 +12,7 @@
     [ "function"; "begin"; "end"; "struct"; "mutable"; "abstract"; "type"; "if"; "elseif"; "else"
     ; "for"; "while"; "true"; "false"; "nothing"; "in"; "return"; "try"; "catch"
     ; "module"; "using"; "import"; "macro"; "quote"; "export"; "where"; "const"
+    ; "break"; "continue"; "let"
     ]
 
   (* every identifier occurrence with the SAME text becomes the SAME
@@ -217,8 +218,33 @@
       else (
         let three = if !i + 2 < n then Some (String.sub src !i 3) else None in
         let two = if !i + 1 < n then Some (String.sub src !i 2) else None in
+        (* `xs .+ 1` -- 実の Julia の broadcast。点のすぐ後ろに演算子が来て
+           いたら、その二つで一つの token にする。`a.b`(後ろは名前)とも
+           `f.(xs)`(後ろは括弧)とも `xs...`(上で先に取る)ともぶつからない
+           -- 点の後ろが演算子の字のときだけ、ここに来る *)
+        let dotop =
+          if c <> '.' || three = Some "..." then None
+          else (
+            let try_ k =
+              if !i + k < n then (
+                let t = String.sub src (!i + 1) k in
+                match t with
+                | "==" | "!=" | "<=" | ">=" | "//" | "^" | "+" | "-" | "*" | "/" | "%" | "<"
+                | ">" | "&" | "|" -> Some t
+                | _ -> None)
+              else None
+            in
+            match try_ 2 with Some t -> Some t | None -> try_ 1)
+        in
+        match dotop with
+        | Some t ->
+          emit (TOP ("." ^ t));
+          i := !i + 1 + String.length t
+        | None ->
         match three with
-        | Some ((">>>" | "===" | "!==" | ">>=") as op) ->
+        (* `xs...` -- 実の Julia の splat。三つの `.` として読むと、field の
+           取り出しと見分けがつかなくなるので、ここで一つにしておく *)
+        | Some ((">>>" | "===" | "!==" | ">>=" | "...") as op) ->
           emit (TOP op);
           i := !i + 3
         | Some "\xe2\x89\xa4" ->

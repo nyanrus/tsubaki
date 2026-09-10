@@ -585,6 +585,17 @@ The pre-existing `+` still concatenates too.
   doesn't), plus `haskey`/`delete!`/`keys`/`values`/`length` and
   `for (k, v) in d`. Keys are Int/Float/Bool/String/Symbol/nothing (`d[1]` and
   `d[1.0]` are the same entry); insertion-ordered.
+- **`a[i]` is a call.** Reading goes to `getindex(a, i)` and `a[i] = v` to
+  `setindex!(a, v, i)`, so a type that holds a collection of its own can be
+  written the way the built-in ones are: add the method, and `g[2]` works.
+  The built-in shapes (Vector/Array/Matrix/Tuple/Dict) are answered directly
+  and win over a method of the same name, so nothing about them moves; a type
+  with no method raises `MethodError`, which says what the old "indexing is
+  only supported on ..." said, in the language's own vocabulary.
+- **`:name` is a Symbol, and a keyword is a name too.** `:type`, `:end`,
+  `:where` quote like any other — which words are keywords is a fact about
+  this language, not about the data a `Dict` arrived carrying. `:true` and
+  `:false` hand the value back rather than a Symbol, as in real Julia.
 - **`Pair`**: `"a" => 1` is a value of its own — `p.first`, `p.second`, shown
   the way it is written, right-associative and lower-binding than every
   arithmetic and comparison operator. `Dict` is the variadic call that takes

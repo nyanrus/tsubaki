@@ -25,6 +25,9 @@ pub struct Param {
     pub name: u32,
     pub types: Vec<u32>,
     pub default: u32,
+    /// `f(a, xs...)` の `xs` なら true。最後の一つにしか立たない -- 呼ばれた
+    /// ときに余ったものをぜんぶ集めて、タプルとして束ねる
+    pub slurp: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +87,8 @@ pub struct Target {
 #[derive(Debug, Clone)]
 pub struct Comp {
     pub targets: Vec<Target>,
+    /// `1 + <irep>` for `[x for x in xs if cond]`, or 0 for no filter.
+    pub cond: u32,
     pub body: u32,
 }
 
@@ -123,6 +128,7 @@ pub enum Instr {
     Range3,
     IterNew,
     IterNext(u32),
+    IterDrop,
     Comprehension(u32),
     Getfield(u32),
     Setfield(u32),
@@ -150,6 +156,10 @@ pub enum Instr {
     Elem(u32),
     UnpackEnd,
     Typecheck(u32, Vec<u32>),
+    /// syms[名前], 積まれている部分の数, どれをばらすかのビット, call cache
+    CallSplat(u32, u32, u32, u32),
+    /// 呼ぶもの, 部分… の順に積んで、部分の数, ビット
+    ApplySplat(u32, u32),
     Qcall(u32, u32, u32, u32),
     Apply(u32),
     ApplyMethod(u32, u32),
@@ -255,7 +265,8 @@ impl<'a> Reader<'a> {
             let name = r.nat()?;
             let types = r.nats()?;
             let default = r.nat()?;
-            Ok(Param { name, types, default })
+            let slurp = r.nat()? != 0;
+            Ok(Param { name, types, default, slurp })
         })
     }
 
@@ -295,6 +306,7 @@ impl<'a> Reader<'a> {
             21 => Range3,
             22 => IterNew,
             23 => IterNext(self.nat()?),
+            64 => IterDrop,
             24 => Pair,
             25 => Identical(self.nat()?),
             26 => Subtype(self.nat()?, self.nat()?),
@@ -335,6 +347,8 @@ impl<'a> Reader<'a> {
             61 => Typecheck(self.nat()?, self.nats()?),
             62 => Symbol(self.nat()?),
             63 => File(self.nat()?),
+            65 => CallSplat(self.nat()?, self.nat()?, self.nat()?, self.nat()?),
+            66 => ApplySplat(self.nat()?, self.nat()?),
             t => return Err(BadTsb(format!("unknown opcode {t}"))),
         })
     }
@@ -343,8 +357,16 @@ impl<'a> Reader<'a> {
 pub fn read(bytes: &[u8]) -> R<Program> {
     let mut r = Reader { b: bytes, pos: 0 };
     r.need(4)?;
-    if &bytes[0..4] != b"TSB1" {
-        return Err(BadTsb("wrong magic".into()));
+    // 形が変わったら版が上がる(bin/bytecode.ml の magic)。古いものを黙って
+    // 読み違えるより、古いと言う
+    match &bytes[0..4] {
+        b"TSB3" => {}
+        b"TSB1" | b"TSB2" => {
+            return Err(BadTsb(
+                "an older .tsb. Fold it again with the current tsubakic".into(),
+            ))
+        }
+        _ => return Err(BadTsb("wrong magic".into())),
     }
     r.pos = 4;
     let pool = r.many(|r| {
@@ -399,8 +421,9 @@ pub fn read(bytes: &[u8]) -> R<Program> {
             let tuple = r.nat()? != 0;
             Ok(Target { names, tuple })
         })?;
+        let cond = r.nat()?;
         let body = r.nat()?;
-        Ok(Comp { targets, body })
+        Ok(Comp { targets, cond, body })
     })?;
     let ireps = r.many(|r| r.many(|r| r.instr()))?;
     let main = r.nat()?;

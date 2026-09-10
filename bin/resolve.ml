@@ -71,6 +71,13 @@
     | EQualifiedCall (_, _, args, kwargs, _) ->
       List.iter (resolve_expr s) args;
       List.iter (fun (_, e) -> resolve_expr s e) kwargs
+    | ESplat e -> resolve_expr s e
+    (* `let` は新しいスコープ。束ねる値は**外**で見て、体は中で見る *)
+    | ELet (binds, body) ->
+      List.iter (fun (_, e) -> resolve_expr s e) binds;
+      let inner = child s in
+      List.iter (fun (n, _) -> know inner n) binds;
+      resolve_stmt_list inner body
     | EField (o, _) -> resolve_expr s o
     | EApply (f, args) ->
       resolve_expr s f;
@@ -88,13 +95,14 @@
       let s' = child s in
       List.iter (know s') params;
       resolve_stmt_list s' body
-    | EComprehension (body_e, clauses) ->
+    | EComprehension (body_e, clauses, cond) ->
       let s' = child s in
       List.iter
         (fun (target, iter_e) ->
           resolve_expr s iter_e;
           match target with FVSingle v -> know s' v | FVTuple names -> List.iter (know s') names)
         clauses;
+      Option.iter (resolve_expr s') cond;
       resolve_expr s' body_e
     | EIndex (o, idx) ->
       resolve_expr s o;
@@ -125,6 +133,8 @@
   and resolve_stmt s (st : stmt) : unit =
     match st with
     | SLine _ -> () (* a source-position marker binds and references nothing *)
+    (* neither binds nor references a name *)
+    | SBreak | SContinue -> ()
     | SExpr e -> resolve_expr s e
     | SIf (branches, else_body) ->
       List.iter
@@ -249,6 +259,10 @@
     | EQualifiedCall (_, _, args, kwargs, _) ->
       List.iter (resolve_quoted_expr s) args;
       List.iter (fun (_, e) -> resolve_quoted_expr s e) kwargs
+    | ESplat e -> resolve_quoted_expr s e
+    | ELet (binds, body) ->
+      List.iter (fun (_, e) -> resolve_quoted_expr s e) binds;
+      ignore body
     | EField (o, _) -> resolve_quoted_expr s o
     | EAssign (_, rhs, _) -> resolve_quoted_expr s rhs
     | EFieldAssign (o, _, rhs) ->
@@ -280,7 +294,7 @@
        splice time by value_to_expr's hygiene rename. Only $(...) splices
        inside the body/iter exprs are ever real, scope-consulting code. *)
     | ELambda (_, body) -> List.iter (resolve_quoted_stmt s) body
-    | EComprehension (body_e, clauses) ->
+    | EComprehension (body_e, clauses, cond) ->
       List.iter (fun (_, iter_e) -> resolve_quoted_expr s iter_e) clauses;
       resolve_quoted_expr s body_e
     | EMacroCall (_, args) -> List.iter (resolve_quoted_expr s) args
@@ -308,6 +322,7 @@
     | SDestructure (targets, rhs) ->
       resolve_quoted_expr s rhs;
       List.iter (fun (t, _ty) -> resolve_quoted_expr s t) targets
+    | SBreak | SContinue
     | SFuncDecl _ | SStructDecl _ | SAbstractDecl _ | STry _ | SModuleDecl _ | SUsing _ | SImport _
     | SMacroDecl _ | SExport _ | SMacroCall _ | SLocalTypedAssign _ -> ()
     (* not quotable at all -- nothing to resolve *)

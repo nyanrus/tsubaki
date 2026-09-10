@@ -61,7 +61,7 @@ pub extern "C" fn tsb_run(ptr: *const u8, len: usize) -> i32 {
             let code = match r {
                 Ok(_) => 0,
                 Err(e) => {
-                    s.push_str(&format!("tsbvm: {e}\n"));
+                    s.push_str(&format!("tsbvm: {}\n", machine.report(&e)));
                     1
                 }
             };
@@ -104,7 +104,7 @@ pub extern "C" fn tsb_call(
                 Ok(j) => (j, 0),
                 Err(e) => (format!("tsbvm: {e}"), 1),
             },
-            Err(e) => (format!("tsbvm: {e}"), 1),
+            Err(e) => (format!("tsbvm: {}", machine.report(&e)), 1),
         },
     });
     OUT.with(|o| *o.borrow_mut() = text);

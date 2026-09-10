@@ -13,11 +13,27 @@ matches Julia" -- not a claim, a second execution. Only opt in a test whose
 source is genuinely valid Julia (Tsubaki's `::Float`/`::Int` annotations, for
 one, are not).
 
+`# julia: vm` says the same thing about the Rust VM ALONE, and has no golden
+at all: the plain run skips it. The two runtimes agree about the language and
+disagree about how a value is stored -- an all-numeric array is an unboxed
+float array in the OCaml runtime, so `[1, 2]` prints `[1.0, 2.0]` there and
+`[1, 2]` in the VM, which follows Julia. A test about what the VM answers
+belongs here rather than nowhere; pinning it to the OCaml runtime's own
+answers as well would only pin the difference.
+
+A test that is NOT valid Julia at all -- Tsubaki has a few shapes of its own,
+`function +(a::P, b::P)` and `T(existing, field = v)` among them -- has no
+reference to cross-check against, so it keeps two goldens: `NAME.out` for the
+tree-walking run and `NAME.vm.out` for `--tsbvm`. Two runtimes, two answers,
+and the difference between them sitting in the repo where it can be read.
+`--update --tsbvm` writes the second one.
+
     python3 tools/test.py                # run everything
     python3 tools/test.py dispatch mac   # only tests whose name contains one of these
     python3 tools/test.py --julia        # also cross-check the `# julia: yes` ones
     python3 tools/test.py --tsbvm        # run through the Rust VM (tsbvm/)
     python3 tools/test.py --update       # rewrite goldens from current output
+    python3 tools/test.py --update --tsbvm   # ... the *.vm.out ones
 
 --tsbvm folds each test with tsubakic and runs the bytes through the Rust VM
 (tsbvm/) -- and compares against REAL JULIA, not against the golden. The Rust
@@ -97,6 +113,17 @@ def tsbvm_not_yet(output):
     return None
 
 
+def julia_mark(jl):
+    """`yes` (both runtimes), `vm` (the Rust VM alone), or None."""
+    with open(jl) as f:
+        first = f.readline().strip()
+    if first == "# julia: yes":
+        return "yes"
+    if first == "# julia: vm":
+        return "vm"
+    return None
+
+
 def run_julia(path):
     return run(["julia", "--startup-file=no", path])
 
@@ -140,7 +167,7 @@ def main():
         print("tests: nothing matched")
         return 1
 
-    passed, failed, crosschecked, skipped = 0, [], 0, 0
+    passed, failed, crosschecked, skipped, vm_only = 0, [], 0, 0, 0
     not_yet = []  # (test name, the shape Tocode stopped on) -- --vm only
 
     for name in names:
@@ -148,9 +175,17 @@ def main():
         # source position (tests/errors_position.jl) would otherwise bake this
         # machine's home directory into its golden
         jl = os.path.join("tests", name + ".jl")
-        golden_path = os.path.join(TESTS, name + ".out")
+        golden_path = os.path.join(TESTS, name + (".vm.out" if args.tsbvm else ".out"))
         if args.tsbvm and name.startswith("repl"):
             # the REPL reads a line at a time; there is no .tsb to fold
+            continue
+        if julia_mark(jl) == "vm" and not args.tsbvm:
+            # the Rust VM is this one's only reference (`--tsbvm`), so there is
+            # nothing here for the tree-walking run to be compared against --
+            # and nothing for --update to write
+            print("%svm only%s %s %s(marked `# julia: vm`)%s"
+                  % (YELLOW, RESET, name, DIM, RESET))
+            vm_only += 1
             continue
         actual = run_tsbvm(jl) if args.tsbvm else run_tsubaki(jl)
 
@@ -168,12 +203,23 @@ def main():
                 continue
             # real Julia is the reference here, not the golden -- see the
             # module docstring for why
-            with open(jl) as f:
-                if f.readline().strip() != "# julia: yes":
-                    print("%sno julia%s %s %s(not marked `# julia: yes`)%s"
-                          % (YELLOW, RESET, name, DIM, RESET))
+            if julia_mark(jl) is None:
+                # not valid Julia -- its own recorded answer is the reference
+                if not os.path.exists(golden_path):
+                    print("%sno golden%s %s %s(no `# julia:` mark and no %s.vm.out)%s"
+                          % (YELLOW, RESET, name, DIM, name, RESET))
                     skipped += 1
                     continue
+                with open(golden_path) as f:
+                    expected = f.read().rstrip("\n")
+                if actual != expected:
+                    print("%sFAIL%s %s %s(against %s.vm.out)%s" % (RED, RESET, name, DIM, name, RESET))
+                    print(diff(expected, actual))
+                    failed.append(name)
+                    continue
+                print("%sok%s   %s %s(its own .vm.out)%s" % (GREEN, RESET, name, DIM, RESET))
+                passed += 1
+                continue
             expected = run_julia(jl)
             if actual != expected:
                 print("%sFAIL%s %s %s(julia disagrees)%s" % (RED, RESET, name, DIM, RESET))
@@ -201,8 +247,7 @@ def main():
 
         # the same file, through real Julia, against the same golden
         note = ""
-        with open(jl) as f:
-            wants_julia = f.readline().strip() == "# julia: yes"
+        wants_julia = julia_mark(jl) == "yes"
         if wants_julia and args.julia:
             jout = run_julia(jl)
             if jout != expected:
@@ -223,6 +268,8 @@ def main():
     line = "%d passed" % passed
     if crosschecked:
         line += ", %d also verified against real Julia" % crosschecked
+    if vm_only:
+        line += ", %d only the VM answers for" % vm_only
     if skipped:
         line += ", %d without a golden" % skipped
     if not_yet:

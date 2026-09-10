@@ -1,0 +1,12 @@
+caught: something went wrong
+  isa Exception: false, isa ErrorException: true
+  e.msg = something went wrong
+caught: MethodError: no method matching describe(String)
+  isa MethodError: false, isa DimensionMismatch: false
+caught: UndefVarError: nonexistent_name not defined  isa UndefVarError: false
+caught: TypeError: Strict.n::Int cannot hold a String  isa TypeError: false
+caught: KeyError: key missing not found
+caught: BoundsError: index 10  isa BoundsError: false
+caught: vm: Makematrix(2, 2) is not supported yet (line 53)  isa DimensionMismatch: false
+tsbvm: type ErrorException has no field code
+  at tests/errors.jl:67

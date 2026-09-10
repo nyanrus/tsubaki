@@ -15,6 +15,10 @@
          correctly needs a genuinely different backing representation this
          round doesn't add. See `Runtime.wrap_fixed` for the actual
          mask/sign-extend logic. *)
+    | VModule of string
+      (* `module M ... end` そのもの。`M.x` は、これの member を読む形になる
+         (Julia でも module は値で、`typeof(M)` は `Module`)。中身は持たず、
+         名前だけ -- member は module_values / Dispatch.methods が持っている *)
     | VRange of int * int * int (* start, step, stop *)
     | VFRange of float * float * float (* start, step, stop -- a Float range, e.g. -1.0:0.1:1.0 *)
     | VVec of vecbuf (* numeric vector -- heap-allocated, grows dynamically *)
@@ -319,15 +323,17 @@
        and changing it is the rename above. See tests/known_gaps.jl. *)
     let alias = function "Float64" -> "Float" | "Int64" -> "Int" | n -> n
 
-    (* like `alias`, but reaching inside a parametric name too, so
-       `Dict{Int64,Float64}` and `Pair{Int64,Box{Float64}}` normalize as
-       whole. Splitting on ',' tracks brace depth -- a nested parameter list
-       has commas of its own that are not this level's separators. *)
-    let rec canonical (n : string) : string =
-      let len = String.length n in
-      match String.index_opt n '{' with
-      | Some i when len > 0 && n.[len - 1] = '}' ->
-        let inner = String.sub n (i + 1) (len - i - 2) in
+    (* `{...}` の中身を、この階のコンマで割る。入れ子の中のコンマは、この階の
+       区切りではない(`Vector{Tuple{Int,Int}}` の中身は一つ)。中身が空なら
+       ゼロ個 -- `Tuple{}` は「名前が一つ、それが空」ではない。
+
+       canonical と parse_concrete が**同じ割りかた**をするように、一つに
+       してある。前は parse_concrete のほうだけが素朴に `,` で割っていて、
+       入れ子が来ると壊れていた(タプルが中身の型を持つようになって、
+       `Vector{Tuple{Int,Int}}` が普通に出てくるようになった) *)
+    let split_params (inner : string) : string list =
+      if inner = "" then []
+      else (
         let parts = ref [] and buf = Buffer.create 16 and depth = ref 0 in
         String.iter
           (fun c ->
@@ -344,8 +350,17 @@
             | c -> Buffer.add_char buf c)
           inner;
         parts := Buffer.contents buf :: !parts;
-        (* `parts` was built back-to-front, and rev_map puts it right again *)
-        let parts = List.rev_map (fun s -> canonical (String.trim s)) !parts in
+        List.rev !parts)
+
+    (* like `alias`, but reaching inside a parametric name too, so
+       `Dict{Int64,Float64}` and `Pair{Int64,Box{Float64}}` normalize as
+       whole. *)
+    let rec canonical (n : string) : string =
+      let len = String.length n in
+      match String.index_opt n '{' with
+      | Some i when len > 0 && n.[len - 1] = '}' ->
+        let inner = String.sub n (i + 1) (len - i - 2) in
+        let parts = List.map (fun s -> canonical (String.trim s)) (split_params inner) in
         alias (String.sub n 0 i) ^ "{" ^ String.concat "," parts ^ "}"
       | _ -> alias n
 
@@ -358,7 +373,7 @@
       | Some i ->
         let base = String.sub name 0 i in
         let inner = String.sub name (i + 1) (String.length name - i - 2) in
-        Some (base, String.split_on_char ',' inner)
+        Some (base, split_params inner)
 
     let ancestors name =
       let rec go n acc =
@@ -387,6 +402,25 @@
        for nested parametrics (`Array{Array{Int}} <: Array{Array{Number}}`)
        for free, though nothing in this project actually nests that deep. *)
     let rec distance_to sub sup =
+      (* 中身を言わない `Tuple` は、Julia では `Tuple{Vararg{Any}}` -- 中身を
+         ぜんぶ `Any` と書いた形の、さらに一つ外。だから中身を言っている相手
+         (`Tuple{Number,Number}`)のほうが、いつでも近くなければならない。
+         `ancestors` は `Tuple{...}` の親を `Tuple` としか言えず、それだと
+         一つ隣(1)になってしまって、素の `Tuple` が何にでも勝つ *)
+      match sup with
+      | "Tuple" -> (
+        (* sup を先に見てから中身を割る -- distance_to は呼び出しのたびに
+           dispatch から来るので、ほかの型の道に字の走査を置かない *)
+        match parse_concrete sub with
+        | Some ("Tuple", params) ->
+          let ds = List.map (fun p -> distance_to (String.trim p) "Any") params in
+          if List.for_all Option.is_some ds then
+            Some (2 + List.fold_left max 0 (List.map Option.get ds))
+          else None
+        | _ -> distance_below sub sup)
+      | _ -> distance_below sub sup
+
+    and distance_below sub sup =
       let rec idx i = function
         | [] -> None
         | x :: xs -> if x = sup then Some i else idx (i + 1) xs
@@ -553,6 +587,7 @@
       if signed && (m lsr (bits - 1)) land 1 = 1 then m - (1 lsl bits) else m)
 
   let rec tag = function
+    | VModule _ -> "Module"
     | VInt _ -> tag_int
     | VFloat _ -> tag_float
     | VBool _ -> tag_bool
@@ -588,7 +623,14 @@
         concrete)
     | VStruct s -> s.kind
     | VClosure _ -> tag_function
-    | VTuple _ -> tag_tuple
+    (* Julia のタプルは中身の型を持つ -- `(1, 2)` は `Tuple{Int,Int}`。
+       綴りは `Types.canonical` が注釈を直す綴りと同じにする(空白を入れず、
+       書くほうの名前)。でないと `t::Tuple{Int64, Int64}` と噛み合わない。
+       `Types.declare` は要らない -- 合成名は `Types.ancestors` の落ちどころが
+       自分の base(`Tuple`)の鎖に載せてくれる。 *)
+    | VTuple vs ->
+      Printf.sprintf "%s{%s}" tag_tuple
+        (String.concat "," (Array.to_list (Array.map tag vs)))
     | VComplex _ -> tag_complex
     | VRational _ -> tag_rational
     | VSymbol _ -> tag_symbol
@@ -660,6 +702,7 @@
     Printf.sprintf "%s %s %sim" (float_repr re) (if im < 0.0 then "-" else "+") (float_repr (Float.abs im))
 
   let rec show = function
+    | VModule n -> n
     | VInt n -> string_of_int n
     | VFloat f -> float_repr f
     | VBool b -> string_of_bool b
@@ -835,8 +878,28 @@
     | other -> inject (Js.string (show other))
 
   (* --- struct field access, the thing that replaces bespoke record types --- *)
+  (* `module M ... end` の中で置かれた**値**。関数と型はもう名前空間を持って
+     いる(Dispatch.methods / struct_defs が "M.name" で覚えている)けれど、
+     値の束縛だけが行き場を持っていなかった -- Julia では module の中の
+     `const x = 1` も `M.x` で読める。鍵は "M.x"。 *)
+  let module_values : (string, value) Hashtbl.t = Hashtbl.create 16
+
+  (* その名前は module か。表がまだ下に居るので、ここは口だけ開けておく
+     (Dispatch と struct_defs が出そろってから差し込む -- register_inlinable
+     などと同じ形) *)
+  let is_module_name : (string -> bool) ref = ref (fun _ -> false)
+
   let get_field v name =
     match v with
+    (* `M.x` -- module の中で置かれた値。入れ子の module も、そのまま次の `.`
+       が読める(`Outer.Inner.b`) *)
+    | VModule m -> (
+      let full = m ^ "." ^ name in
+      match Hashtbl.find_opt module_values full with
+      | Some v -> v
+      | None ->
+        if !is_module_name full then VModule full
+        else failwith (Printf.sprintf "UndefVarError: %s not defined" full))
     | VStruct s -> (
       match Array.find_opt (fun (n, _) -> n = name) s.fields with
       | Some (_, r) -> !r
@@ -1192,7 +1255,9 @@
   module Dispatch = struct
     (* each parameter's declared type is a list of alternatives -- a plain type
        is a singleton, "Any" is ["Any"], and Union{A,B,C} is ["A";"B";"C"] *)
-    type method_ = { sig_ : string list list; impl : value list -> value }
+    (* `vararg` は `f(a, xs...)` -- 最後の alt は「残り全部が、これ」を言う。
+       数が合っていなくても applicable になるのは、この一つだけ。 *)
+    type method_ = { sig_ : string list list; vararg : bool; impl : value list -> value }
 
     let methods : (string, method_ list) Hashtbl.t = Hashtbl.create 64
 
@@ -1201,26 +1266,68 @@
        changed since you were resolved, redo the full lookup" *)
     let generation = ref 0
 
-    let defmethod name sig_ impl =
+    let defmethod ?(vararg = false) name sig_ impl =
       incr generation;
       let existing = Option.value (Hashtbl.find_opt methods name) ~default:[] in
       (* redefining a method with the exact same signature replaces it --
          matching real Julia -- rather than accumulating an ever-growing
          pile of identical, eventually-ambiguous candidates *)
-      let existing = List.filter (fun m -> m.sig_ <> sig_) existing in
-      Hashtbl.replace methods name ({ sig_; impl } :: existing)
+      let existing = List.filter (fun m -> not (m.sig_ = sig_ && m.vararg = vararg)) existing in
+      Hashtbl.replace methods name ({ sig_; vararg; impl } :: existing)
+
+    let rec take n = function [] -> [] | _ when n <= 0 -> [] | x :: rest -> x :: take (n - 1) rest
+    let rec drop n = function [] -> [] | l when n <= 0 -> l | _ :: rest -> drop (n - 1) rest
 
     let matches_alt arg alts = List.exists (fun alt -> Types.distance_to arg alt <> None) alts
     let best_distance arg alts = List.filter_map (Types.distance_to arg) alts |> List.fold_left min max_int
 
-    let applicable m arg_tags =
-      List.length m.sig_ = List.length arg_tags
-      && List.for_all2 (fun alts arg -> matches_alt arg alts) m.sig_ arg_tags
+    (* `f(a, xs...)` は「最初の n-1 個が名前どおりで、残りは全部おしまいの
+       alt」。残りがゼロ個でもいい(`f(1)` は `f(a, xs...)` に当たって、
+       xs は空のタプルになる)。 *)
+    let split_last l =
+      match List.rev l with
+      | [] -> [], []
+      | last :: rev_init -> List.rev rev_init, [ last ]
 
+    let applicable m arg_tags =
+      if not m.vararg then
+        List.length m.sig_ = List.length arg_tags
+        && List.for_all2 (fun alts arg -> matches_alt arg alts) m.sig_ arg_tags
+      else (
+        let fixed, rest_alt = split_last m.sig_ in
+        let n = List.length fixed in
+        List.length arg_tags >= n
+        && List.for_all2 (fun alts arg -> matches_alt arg alts) fixed (take n arg_tags)
+        &&
+        match rest_alt with
+        | [ alts ] -> List.for_all (fun arg -> matches_alt arg alts) (drop n arg_tags)
+        | _ -> true)
+
+    (* 遠さの合計。`...` で受けたものは、数がぴったりの method に負けるように
+       一つ余分に足す -- Julia でも `f(a, b)` が `f(a, xs...)` より先に選ばれる *)
     let specificity m arg_tags =
-      List.fold_left2 (fun acc alts arg -> acc + best_distance arg alts) 0 m.sig_ arg_tags
+      if not m.vararg then
+        List.fold_left2 (fun acc alts arg -> acc + best_distance arg alts) 0 m.sig_ arg_tags
+      else (
+        let fixed, rest_alt = split_last m.sig_ in
+        let n = List.length fixed in
+        let acc = List.fold_left2 (fun acc alts arg -> acc + best_distance arg alts) 0 fixed (take n arg_tags) in
+        let acc =
+          match rest_alt with
+          | [ alts ] -> List.fold_left (fun acc arg -> acc + best_distance arg alts) acc (drop n arg_tags)
+          | _ -> acc
+        in
+        acc + 1)
 
     let show_sig sig_ = String.concat ", " (List.map (String.concat "|") sig_)
+
+    (* a の署名は b の署名に収まるか(どの場所でも、a の型が b の型の中)。
+       これが Julia の「どちらが狭いか」で、遠さの合計とは別のものさし --
+       `f(x::Int, y)` と `f(x, y::Float64)` は `f(1, 1.0)` にどちらも当たる
+       けれど、どちらが狭いとも言えない。そこで Julia は決めない。 *)
+    let alts_within x y = List.for_all (fun xa -> List.exists (fun ya -> Types.distance_to xa ya <> None) y) x
+
+    let sig_within a b = List.length a = List.length b && List.for_all2 alts_within a b
 
     (* the actual resolution algorithm, shared by both the uncached and the
        inline-cached call paths below *)
@@ -1235,11 +1342,24 @@
         let scored = List.map (fun m -> specificity m arg_tags, m) ms in
         let sorted = List.sort (fun (s1, _) (s2, _) -> compare s1 s2) scored in
         match sorted with
-        | (best, m1) :: (second, _) :: _ when second = best ->
-          failwith
-            (Printf.sprintf "MethodError: ambiguous method for %s(%s) -- signature (%s) ties"
-               name (String.concat ", " arg_tags) (show_sig m1.sig_))
-        | (_, m) :: _ -> m
+        | (_, m) :: rest ->
+          (* いちばん近いものが、ほかのどれとも「どちらが狭いとも言えない」
+             ままなら、決めない。引数の数の扱いが違うもの(`...` や既定つき)は、
+             そこで先に決まっているので見ない *)
+          List.iter
+            (fun (_, other) ->
+              if
+                (not m.vararg) && (not other.vararg)
+                && List.length m.sig_ = List.length other.sig_
+                && (not (sig_within m.sig_ other.sig_))
+                && not (sig_within other.sig_ m.sig_)
+              then
+                failwith
+                  (Printf.sprintf
+                     "MethodError: %s(%s) is ambiguous -- (%s) and (%s) are equally close" name
+                     (String.concat ", " arg_tags) (show_sig other.sig_) (show_sig m.sig_)))
+            rest;
+          m
         | [] -> assert false)
 
     let call name args =
@@ -1376,6 +1496,19 @@
     }
 
   let struct_defs : (string, struct_def) Hashtbl.t = Hashtbl.create 32
+
+  (* 上で開けておいた口に、表がそろったので差し込む。member を一つでも
+     持っていれば module と見なす -- `M.nope` が「M なんて名前は無い」では
+     なく「M.nope が無い」と言えるように *)
+  let () =
+    is_module_name :=
+      fun n ->
+        let qp = n ^ "." in
+        let qplen = String.length qp in
+        let starts k = String.length k > qplen && String.equal (String.sub k 0 qplen) qp in
+        Hashtbl.fold (fun k _ acc -> acc || starts k) Dispatch.methods false
+        || Hashtbl.fold (fun k _ acc -> acc || starts k) struct_defs false
+        || Hashtbl.fold (fun k _ acc -> acc || starts k) module_values false
 
   (* bumped on every struct declaration -- lets ECall's own "is `name`
      possibly a struct constructor" pre-check (see Eval, `call_cache`'s
@@ -1731,6 +1864,11 @@
       Hashtbl.fold (fun k v acc -> if has_prefix k then (bare_of k, v) :: acc else acc) struct_defs []
     in
     List.iter (fun (bare, sd) -> Hashtbl.replace struct_defs bare sd) structs_to_merge;
+    (* module の中で置かれた値も、裸の名前で引けるように(関数や型と同じ扱い) *)
+    let values_to_merge =
+      Hashtbl.fold (fun k v acc -> if has_prefix k then (bare_of k, v) :: acc else acc) module_values []
+    in
+    List.iter (fun (bare, v) -> Hashtbl.replace module_values bare v) values_to_merge;
     let types_to_merge =
       Hashtbl.fold (fun k v acc -> if has_prefix k then (bare_of k, v) :: acc else acc) Types.parent []
     in
@@ -1776,6 +1914,10 @@
           Hashtbl.replace Dispatch.methods bare (fresh @ existing))
       methods_to_merge;
     if !merged then incr Dispatch.generation;
+    let values_to_merge =
+      Hashtbl.fold (fun k v acc -> if has_wanted_prefix k then (bare_of k, v) :: acc else acc) module_values []
+    in
+    List.iter (fun (bare, v) -> Hashtbl.replace module_values bare v) values_to_merge;
     let structs_to_merge =
       Hashtbl.fold (fun k v acc -> if has_wanted_prefix k then (bare_of k, v) :: acc else acc) struct_defs []
     in
@@ -2159,6 +2301,10 @@
         VFloat (if r <> 0.0 && (r < 0.0) <> (b < 0.0) then r +. b else r));
     (* logical not -- see Parser.parse_unary for why `!x` is just an
        ordinary call to this, not a dedicated AST node *)
+    (* `~x` -- ビットを裏返す。`!` と同じで、名前のついた関数 *)
+    Dispatch.defmethod "~" [ [ "Int" ] ] (function
+      | [ VInt a ] -> VInt (lnot a)
+      | _ -> assert false);
     Dispatch.defmethod "!" [ [ "Bool" ] ] (function
       | [ VBool b ] -> VBool (not b)
       | _ -> assert false);
@@ -2655,6 +2801,11 @@
       | _ -> assert false);
     Dispatch.defmethod "length" [ [ "Array" ] ] (function
       | [ VArr { cells; _ } ] -> VInt (arrbuf_length cells)
+      | _ -> assert false);
+    (* タプルにも長さがある(Julia もそう)。自分で組んだタプルを読み返すとき
+       に要る -- `(1px, :solid, c)` のような、並べて書いたものを数える *)
+    Dispatch.defmethod "length" [ [ "Tuple" ] ] (function
+      | [ VTuple vs ] -> VInt (Array.length vs)
       | _ -> assert false);
     (* `a[begin]` and `a[end]`, as ordinary functions -- for when the index is
        worked out somewhere else. `a[begin + i]` is how an index that came from

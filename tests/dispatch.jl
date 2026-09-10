@@ -46,3 +46,22 @@ each(speak, [Cat("a"), Dog("b"), Wolf("c")])
 # a method added later joins the same generic function
 speak(w::Wolf) = "awoo"
 println(speak(Wolf("gray")))
+
+# 「どちらが狭いとも言えない」ときは、決めない。`f(1, 1.0)` は下の二つに
+# どちらも当たるけれど、片方が片方の中に収まってはいない -- そこで黙って
+# 一つ選ぶと、いちばん見つけにくい食い違いになる。
+# (何と言って断るかは runtime ごとに少し違うので、ここでは断ったことだけ)
+side(x::Int, y) = "left"
+side(x, y::Float64) = "right"
+println(side(1, 1), " ", side("s", 1.0))
+try
+    side(1, 1.0)
+    println("chose one")
+catch e
+    println("ambiguous")
+end
+
+# 同じ署名で書き直したら、置きかわる(積み上がらない)
+over(x) = "first"
+over(x) = "second"
+println(over(1))

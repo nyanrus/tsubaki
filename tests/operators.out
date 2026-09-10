@@ -1,0 +1,7 @@
+Money(yen=200)
+Money(yen=360)
+3 ab true
+Len(n=40, unit=:px) Len(n=1.5, unit=:rem)
+Len(n=32, unit=:px)
+Dict(:width => Len(n=40, unit=:px), :padding => (Len(n=4, unit=:px), 0))
+2

@@ -57,6 +57,17 @@ type builder =
   ; mutable ncomps : int
   ; mutable ireps_rev : instr array list
   ; mutable nireps : int
+  ; mutable loops : loopinfo list
+    (* いま畳んでいるループ、内側から。break と continue が飛ぶ先を知っている
+       のは、ここだけ -- 「いちばん内側」は、この並びの頭のこと *)
+  ; mutable depth : int (* Enter した数。break が何段 Leave するかを数える *)
+  }
+
+and loopinfo =
+  { li_continue : int (* 次の turn の番地 *)
+  ; li_breaks : int list ref (* 出口へ飛ぶ穴。出口が決まったところで埋める *)
+  ; li_depth : int (* このループに入る前の depth *)
+  ; li_iter : bool (* for なら true -- break のとき、反復を降ろす *)
   }
 
 let new_builder () =
@@ -76,6 +87,8 @@ let new_builder () =
   ; ncomps = 0
   ; ireps_rev = []
   ; nireps = 0
+  ; loops = []
+  ; depth = 0
   }
 
 let lit_index b l =
@@ -116,6 +129,15 @@ let add_lambda b l =
   b.nlambdas <- i + 1;
   i
 
+(* Enter と Leave は、深さを数えながら出す -- break はその差だけ Leave する *)
+let enter b cb =
+  emit cb Enter;
+  b.depth <- b.depth + 1
+
+let leave b cb =
+  emit cb Leave;
+  b.depth <- b.depth - 1
+
 let add_comp b c =
   let i = b.ncomps in
   b.comps_rev <- c :: b.comps_rev;
@@ -141,6 +163,16 @@ let types_index b (ts : string list) =
   Array.of_list (List.map (sym_index b) ts)
 
 (* --- 式。どれも「値を一つ積んで終わる」 --- *)
+(* どの引数に `...` が付いていたか、を一つの数に畳む。位が引数の場所 --
+   `f(a, xs...)` なら 2。三十二を超える引数は、実際には書かれない *)
+let splat_mask (args : expr list) : int =
+  let m = ref 0 in
+  List.iteri (fun i a -> match a with ESplat _ -> m := !m lor (1 lsl i) | _ -> ()) args;
+  !m
+
+let has_splat (args : expr list) = List.exists (function ESplat _ -> true | _ -> false) args
+let unsplat = function ESplat e -> e | e -> e
+
 let rec compile_expr b cb (e : expr) : unit =
   match e with
   | EInt n -> emit cb (Const (lit_index b (LInt n)))
@@ -235,9 +267,14 @@ let rec compile_expr b cb (e : expr) : unit =
          , List.length args
          , Array.of_list (List.map (fun (k, _) -> sym_index b k) kwargs)
          , cc ))
+  | ECall (name, args, [], cc) when has_splat args ->
+    List.iter (fun a -> compile_expr b cb (unsplat a)) args;
+    emit cb (Call_splat (sym_index b name, List.length args, splat_mask args, cc))
   | ECall (name, args, [], cc) ->
     List.iter (compile_expr b cb) args;
     emit cb (Call (sym_index b name, List.length args, cc))
+  (* `xs...` が引数のどこかにある呼び出しは、上の二つの形でだけ受ける *)
+  | ESplat _ -> raise (Not_yet "`...` outside a call's argument list")
   | ETernary (c, t, f) ->
     compile_expr b cb c;
     let to_else = hole cb in
@@ -253,6 +290,10 @@ let rec compile_expr b cb (e : expr) : unit =
     compile_expr b cb o;
     List.iter (compile_expr b cb) args;
     emit cb (Apply_method (sym_index b meth, List.length args))
+  | EApply (callee, args) when has_splat args ->
+    compile_expr b cb callee;
+    List.iter (fun a -> compile_expr b cb (unsplat a)) args;
+    emit cb (Apply_splat (List.length args, splat_mask args))
   | EApply (callee, args) ->
     compile_expr b cb callee;
     List.iter (compile_expr b cb) args;
@@ -272,12 +313,15 @@ let rec compile_expr b cb (e : expr) : unit =
     (* 体は子 irep。名前で呼ばれるものではないので、funcs とは別の棚に置く *)
     let l = { l_params = Array.of_list (List.map (sym_index b) params); l_body = compile_body b body } in
     emit cb (Makeclosure (add_lambda b l))
-  | EComprehension (_, clauses) when List.length clauses > 2 ->
+  | EComprehension (_, clauses, _) when List.length clauses > 2 ->
     raise (Not_yet "a comprehension with more than two for-clauses")
-  | EComprehension (body_e, clauses) ->
+  | EComprehension (_, [ _; _ ], Some _) ->
+    raise (Not_yet "a comprehension with two for-clauses and an `if`")
+  | EComprehension (body_e, clauses, cond) ->
     List.iter (fun (_, iter_e) -> compile_expr b cb iter_e) clauses;
     let c =
       { cp_targets = Array.of_list (List.map (fun (t, _) -> fold_target b t) clauses)
+      ; cp_cond = (match cond with None -> 0 | Some e -> 1 + compile_body b [ SExpr e ])
       ; cp_body = compile_body b [ SExpr body_e ]
       }
     in
@@ -343,6 +387,15 @@ let rec compile_expr b cb (e : expr) : unit =
   | EQuote _ | EQuoteBlock _ -> raise (Not_yet "a quote")
   | EInterp _ | EInterpAssign _ -> raise (Not_yet "an interpolation")
   | EMacroCall _ -> raise (Not_yet "a macro call")
+  (* `let x = 1 ... end` -- 新しいスコープを開く。束ねる値は**外**で作って
+     から中に置くので、`let x = x` が外の x を捕まえられる。積んだ順の逆から
+     Bind するのは、Bind が上から取るため *)
+  | ELet (binds, body) ->
+    List.iter (fun (_, e) -> compile_expr b cb e) binds;
+    enter b cb;
+    List.iter (fun (n, _) -> emit cb (Bind (sym_index b n))) (List.rev binds);
+    compile_stmts b cb body;
+    leave b cb
   (* `begin ... end`、そして macro の展開が文の形だったときに包まれるもの。
      新しいスコープは作らない -- eval も exec_stmt_list をそのまま呼んでいる *)
   | EBlock stmts -> compile_stmts b cb stmts
@@ -365,16 +418,16 @@ and compile_stmt b cb (s : stmt) : unit =
       | [] -> (
         match else_body with
         | Some body ->
-          emit cb Enter;
+          enter b cb;
           compile_stmts b cb body;
-          emit cb Leave
+          leave b cb
         | None -> emit cb Nothing)
       | (cond, body) :: rest ->
         compile_expr b cb cond;
         let to_next = hole cb in
-        emit cb Enter;
+        enter b cb;
         compile_stmts b cb body;
-        emit cb Leave;
+        leave b cb;
         ends := hole cb :: !ends;
         patch cb to_next (Jump_if_false (here cb));
         go rest
@@ -386,12 +439,17 @@ and compile_stmt b cb (s : stmt) : unit =
     let top = here cb in
     compile_expr b cb cond;
     let out = hole cb in
-    emit cb Enter;
+    let li = { li_continue = top; li_breaks = ref []; li_depth = b.depth; li_iter = false } in
+    b.loops <- li :: b.loops;
+    enter b cb;
     compile_stmts b cb body;
-    emit cb Leave;
+    leave b cb;
     emit cb Pop;
     emit cb (Jump top);
-    patch cb out (Jump_if_false (here cb));
+    b.loops <- List.tl b.loops;
+    let fin = here cb in
+    patch cb out (Jump_if_false fin);
+    List.iter (fun at -> patch cb at (Jump fin)) !(li.li_breaks);
     emit cb Nothing
   | SFuncDecl (name, params, kwparams, body, fc) ->
     let ps = List.map (fold_param b) params in
@@ -411,6 +469,22 @@ and compile_stmt b cb (s : stmt) : unit =
       ~kwdef:false
   | SAbstractDecl (name, parent) ->
     emit cb (Defabstract (sym_index b name, sym_index b (Option.value parent ~default:"Any")))
+  (* いちばん内側のループへ。途中で開いたスコープはその数だけ閉じる --
+     例外で飛ぶ eval と違って、こちらは自分で戻さないと深さが合わなくなる *)
+  | SBreak | SContinue -> (
+    match b.loops with
+    | [] ->
+      raise
+        (Not_yet (if s = SBreak then "break outside a loop" else "continue outside a loop"))
+    | li :: _ ->
+      for _ = 1 to b.depth - li.li_depth do
+        emit cb Leave
+      done;
+      if s = SBreak then begin
+        if li.li_iter then emit cb Iter_drop;
+        li.li_breaks := hole cb :: !(li.li_breaks)
+      end
+      else emit cb (Jump li.li_continue))
   | SLine n -> emit cb (Line n)
   | SFor (target, iter_e, body) ->
     (* 反復を作って、次があるあいだ体を回す。体は同じ命令列の中に居る --
@@ -421,31 +495,36 @@ and compile_stmt b cb (s : stmt) : unit =
     emit cb Iter_new;
     let top = here cb in
     let out = hole cb in
-    emit cb Enter;
+    let li = { li_continue = top; li_breaks = ref []; li_depth = b.depth; li_iter = true } in
+    b.loops <- li :: b.loops;
+    enter b cb;
     (match fold_target b target with
      | { t_names = [| n |]; t_tuple = false } -> emit cb (Bind n)
      | t -> emit cb (Bind_tuple t.t_names));
     compile_stmts b cb body;
     emit cb Pop;
-    emit cb Leave;
+    leave b cb;
     emit cb (Jump top);
-    patch cb out (Iter_next (here cb));
+    b.loops <- List.tl b.loops;
+    let fin = here cb in
+    patch cb out (Iter_next fin);
+    List.iter (fun at -> patch cb at (Jump fin)) !(li.li_breaks);
     emit cb Nothing
   | STry (body, catchvar, catch_body) ->
     (* 受け止める場所を先に言っておいて、体を走らせる。無事に済んだら
        受け止めをやめて、catch を飛び越す *)
     let to_catch = hole cb in
-    emit cb Enter;
+    enter b cb;
     compile_stmts b cb body;
-    emit cb Leave;
+    leave b cb;
     emit cb Try_end;
     let to_end = hole cb in
     patch cb to_catch (Try (here cb));
     (* ここに来たときは、投げられた値が積まれている *)
-    emit cb Enter;
+    enter b cb;
     (match catchvar with Some n -> emit cb (Bind (sym_index b n)) | None -> emit cb Pop);
     compile_stmts b cb catch_body;
-    emit cb Leave;
+    leave b cb;
     patch cb to_end (Jump (here cb))
   | SDestructure (targets, rhs) ->
     (* 右辺のタプルは、代入のあいだ覚えておいて Elem で取り出す。式としての
@@ -516,6 +595,7 @@ and fold_param b (p : Ast.param) : Bytecode.param =
   { p_name = sym_index b p.pname
   ; p_types = types_index b p.ptype
   ; p_default = (match p.pdefault with None -> 0 | Some e -> 1 + compile_body b [ SExpr e ])
+  ; p_slurp = (if p.pslurp then 1 else 0)
   }
 
 (* キーワード引数ひとつ。既定値は、式ひとつだけの子 irep にする -- 呼ばれる

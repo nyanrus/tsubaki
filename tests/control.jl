@@ -66,6 +66,8 @@ println(-7 % 3, " ", 7 % -3)
 
 # bitwise, at real Julia's arithmetic-like precedence (not &&/||'s)
 println(6 & 3, " ", 6 | 3, " ", 6 << 2, " ", 6 >> 1)
+# `~` はビットを裏返す。`!` と同じで、前に置く一つだけの演算子
+println(~5, " ", ~0, " ", 6 & ~3)
 println(1 << 3 + 1)
 
 # comparisons across Int/Float

@@ -30,6 +30,10 @@ let read_file path =
    gate the whole thing on it actually being Node. *)
 let () = Async.install ()
 let () = Frontend.install ()
+
+(* `include("other.jl")` -- ここで開けている。drop の build は開けない
+   (bin/drop.ml のいちばん上に、そのわけがある) *)
+let () = Eval.install_include ()
 let () = Math.init ()
 let () = CurveBridge.init ()
 let () = GpuBridge.init ()

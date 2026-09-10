@@ -1,4 +1,4 @@
-.PHONY: build run repl test test-julia test-tsbvm clean build-gpu clean-gpu
+.PHONY: build run repl test test-julia test-tsbvm check-doors clean build-gpu clean-gpu
 
 # 三本建つ。main は CLI/REPL と橋を全部つれてくる開発用、drop は drop に積む
 # ほう(actor の戸だけ)、tsubakic は .tsubaki を .tsb に畳むだけの道具。
@@ -34,6 +34,11 @@ test-julia: build
 test-tsbvm: build
 	cd tsbvm && cargo build --lib --target wasm32-unknown-unknown --release
 	python3 tools/test.py --tsbvm $(FILTER)
+
+# drop に積む build に、外へ出る戸(jsglobal / tojs / include)が残っていないか。
+# 消したことを覚えているのがコメントだけ、では、また戻ってくる。
+check-doors: build
+	node tools/drop-doors.cjs
 
 clean:
 	dune clean
