@@ -36,11 +36,6 @@ pub enum Value {
     Sym(Rc<str>),
     Nothing,
     Arr(Rc<RefCell<Vec<Value>>>),
-    /// An array whose elements are all numbers stays in this shape -- the
-    /// OCaml side keeps it as an unboxed float array, and it PRINTS
-    /// differently for it (`[1.0, 2.0]`, not `[1, 2]`). Matching that is why
-    /// this is a separate case and not a flag.
-    Vector(Rc<RefCell<Vec<f64>>>),
     Tuple(Rc<Vec<Value>>),
     /// Insertion-ordered, like the OCaml side's -- so printing one is
     /// reproducible. Small enough everywhere it is used that a linear scan
@@ -50,45 +45,51 @@ pub enum Value {
     Struct(Rc<StructVal>),
     Range(i64, i64, i64),
     Closure(Rc<Closure>),
+    /// A bare function NAME used as a value -- `filter(long, xs)`,
+    /// `each(speak, pets)`. It stands for the whole generic function (every
+    /// method of it), so which one runs is decided by the arguments it
+    /// actually gets, not by what existed when the name was read.
+    Generic(Rc<str>),
 }
 
-/// `[...]`: all numbers stays a numeric Vector, anything else (an empty one
-/// included) is an Array. The OCaml side's Eval.make_array_lit, same rule.
-pub fn make_array_lit(vs: Vec<Value>) -> Value {
-    let numeric = !vs.is_empty()
-        && vs.iter().all(|v| matches!(v, Value::Int(_) | Value::Float(_)));
-    if numeric {
-        let fs = vs
-            .iter()
-            .map(|v| match v {
-                Value::Int(n) => *n as f64,
-                Value::Float(f) => *f,
-                _ => unreachable!(),
-            })
-            .collect();
-        Value::Vector(Rc::new(RefCell::new(fs)))
-    } else {
-        Value::Arr(Rc::new(RefCell::new(vs)))
+/// `[...]`. Julia promotes: `[1, 2.0]` is a `Vector{Float64}`, so it prints
+/// `[1.0, 2.0]`. `[1, 2]` stays whole -- `[1, 2]`, not `[1.0, 2.0]`.
+///
+/// (The OCaml runtime turns EVERY all-numeric array into an unboxed float
+/// array, so `[1, 2]` prints `[1.0, 2.0]` there. That is a choice about how
+/// to store one, not about what Julia means, and this VM follows Julia.)
+pub fn make_array_lit(mut vs: Vec<Value>) -> Value {
+    let all_num = vs.iter().all(|v| matches!(v, Value::Int(_) | Value::Float(_)));
+    let any_float = vs.iter().any(|v| matches!(v, Value::Float(_)));
+    if all_num && any_float {
+        for v in vs.iter_mut() {
+            if let Value::Int(n) = v {
+                *v = Value::Float(*n as f64);
+            }
+        }
     }
+    Value::Arr(Rc::new(RefCell::new(vs)))
 }
 
 /// The runtime type name, as Tsubaki's own dispatch spells it.
 pub fn tag(v: &Value) -> &str {
     match v {
-        Value::Int(_) => "Int",
-        Value::Float(_) => "Float",
+        // Julia's own names: `Int` and `Float` are what you WRITE, `Int64`
+        // and `Float64` are what a value IS (see canonical below)
+        Value::Int(_) => "Int64",
+        Value::Float(_) => "Float64",
         Value::Bool(_) => "Bool",
         Value::Str(_) => "String",
         Value::Sym(_) => "Symbol",
         Value::Nothing => "Nothing",
-        Value::Arr(_) => "Array",
-        Value::Vector(_) => "Vector",
+        // Julia's own name for a one-dimensional array
+        Value::Arr(_) => "Vector",
         Value::Tuple(_) => "Tuple",
         Value::Dict(_) => "Dict",
         Value::Pair(_) => "Pair",
         Value::Struct(s) => &s.kind,
         Value::Range(..) => "Range",
-        Value::Closure(_) => "Function",
+        Value::Closure(_) | Value::Generic(_) => "Function",
     }
 }
 
@@ -109,8 +110,8 @@ pub fn value_eq(a: &Value, b: &Value) -> bool {
             let (x, y) = (x.borrow(), y.borrow());
             x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| value_eq(a, b))
         }
-        (Vector(x), Vector(y)) => *x.borrow() == *y.borrow(),
         (Closure(x), Closure(y)) => Rc::ptr_eq(x, y),
+        (Generic(x), Generic(y)) => x == y,
         (Tuple(x), Tuple(y)) => {
             x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| value_eq(a, b))
         }
@@ -142,15 +143,22 @@ pub fn identical(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Struct(x), Struct(y)) => Rc::ptr_eq(x, y),
         (Arr(x), Arr(y)) => Rc::ptr_eq(x, y),
-        (Vector(x), Vector(y)) => Rc::ptr_eq(x, y),
         (Dict(x), Dict(y)) => Rc::ptr_eq(x, y),
         _ => value_eq(a, b),
     }
 }
 
-/// Julia's own float printing, which is what the OCaml side does too
-/// (Runtime.float_repr): a whole number keeps its `.0`, everything else is
-/// the shortest form that reads back the same.
+/// Julia's own float printing. Measured against julia 1.12, not guessed:
+///
+///     0.0001     0.0001       0.00012    0.00012
+///     0.00001    1.0e-5       0.000012   1.2e-5
+///     999999.0   999999.0     1000000.0  1.0e6
+///     0.1+0.2    0.30000000000000004      -0.0  -0.0
+///
+/// So: plain decimal while the magnitude is in [1e-4, 1e6), exponent form
+/// outside it, and a whole number always keeps its `.0`. Rust's own `{}`
+/// gives the shortest form that reads back the same (which is what Julia
+/// wants too), so the work here is only about which shape to put it in.
 pub fn float_repr(f: f64) -> String {
     if f.is_nan() {
         return "NaN".into();
@@ -158,11 +166,26 @@ pub fn float_repr(f: f64) -> String {
     if f.is_infinite() {
         return if f > 0.0 { "Inf".into() } else { "-Inf".into() };
     }
-    if f == f.trunc() && f.abs() < 1e16 {
-        return format!("{:.1}", f);
+    if f == 0.0 {
+        return if f.is_sign_negative() { "-0.0".into() } else { "0.0".into() };
     }
-    // Rust's `{}` for f64 is already the shortest round-tripping form
-    format!("{}", f)
+    let a = f.abs();
+    if (1e-4..1e6).contains(&a) {
+        let s = format!("{f}");
+        if s.contains('.') {
+            s
+        } else {
+            format!("{s}.0")
+        }
+    } else {
+        // `{:e}` writes `1e6`; Julia writes `1.0e6`, so the mantissa always
+        // carries a point
+        let s = format!("{f:e}");
+        match s.split_once('e') {
+            Some((m, e)) if !m.contains('.') => format!("{m}.0e{e}"),
+            _ => s,
+        }
+    }
 }
 
 pub fn show(v: &Value) -> String {
@@ -173,20 +196,24 @@ pub fn show(v: &Value) -> String {
         // a string prints bare at the top, and quoted when nested -- see
         // show_elem, which is the OCaml side's rule too
         Value::Str(s) => s.to_string(),
-        Value::Sym(s) => format!(":{s}"),
+        // `println(:name)` prints `name`; inside something else it shows
+        // as `:name` (see show_elem) -- that is Julia's print/show split
+        Value::Sym(s) => s.to_string(),
         Value::Nothing => "nothing".into(),
         Value::Arr(xs) => {
             let xs = xs.borrow();
-            format!("[{}]", xs.iter().map(show_elem).collect::<Vec<_>>().join(", "))
-        }
-        Value::Vector(xs) => {
-            let xs = xs.borrow();
-            format!("[{}]", xs.iter().map(|f| float_repr(*f)).collect::<Vec<_>>().join(", "))
+            format!(
+                "{}[{}]",
+                array_prefix(&xs),
+                xs.iter().map(show_elem).collect::<Vec<_>>().join(", ")
+            )
         }
         Value::Tuple(xs) => {
             format!("({})", xs.iter().map(show_elem).collect::<Vec<_>>().join(", "))
         }
         Value::Closure(_) => "#<function>".into(),
+        // Julia prints a named function as its name
+        Value::Generic(n) => n.to_string(),
         Value::Dict(d) => {
             let d = d.borrow();
             let body = d
@@ -208,9 +235,11 @@ pub fn show(v: &Value) -> String {
                     return show(m);
                 }
             }
+            // Julia shows a struct as its name and its fields in order --
+            // no field names (`P(1, 2)`, not `P(x=1, y=2)`)
             let body = fs
                 .iter()
-                .map(|(n, v)| format!("{n}={}", show_elem(v)))
+                .map(|(_, v)| show_elem(v))
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("{}({})", sv.kind, body)
@@ -218,10 +247,38 @@ pub fn show(v: &Value) -> String {
     }
 }
 
+/// The type Julia writes in front of an array when the elements alone would
+/// not say what it holds. Measured against julia 1.12:
+///
+///     [1, 2, 3]   [1, 2, 3]        [1, "a"]   Any[1, "a"]
+///     [1.5]       [1.5]            []         Any[]
+///     ["a"]       ["a"]            [true]     Bool[...]
+///     [:a]        [:a]             [Q(1)]     Q[Q(1)]
+///     [nothing]   [nothing]        [[1, 2]]   [[1, 2]]
+///
+/// The rule underneath is "would the elements, printed, tell you the type?"
+/// -- a number or a string or a symbol does, a struct does not, and a mixed
+/// array has nothing to tell.
+fn array_prefix(xs: &[Value]) -> String {
+    let Some(first) = xs.first() else {
+        return "Any".into();
+    };
+    let t = tag(first);
+    if !xs.iter().all(|v| tag(v) == t) {
+        return "Any".into();
+    }
+    match t {
+        "Int64" | "Float64" | "String" | "Symbol" | "Nothing" | "Vector" | "Dict" | "Pair"
+        | "Tuple" => String::new(),
+        other => other.into(),
+    }
+}
+
 /// How a value prints *inside* something else: a string gets its quotes back,
 /// everything else is the same. (Runtime.show_elem, on the OCaml side.)
 pub fn show_elem(v: &Value) -> String {
     match v {
+        Value::Sym(s) => format!(":{s}"),
         Value::Str(s) => {
             let mut b = String::with_capacity(s.len() + 2);
             b.push('"');
@@ -352,25 +409,42 @@ pub struct Vm {
     outer_prefixes: Vec<String>,
     /// what `end` means right now, inside a `[...]`
     current_end: i64,
+    /// The scope the program's own top level ran in -- what a later
+    /// `call` from the host has to see (its structs, its functions, its
+    /// globals).
+    global: Option<Rc<RefCell<Scope>>>,
     out: String,
     line: u32,
+}
+
+/// `Int` is Julia's own name for `Int64` (`const Int = Int64`), so a program
+/// may write either -- and `Float` is Tsubaki's shorthand for `Float64`, the
+/// same way. Both are the same type; this is which spelling wins.
+fn canonical(name: &str) -> &str {
+    match name {
+        "Int" => "Int64",
+        "Float" => "Float64",
+        other => other,
+    }
 }
 
 /// Julia's own tower, as much of it as dispatch here needs. Written out
 /// rather than derived: it is a fact about the language, not about a program.
 const BUILTIN_PARENTS: &[(&str, &str)] = &[
-    ("Int", "Signed"),
+    ("Int64", "Signed"),
     ("Signed", "Integer"),
     ("Bool", "Integer"),
     ("Integer", "Real"),
-    ("Float", "AbstractFloat"),
+    ("Float64", "AbstractFloat"),
     ("AbstractFloat", "Real"),
     ("Real", "Number"),
     ("Number", "Any"),
     ("String", "AbstractString"),
     ("AbstractString", "Any"),
     ("Symbol", "Any"),
-    ("Array", "Any"),
+    ("Vector", "Array"),
+    ("Array", "AbstractArray"),
+    ("AbstractArray", "Any"),
     ("Dict", "Any"),
     ("Tuple", "Any"),
     ("Pair", "Any"),
@@ -399,6 +473,7 @@ impl Vm {
             prefix: String::new(),
             outer_prefixes: Vec::new(),
             current_end: 0,
+            global: None,
             out: String::new(),
             line: 0,
         }
@@ -416,42 +491,62 @@ impl Vm {
 
     pub fn run(&mut self) -> E<Value> {
         let env = Scope::root();
+        self.global = Some(env.clone());
         let main = self.p.main;
         self.exec(main, &env)
     }
 
-    /// Is `sub` this type, or one below it? Walks the one chain of parents --
-    /// the built-in tower and whatever the program declared, in one table.
-    fn is_subtype(&self, sub: &str, sup: &str) -> bool {
-        if sup == "Any" || sub == sup {
-            return true;
+    /// Call one of the program's functions from outside, after it has run.
+    /// This is the `call` a drop's host makes (`ops.call("setup")`).
+    pub fn call_toplevel(&mut self, name: &str, args: Vec<Value>) -> E<Value> {
+        let env = self
+            .global
+            .clone()
+            .ok_or("the program has not been run yet")?;
+        self.call(&Rc::from(name), args, &env)
+    }
+
+    /// How far `sub` is below `sup`: 0 for the same type, 1 for its parent,
+    /// and so on. `None` when it is not below it at all.
+    ///
+    /// This is what decides which method a call goes to. `Cat <: Pet <:
+    /// Animal` means a Cat argument is 0 away from `speak(::Cat)` and 2 away
+    /// from `speak(::Animal)` -- so the Cat one wins. Counting, not just
+    /// "does it fit", is the whole of most-specific-wins.
+    fn distance(&self, sub: &str, sup: &str) -> Option<u32> {
+        let (sub, sup) = (canonical(sub), canonical(sup));
+        if sub == sup {
+            return Some(0);
         }
         let mut cur: Rc<str> = Rc::from(sub);
         // a cycle would be a bug in a declaration, not in a program: stop
         // rather than spin
-        for _ in 0..32 {
+        for d in 1..32u32 {
             match self.parents.get(&cur) {
                 Some(p) => {
                     if &**p == sup {
-                        return true;
+                        return Some(d);
                     }
                     cur = p.clone();
                 }
-                None => return false,
+                // the chain ran out. Everything is under Any, whether or not
+                // the table says so
+                None => return if sup == "Any" { Some(32) } else { None },
             }
         }
-        false
+        None
     }
 
-    /// Does this argument satisfy one parameter's alternatives?
-    fn accepts(&self, alts: &[u32], v: &Value) -> bool {
-        alts.iter().any(|a| {
-            if Some(*a) == self.any {
-                true
-            } else {
-                self.is_subtype(tag(v), self.sym(*a))
-            }
-        })
+    fn is_subtype(&self, sub: &str, sup: &str) -> bool {
+        self.distance(sub, sup).is_some()
+    }
+
+    /// How well one argument fits one parameter: the distance to the nearest
+    /// of its alternatives, or `None` if it fits none of them.
+    fn fit(&self, alts: &[u32], v: &Value) -> Option<u32> {
+        alts.iter()
+            .filter_map(|a| self.distance(tag(v), self.sym(*a)))
+            .min()
     }
 
     /// Build a struct the way its declaration says: one argument per field,
@@ -484,26 +579,33 @@ impl Vm {
         })))
     }
 
-    /// The method to run for this call. More specific wins, the way Tsubaki's
-    /// own dispatch does -- here that only means "fewer `Any`s", which is as
-    /// much of the ordering as this narrow VM can be asked about.
+    /// The method to run for this call: the one whose parameters are nearest
+    /// to what was actually passed. Julia's most-specific-wins, added up
+    /// across the arguments.
+    ///
+    /// A tie goes to the one declared later, which is not Julia's answer
+    /// (there it is an ambiguity error) -- worth saying out loud rather than
+    /// pretending the ordering here is complete.
     fn pick(&self, name: &str, args: &[Value]) -> Option<usize> {
         let ms = self.methods.get(name)?;
-        let mut best: Option<(usize, usize)> = None;
+        let mut best: Option<(usize, u32)> = None;
         for (i, m) in ms.iter().enumerate() {
             if m.sig.len() != args.len() {
                 continue;
             }
-            if !m.sig.iter().zip(args).all(|(alts, v)| self.accepts(alts, v)) {
-                continue;
+            let mut total = 0u32;
+            let mut fits = true;
+            for (alts, v) in m.sig.iter().zip(args) {
+                match self.fit(alts, v) {
+                    Some(d) => total += d,
+                    None => {
+                        fits = false;
+                        break;
+                    }
+                }
             }
-            let anys = m
-                .sig
-                .iter()
-                .filter(|alts| alts.iter().any(|a| Some(*a) == self.any))
-                .count();
-            if best.map_or(true, |(_, b)| anys < b) {
-                best = Some((i, anys));
+            if fits && best.map_or(true, |(_, b)| total <= b) {
+                best = Some((i, total));
             }
         }
         best.map(|(i, _)| i)
@@ -632,13 +734,11 @@ impl Vm {
         Some(match (name, args) {
             ("Dict", []) => Ok(Dict(Rc::new(RefCell::new(Vec::new())))),
             ("length", [Arr(a)]) => Ok(Int(a.borrow().len() as i64)),
-            ("length", [Vector(a)]) => Ok(Int(a.borrow().len() as i64)),
             ("length", [Tuple(t)]) => Ok(Int(t.len() as i64)),
             ("length", [Dict(d)]) => Ok(Int(d.borrow().len() as i64)),
             ("length", [Str(s)]) => Ok(Int(s.chars().count() as i64)),
             ("isempty", [v]) => match v {
                 Arr(a) => Ok(Bool(a.borrow().is_empty())),
-                Vector(a) => Ok(Bool(a.borrow().is_empty())),
                 Dict(d) => Ok(Bool(d.borrow().is_empty())),
                 Str(s) => Ok(Bool(s.is_empty())),
                 other => Err(format!("isempty: not a collection, a {}", tag(other))),
@@ -675,7 +775,7 @@ impl Vm {
                 let mut out = Vec::new();
                 for v in vs {
                     match v {
-                        Arr(_) | Vector(_) | Tuple(_) => match iter_values(v) {
+                        Arr(_) | Tuple(_) => match iter_values(v) {
                             Ok(xs) => out.extend(xs),
                             Err(e) => return Some(Err(e)),
                         },
@@ -716,6 +816,122 @@ impl Vm {
                     _ => make_array_lit(out),
                 })
             }
+            ("count", [f, coll]) => {
+                let xs = match iter_values(coll) {
+                    Ok(xs) => xs,
+                    Err(e) => return Some(Err(e)),
+                };
+                let mut n = 0i64;
+                for x in xs {
+                    match self.apply(&f.clone(), vec![x]) {
+                        Ok(Bool(true)) => n += 1,
+                        Ok(Bool(false)) => {}
+                        Ok(other) => {
+                            return Some(Err(format!(
+                                "count: the test must answer Bool, got a {}",
+                                tag(&other)
+                            )))
+                        }
+                        Err(e) => return Some(Err(e)),
+                    }
+                }
+                Ok(Int(n))
+            }
+            ("all", [f, coll]) | ("any", [f, coll]) => {
+                let want_all = name == "all";
+                let xs = match iter_values(coll) {
+                    Ok(xs) => xs,
+                    Err(e) => return Some(Err(e)),
+                };
+                let mut answer = want_all;
+                for x in xs {
+                    match self.apply(&f.clone(), vec![x]) {
+                        Ok(Bool(b)) => {
+                            if b != want_all {
+                                answer = b;
+                                break;
+                            }
+                        }
+                        Ok(other) => {
+                            return Some(Err(format!(
+                                "{name}: the test must answer Bool, got a {}",
+                                tag(&other)
+                            )))
+                        }
+                        Err(e) => return Some(Err(e)),
+                    }
+                }
+                Ok(Bool(answer))
+            }
+            ("sum", [coll]) => {
+                let xs = match iter_values(coll) {
+                    Ok(xs) => xs,
+                    Err(e) => return Some(Err(e)),
+                };
+                let all_int = xs.iter().all(|v| matches!(v, Int(_)));
+                let mut fi = 0i64;
+                let mut ff = 0.0f64;
+                for x in &xs {
+                    match x {
+                        Int(n) => {
+                            fi += n;
+                            ff += *n as f64;
+                        }
+                        Float(f) => ff += f,
+                        other => {
+                            return Some(Err(format!("sum: not a number, a {}", tag(other))))
+                        }
+                    }
+                }
+                Ok(if all_int { Int(fi) } else { Float(ff) })
+            }
+            ("maximum", [coll]) | ("minimum", [coll]) => {
+                let want_max = name == "maximum";
+                let xs = match iter_values(coll) {
+                    Ok(xs) => xs,
+                    Err(e) => return Some(Err(e)),
+                };
+                let mut best: Option<Value> = None;
+                for x in xs {
+                    let take = match &best {
+                        None => true,
+                        Some(b) => match num_cmp(&x, b) {
+                            Some(o) => (o > 0) == want_max && o != 0,
+                            None => return Some(Err("maximum/minimum: not numbers".into())),
+                        },
+                    };
+                    if take {
+                        best = Some(x);
+                    }
+                }
+                best.ok_or_else(|| format!("{name}: the collection is empty"))
+            }
+            ("first", [coll]) => match iter_values(coll) {
+                Ok(xs) => xs.first().cloned().ok_or_else(|| "first: empty".to_string()),
+                Err(e) => Err(e),
+            },
+            ("last", [coll]) => match iter_values(coll) {
+                Ok(xs) => xs.last().cloned().ok_or_else(|| "last: empty".to_string()),
+                Err(e) => Err(e),
+            },
+            ("firstindex", [_]) => Ok(Int(1)),
+            ("lastindex", [coll]) => match coll {
+                Arr(a) => Ok(Int(a.borrow().len() as i64)),
+                Tuple(t) => Ok(Int(t.len() as i64)),
+                Str(s) => Ok(Int(s.chars().count() as i64)),
+                other => Err(format!("lastindex: not indexable, a {}", tag(other))),
+            },
+            ("abs", [Int(n)]) => Ok(Int(n.abs())),
+            ("abs", [Float(f)]) => Ok(Float(f.abs())),
+            ("sqrt", [Int(n)]) => Ok(Float((*n as f64).sqrt())),
+            ("sqrt", [Float(f)]) => Ok(Float(f.sqrt())),
+            ("min", [a, b]) | ("max", [a, b]) => {
+                let want_max = name == "max";
+                match num_cmp(a, b) {
+                    Some(o) => Ok(if (o > 0) == want_max { a.clone() } else { b.clone() }),
+                    None => Err(format!("{name}: not numbers")),
+                }
+            }
             ("map", [f, coll]) => {
                 let xs = match iter_values(coll) {
                     Ok(xs) => xs,
@@ -737,6 +953,14 @@ impl Vm {
     /// Calling a value rather than a name: a closure, and nothing else here.
     fn apply(&mut self, f: &Value, args: Vec<Value>) -> E<Value> {
         match f {
+            // re-enters dispatch on each call, so it really is the whole
+            // generic function -- not the one method that happened to exist
+            // when the name was read
+            Value::Generic(n) => {
+                let n = n.clone();
+                let env = self.global.clone().ok_or("nothing has been run yet")?;
+                self.call(&n, args, &env)
+            }
             Value::Closure(c) => {
                 let scope = Scope::child(&c.env);
                 for (k, v) in c.params.iter().zip(args) {
@@ -836,8 +1060,22 @@ impl Vm {
                     pc += 1;
                 }
                 Instr::Load(s, _) => {
-                    let v = lookup(&env, *s)
-                        .ok_or_else(|| format!("UndefVarError: {} not defined", self.sym(*s)))?;
+                    let v = match lookup(&env, *s) {
+                        Some(v) => v,
+                        // not a bound variable -- a bare FUNCTION name used as
+                        // a plain expression is that function, as a value
+                        None => {
+                            let name = self.sym_rc[*s as usize].clone();
+                            if self.methods.contains_key(&name) {
+                                Value::Generic(name)
+                            } else {
+                                return Err(format!(
+                                    "UndefVarError: {} not defined",
+                                    self.sym(*s)
+                                ));
+                            }
+                        }
+                    };
                     stack.push(v);
                     pc += 1;
                 }
@@ -866,8 +1104,17 @@ impl Vm {
                 Instr::Call(s, nargs, _) => {
                     let at = stack.len() - *nargs as usize;
                     let args: Vec<Value> = stack.split_off(at);
-                    let name = self.sym_rc[*s as usize].clone();
-                    let v = self.call(&name, args, &env)?;
+                    // a local holding a function wins over the name -- `f(x)`
+                    // inside `each(f, xs)` means the one that was passed in
+                    let v = match lookup(&env, *s) {
+                        Some(f @ (Value::Closure(_) | Value::Generic(_))) => {
+                            self.apply(&f, args)?
+                        }
+                        _ => {
+                            let name = self.sym_rc[*s as usize].clone();
+                            self.call(&name, args, &env)?
+                        }
+                    };
                     stack.push(v);
                     pc += 1;
                 }
@@ -972,6 +1219,24 @@ impl Vm {
                 }
                 Instr::Symbol(s) => {
                     stack.push(Value::Sym(Rc::from(self.sym(*s))));
+                    pc += 1;
+                }
+                Instr::Typeof => {
+                    let v = stack.pop().ok_or("vm: typeof wants a value")?;
+                    // Tsubaki has no first-class type value, so this is the
+                    // NAME -- which is what it prints as either way
+                    stack.push(Value::Str(Rc::from(tag(&v))));
+                    pc += 1;
+                }
+                Instr::Isa(t) => {
+                    let v = stack.pop().ok_or("vm: isa wants a value")?;
+                    let name = self.sym(*t).to_string();
+                    stack.push(Value::Bool(self.is_subtype(tag(&v), &name)));
+                    pc += 1;
+                }
+                Instr::Subtype(a, b) => {
+                    let (x, y) = (self.sym(*a).to_string(), self.sym(*b).to_string());
+                    stack.push(Value::Bool(self.is_subtype(&x, &y)));
                     pc += 1;
                 }
                 Instr::Identical(want) => {
@@ -1450,12 +1715,10 @@ fn unsupported_kind(i: &Instr) -> Option<&'static str> {
         | ModuleEnter(..) | ModuleLeave | Getfield(..) | Setfield(..) | SetEnd | Endmark
         | Index | IndexSet | LoadIndex(..) | IndexOrTyped(..) | Makeclosure(..) | Range
         | Range3 | IterNew | IterNext(..) | Comprehension(..) | Using(..) | Import(..)
-        | Qcall(..) | Apply(..) | In | BindTuple(..) | CallKw(..) => return None,
+        | Qcall(..) | Apply(..) | In | BindTuple(..) | CallKw(..) | Typeof | Isa(..)
+        | Subtype(..) => return None,
         Makematrix(..) => "a matrix",
         ApplyMethod(..) => "calling a method on a JS value",
-        Subtype(..) => "<:",
-        Typeof => "typeof",
-        Isa(..) => "isa",
         Typedarr(..) | TypedarrUndef(..) | TypedmatUndef(..) => "a typed array constructor",
         UnpackCheck(..) | Elem(..) | UnpackEnd => "a destructuring assignment",
         Typecheck(..) => "a type-annotated assignment",
@@ -1505,9 +1768,6 @@ fn iter_start(v: &Value) -> E<Iter> {
             Iter::Range(*a, *s, *b)
         }
         Value::Arr(a) => Iter::Vals(a.borrow().clone(), 0),
-        Value::Vector(a) => {
-            Iter::Vals(a.borrow().iter().map(|f| Value::Float(*f)).collect(), 0)
-        }
         Value::Tuple(t) => Iter::Vals(t.as_ref().clone(), 0),
         // a Dict iterates as its (key, value) pairs
         Value::Dict(d) => Iter::Vals(
@@ -1565,14 +1825,6 @@ fn index_get(c: &Value, i: &Value) -> E<Value> {
                 Ok(a[*n as usize - 1].clone())
             }
         }
-        (Value::Vector(a), Value::Int(n)) => {
-            let a = a.borrow();
-            if *n < 1 || *n as usize > a.len() {
-                Err(format!("BoundsError: index {n}"))
-            } else {
-                Ok(Value::Float(a[*n as usize - 1]))
-            }
-        }
         (Value::Tuple(t), Value::Int(n)) => {
             if *n < 1 || *n as usize > t.len() {
                 Err(format!("BoundsError: index {n}"))
@@ -1600,20 +1852,7 @@ fn index_get(c: &Value, i: &Value) -> E<Value> {
             }
             Ok(Value::Arr(Rc::new(RefCell::new(out))))
         }
-        (Value::Vector(a), Value::Range(lo, st, hi)) => {
-            let a = a.borrow();
-            let mut out = Vec::new();
-            let mut i = *lo;
-            while if *st > 0 { i <= *hi } else { i >= *hi } {
-                if i < 1 || i as usize > a.len() {
-                    return Err("BoundsError: slice index out of range".into());
-                }
-                out.push(a[i as usize - 1]);
-                i += *st;
-            }
-            Ok(Value::Vector(Rc::new(RefCell::new(out))))
-        }
-        (Value::Arr(_) | Value::Vector(_) | Value::Tuple(_), other) => {
+        (Value::Arr(_) | Value::Tuple(_), other) => {
             Err(format!("index must be an Int, got a {}", tag(other)))
         }
         (other, _) => Err(format!(
@@ -1632,20 +1871,6 @@ fn index_set(c: &Value, i: &Value, v: Value) -> E<()> {
             } else {
                 let at = *n as usize - 1;
                 a[at] = v;
-                Ok(())
-            }
-        }
-        (Value::Vector(a), Value::Int(n)) => {
-            let mut a = a.borrow_mut();
-            if *n < 1 || *n as usize > a.len() {
-                Err(format!("BoundsError: index {n}"))
-            } else {
-                let at = *n as usize - 1;
-                a[at] = match v {
-                    Value::Int(x) => x as f64,
-                    Value::Float(f) => f,
-                    other => return Err(format!("a Vector holds numbers, not a {}", tag(&other))),
-                };
                 Ok(())
             }
         }
@@ -1678,6 +1903,23 @@ fn bind_target(scope: &Rc<RefCell<Scope>>, t: &Target, v: Value) -> E<()> {
             tag(other)
         )),
     }
+}
+
+/// Comparing two numbers: -1, 0, 1 -- and None when either is not a number.
+fn num_cmp(a: &Value, b: &Value) -> Option<i32> {
+    let f = |v: &Value| match v {
+        Value::Int(n) => Some(*n as f64),
+        Value::Float(f) => Some(*f),
+        _ => None,
+    };
+    let (x, y) = (f(a)?, f(b)?);
+    Some(if x < y {
+        -1
+    } else if x > y {
+        1
+    } else {
+        0
+    })
 }
 
 fn as_int(v: &Value) -> i64 {

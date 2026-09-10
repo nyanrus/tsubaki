@@ -10,6 +10,7 @@
 //! (`Unsupported`) rather than guessing -- the same shape as Tocode's
 //! `Not_yet` on the folding side.
 
+pub mod json;
 pub mod tsb;
 pub mod vm;
 
@@ -22,6 +23,14 @@ use std::cell::RefCell;
 
 thread_local! {
     static OUT: RefCell<String> = RefCell::new(String::new());
+    /// The program stays up after it has run, so the host can call into it
+    /// (`ops.call("setup")` and the rest) -- the same way the OCaml side's
+    /// tsubakiEval/tsubakiCall share one persistent global scope.
+    static VM: RefCell<Option<vm::Vm>> = RefCell::new(None);
+}
+
+fn take(ptr: *const u8, len: usize) -> String {
+    String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(ptr, len) }).into_owned()
 }
 
 #[no_mangle]
@@ -49,16 +58,55 @@ pub extern "C" fn tsb_run(ptr: *const u8, len: usize) -> i32 {
             let mut machine = vm::Vm::new(p);
             let r = machine.run();
             let mut s = machine.output().to_string();
-            match r {
-                Ok(_) => (s, 0),
+            let code = match r {
+                Ok(_) => 0,
                 Err(e) => {
                     s.push_str(&format!("tsbvm: {e}\n"));
-                    (s, 1)
+                    1
                 }
-            }
+            };
+            VM.with(|v| *v.borrow_mut() = Some(machine));
+            (s, code)
         }
         Err(e) => (format!("tsbvm: {e}\n"), 1),
     };
+    OUT.with(|o| *o.borrow_mut() = text);
+    code
+}
+
+/// Call a function of the program that already ran. The arguments arrive as a
+/// JSON array and the answer leaves as JSON -- see json.rs for what that
+/// carries, and why it is the same meaning the OCaml side hands to JS.
+///
+/// Returns 0 and leaves the answer in the output buffer; 1 and leaves the
+/// reason there instead.
+#[no_mangle]
+pub extern "C" fn tsb_call(
+    name_ptr: *const u8,
+    name_len: usize,
+    args_ptr: *const u8,
+    args_len: usize,
+) -> i32 {
+    let name = take(name_ptr, name_len);
+    let args_json = take(args_ptr, args_len);
+    let args = match json::from_json(&args_json) {
+        Ok(vm::Value::Arr(a)) => a.borrow().clone(),
+        Ok(other) => vec![other],
+        Err(e) => {
+            OUT.with(|o| *o.borrow_mut() = format!("tsbvm: the arguments are not JSON: {e}"));
+            return 1;
+        }
+    };
+    let (text, code) = VM.with(|cell| match cell.borrow_mut().as_mut() {
+        None => ("tsbvm: nothing has been run yet".to_string(), 1),
+        Some(machine) => match machine.call_toplevel(&name, args) {
+            Ok(v) => match json::to_json(&v) {
+                Ok(j) => (j, 0),
+                Err(e) => (format!("tsbvm: {e}"), 1),
+            },
+            Err(e) => (format!("tsbvm: {e}"), 1),
+        },
+    });
     OUT.with(|o| *o.borrow_mut() = text);
     code
 }

@@ -16,19 +16,16 @@ one, are not).
     python3 tools/test.py                # run everything
     python3 tools/test.py dispatch mac   # only tests whose name contains one of these
     python3 tools/test.py --julia        # also cross-check the `# julia: yes` ones
-    python3 tools/test.py --vm           # run through the bytecode VM instead
     python3 tools/test.py --tsbvm        # run through the Rust VM (tsbvm/)
     python3 tools/test.py --update       # rewrite goldens from current output
 
---vm runs each test through --vm (fold to .tsb, read it back, execute) and
-compares against the SAME golden. A test whose shapes Tocode can't fold yet
-says so and is counted separately -- that count, and what it names, is the
-map of what the VM still needs. See bin/tocode.ml.
-
 --tsbvm folds each test with tsubakic and runs the bytes through the Rust VM
-(tsbvm/), comparing against the SAME golden. A test the Rust VM does not know
-enough for yet says so and is counted separately -- that count is the map of
-what it still needs.
+(tsbvm/) -- and compares against REAL JULIA, not against the golden. The Rust
+VM follows Julia where the OCaml runtime and Julia disagree (an all-Int array
+stays Int there, a struct prints without field names), so the goldens, which
+record what the OCaml runtime does, are the wrong reference for it. A test
+without `# julia: yes` has no reference here and is skipped. Needs julia on
+PATH. A shape the Rust VM does not know yet says so and is counted separately.
 
 --update exists so a deliberate change doesn't mean hand-editing 20 files.
 It records whatever comes out, including a regression -- read the diff it
@@ -60,24 +57,13 @@ def run(cmd, timeout=180, stdin=None):
     return (p.stdout + p.stderr).rstrip("\n")
 
 
-def run_tsubaki(path, vm=False):
+def run_tsubaki(path):
     # a test named repl_* is fed to the REPL on stdin instead of run as a
     # file -- same golden mechanism, exercising the interactive path
     if os.path.basename(path).startswith("repl"):
         with open(os.path.join(ROOT, path)) as f:
             return run(["node", "-r", "./preload.js", BINARY, "--repl"], stdin=f.read())
-    flags = ["--vm"] if vm else []
-    return run(["node", "-r", "./preload.js", BINARY] + flags + [path])
-
-
-NOT_YET = "tsubaki: --vm cannot fold "
-
-
-def not_yet_reason(output):
-    """The shape Tocode stopped on, or None if it didn't stop."""
-    if not output.startswith(NOT_YET):
-        return None
-    return output[len(NOT_YET):].split(" yet (")[0]
+    return run(["node", "-r", "./preload.js", BINARY, path])
 
 
 TSBVM = os.path.join("_build", "default", "bin", "tsbvm-check.tsb")
@@ -138,7 +124,6 @@ def main():
     ap.add_argument("filters", nargs="*", help="substring match on test name")
     ap.add_argument("--update", action="store_true", help="rewrite goldens")
     ap.add_argument("--julia", action="store_true", help="cross-check julia-compatible tests")
-    ap.add_argument("--vm", action="store_true", help="run through the bytecode VM (see bin/vm.ml)")
     ap.add_argument("--tsbvm", action="store_true", help="run through the Rust VM (see tsbvm/)")
     args = ap.parse_args()
 
@@ -164,10 +149,10 @@ def main():
         # machine's home directory into its golden
         jl = os.path.join("tests", name + ".jl")
         golden_path = os.path.join(TESTS, name + ".out")
-        if (args.vm or args.tsbvm) and name.startswith("repl"):
+        if args.tsbvm and name.startswith("repl"):
             # the REPL reads a line at a time; there is no .tsb to fold
             continue
-        actual = run_tsbvm(jl) if args.tsbvm else run_tsubaki(jl, vm=args.vm)
+        actual = run_tsbvm(jl) if args.tsbvm else run_tsubaki(jl)
 
         if args.update:
             with open(golden_path, "w") as f:
@@ -181,13 +166,23 @@ def main():
                 print("%snot yet%s %s %s(%s)%s" % (YELLOW, RESET, name, DIM, reason, RESET))
                 not_yet.append((name, reason))
                 continue
-
-        if args.vm:
-            reason = not_yet_reason(actual)
-            if reason is not None:
-                print("%snot yet%s %s %s(%s)%s" % (YELLOW, RESET, name, DIM, reason, RESET))
-                not_yet.append((name, reason))
+            # real Julia is the reference here, not the golden -- see the
+            # module docstring for why
+            with open(jl) as f:
+                if f.readline().strip() != "# julia: yes":
+                    print("%sno julia%s %s %s(not marked `# julia: yes`)%s"
+                          % (YELLOW, RESET, name, DIM, RESET))
+                    skipped += 1
+                    continue
+            expected = run_julia(jl)
+            if actual != expected:
+                print("%sFAIL%s %s %s(julia disagrees)%s" % (RED, RESET, name, DIM, RESET))
+                print(diff(expected, actual))
+                failed.append(name)
                 continue
+            print("%sok%s   %s %s(matches julia)%s" % (GREEN, RESET, name, DIM, RESET))
+            passed += 1
+            continue
 
         if not os.path.exists(golden_path):
             print("%sno golden%s %s -- run with --update once you've read its output"
