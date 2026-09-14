@@ -1,0 +1,5 @@
+fib(20) = 6765
+pisum() = 1.6448340718480652
+is_sorted(sortperf(5000)) = true
+first 0.0 last 4999.0
+sum(mandelperf()) = 14791

@@ -1,0 +1,14 @@
+caught: something went wrong
+  isa Exception: true, isa ErrorException: true
+  e.msg = something went wrong
+caught: MethodError: no method matching describe(String)
+  isa MethodError: true, isa DimensionMismatch: false
+caught: UndefVarError: nonexistent_name not defined  isa UndefVarError: true
+caught: TypeError: field n::Int cannot hold a String  isa TypeError: true
+caught: KeyError: key missing not found
+caught: BoundsError: index 10  isa BoundsError: true
+caught: DimensionMismatch: Matrix has 2 columns, Vector has 3 elements  isa DimensionMismatch: true
+caught a MyError, code = 42, isa MyError: true
+safe_div(6, 3) = 2.0, safe_div(1, 0) = -1.0
+caught from three frames down: from level 3
+still running

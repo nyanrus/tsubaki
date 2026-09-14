@@ -15,6 +15,10 @@
          correctly needs a genuinely different backing representation this
          round doesn't add. See `Runtime.wrap_fixed` for the actual
          mask/sign-extend logic. *)
+    | VModule of string
+      (* `module M ... end` そのもの。`M.x` は、これの member を読む形になる
+         (Julia でも module は値で、`typeof(M)` は `Module`)。中身は持たず、
+         名前だけ -- member は module_values / Dispatch.methods が持っている *)
     | VRange of int * int * int (* start, step, stop *)
     | VFRange of float * float * float (* start, step, stop -- a Float range, e.g. -1.0:0.1:1.0 *)
     | VVec of vecbuf (* numeric vector -- heap-allocated, grows dynamically *)
@@ -159,6 +163,19 @@
          `parse_type_expr`'s "Dict{Int,String}"). See `tag`'s own case for
          how this integrates with ordinary dispatch, and Types.ancestors
          for why a compound name like "Deque{Int}" can still reach "Any". *)
+    | VPair of value * value
+      (* real Julia's `Pair` (`"a" => 1`) -- what a Dict is written with, and
+         its own value the rest of the time (`p.first`, `p.second`). Deliberately
+         not a 2-Tuple in disguise: `("a", 1)` and `"a" => 1` show differently,
+         dispatch differently, and only one of them means "this goes in a Dict". *)
+    | VJS of Js_of_ocaml.Js.Unsafe.any
+      (* a JS value held AS IT IS: `document`, a `<browser>` element, Preact's
+         `h`. Nothing is copied -- this is the same object the host has, which
+         is the whole point (a copy of `document` is `document` lost). Values
+         still cross by copy in the direction where copying is what's wanted:
+         see js_of_value going out. Coming back, a field read or a call result
+         stops at the surface (value_of_js_shallow) and anything that isn't a
+         number/string/boolean/null stays one of these. *)
 
   (* backing storage for VVec/VArr: a physical array that may be BIGGER than
      the logical contents (`vlen`/`alen`), so push! can grow it geometrically
@@ -285,6 +302,68 @@
     let parent : (string, string) Hashtbl.t = Hashtbl.create 32
     let declare child ~parent:p = Hashtbl.replace parent child p
 
+    (* Real Julia spells the two default numeric types `Int64` and `Float64`;
+       Tsubaki's own tags are "Int" and "Float". `Int` is a real Julia alias
+       for `Int64`, so that half already agreed -- but `x::Float64`,
+       `Float64[]`, `Vector{Float64}(undef, n)` and `isa(x, Float64)` were all
+       simply wrong here, and they are the first thing anyone arriving from
+       Julia writes. `Float64[]` was the worst of them: it built a real
+       `Array{Float64}` that then refused every Float it was handed.
+
+       They are accepted as ALIASES rather than renaming the tags: "Int" and
+       "Float" appear as literal strings in about 120 method signatures across
+       runtime/compile/ecs/gpuBridge, and renaming those is a rewrite no type
+       checker would supervise. So a type name written in SOURCE is normalized
+       here, at each of the handful of points where one enters the system
+       (Runtime.resolve_type_name, Eval's ETypeExpr / typed-array and -matrix
+       constructors / `isa` / `::Type{...}` patterns). Nothing downstream --
+       dispatch, `tag`, the hierarchy -- ever sees the alias.
+
+       `typeof(1.0)` still answers "Float", not "Float64": that is the tag,
+       and changing it is the rename above. See tests/known_gaps.jl. *)
+    let alias = function "Float64" -> "Float" | "Int64" -> "Int" | n -> n
+
+    (* `{...}` の中身を、この階のコンマで割る。入れ子の中のコンマは、この階の
+       区切りではない(`Vector{Tuple{Int,Int}}` の中身は一つ)。中身が空なら
+       ゼロ個 -- `Tuple{}` は「名前が一つ、それが空」ではない。
+
+       canonical と parse_concrete が**同じ割りかた**をするように、一つに
+       してある。前は parse_concrete のほうだけが素朴に `,` で割っていて、
+       入れ子が来ると壊れていた(タプルが中身の型を持つようになって、
+       `Vector{Tuple{Int,Int}}` が普通に出てくるようになった) *)
+    let split_params (inner : string) : string list =
+      if inner = "" then []
+      else (
+        let parts = ref [] and buf = Buffer.create 16 and depth = ref 0 in
+        String.iter
+          (fun c ->
+            match c with
+            | '{' ->
+              incr depth;
+              Buffer.add_char buf c
+            | '}' ->
+              decr depth;
+              Buffer.add_char buf c
+            | ',' when !depth = 0 ->
+              parts := Buffer.contents buf :: !parts;
+              Buffer.clear buf
+            | c -> Buffer.add_char buf c)
+          inner;
+        parts := Buffer.contents buf :: !parts;
+        List.rev !parts)
+
+    (* like `alias`, but reaching inside a parametric name too, so
+       `Dict{Int64,Float64}` and `Pair{Int64,Box{Float64}}` normalize as
+       whole. *)
+    let rec canonical (n : string) : string =
+      let len = String.length n in
+      match String.index_opt n '{' with
+      | Some i when len > 0 && n.[len - 1] = '}' ->
+        let inner = String.sub n (i + 1) (len - i - 2) in
+        let parts = List.map (fun s -> canonical (String.trim s)) (split_params inner) in
+        alias (String.sub n 0 i) ^ "{" ^ String.concat "," parts ^ "}"
+      | _ -> alias n
+
     (* splits a concrete instantiation's name into its base and parameters,
        e.g. "Array{Int}" -> Some ("Array", ["Int"]), "Pair{Int,String}" ->
        Some ("Pair", ["Int"; "String"]), "Any" -> None *)
@@ -294,7 +373,7 @@
       | Some i ->
         let base = String.sub name 0 i in
         let inner = String.sub name (i + 1) (String.length name - i - 2) in
-        Some (base, String.split_on_char ',' inner)
+        Some (base, split_params inner)
 
     let ancestors name =
       let rec go n acc =
@@ -323,6 +402,25 @@
        for nested parametrics (`Array{Array{Int}} <: Array{Array{Number}}`)
        for free, though nothing in this project actually nests that deep. *)
     let rec distance_to sub sup =
+      (* 中身を言わない `Tuple` は、Julia では `Tuple{Vararg{Any}}` -- 中身を
+         ぜんぶ `Any` と書いた形の、さらに一つ外。だから中身を言っている相手
+         (`Tuple{Number,Number}`)のほうが、いつでも近くなければならない。
+         `ancestors` は `Tuple{...}` の親を `Tuple` としか言えず、それだと
+         一つ隣(1)になってしまって、素の `Tuple` が何にでも勝つ *)
+      match sup with
+      | "Tuple" -> (
+        (* sup を先に見てから中身を割る -- distance_to は呼び出しのたびに
+           dispatch から来るので、ほかの型の道に字の走査を置かない *)
+        match parse_concrete sub with
+        | Some ("Tuple", params) ->
+          let ds = List.map (fun p -> distance_to (String.trim p) "Any") params in
+          if List.for_all Option.is_some ds then
+            Some (2 + List.fold_left max 0 (List.map Option.get ds))
+          else None
+        | _ -> distance_below sub sup)
+      | _ -> distance_below sub sup
+
+    and distance_below sub sup =
       let rec idx i = function
         | [] -> None
         | x :: xs -> if x = sup then Some i else idx (i + 1) xs
@@ -381,6 +479,8 @@
         ; "Dict", "Any"
         ; "Symbol", "Any"
         ; "Expr", "Any"
+        ; "JSValue", "Any"
+        ; "Pair", "Any"
         ; "UniformScaling", "Any"
         ; (* deliberately "Any", NOT "Vector"/"Matrix" -- every existing
              `[["Vector"]]`/`[["Matrix"]]`-signature method in this file
@@ -461,6 +561,8 @@
   let tag_uint8 = "UInt8"
   let tag_uint16 = "UInt16"
   let tag_uint32 = "UInt32"
+  let tag_jsvalue = "JSValue"
+  let tag_pair = "Pair"
 
   let fixed_int_tag bits signed =
     match bits, signed with
@@ -485,6 +587,7 @@
       if signed && (m lsr (bits - 1)) land 1 = 1 then m - (1 lsl bits) else m)
 
   let rec tag = function
+    | VModule _ -> "Module"
     | VInt _ -> tag_int
     | VFloat _ -> tag_float
     | VBool _ -> tag_bool
@@ -520,11 +623,20 @@
         concrete)
     | VStruct s -> s.kind
     | VClosure _ -> tag_function
-    | VTuple _ -> tag_tuple
+    (* Julia のタプルは中身の型を持つ -- `(1, 2)` は `Tuple{Int,Int}`。
+       綴りは `Types.canonical` が注釈を直す綴りと同じにする(空白を入れず、
+       書くほうの名前)。でないと `t::Tuple{Int64, Int64}` と噛み合わない。
+       `Types.declare` は要らない -- 合成名は `Types.ancestors` の落ちどころが
+       自分の base(`Tuple`)の鎖に載せてくれる。 *)
+    | VTuple vs ->
+      Printf.sprintf "%s{%s}" tag_tuple
+        (String.concat "," (Array.to_list (Array.map tag vs)))
     | VComplex _ -> tag_complex
     | VRational _ -> tag_rational
     | VSymbol _ -> tag_symbol
     | VExpr _ -> tag_expr
+    | VJS _ -> tag_jsvalue
+    | VPair _ -> tag_pair
     | VDict _ -> tag_dict
     | VUniformScaling _ -> tag_uniform_scaling
     | VComplexVec _ -> tag_complex_vec
@@ -538,33 +650,80 @@
       Types.declare concrete ~parent:"Type";
       concrete
 
+  (* How a float is DISPLAYED -- real Julia's own rule, both halves of it.
+     This used to be `%.3f`, which is not a formatting preference but a lie:
+     it printed 1.5e-8 as "0.000", -0.0 as "0.000", and 1e100 as a hundred-
+     and-one digit fixed-point number. This file's own pisum benchmark
+     printed its answer as "1.645" while claiming to match real Julia's
+     1.6449340668 -- true, and unverifiable from the output.
+
+     Julia prints the SHORTEST decimal that reads back as the exact same
+     float (so `0.1 + 0.2` shows its real value, `0.30000000000000004`, not
+     a rounded one), and switches to scientific notation outside decimal
+     exponents -4..5 -- checked against real Julia 1.12.5 across magnitudes
+     from 1e-300 to 1e100, not assumed. A float always keeps a fractional
+     part, so it never reads back as an Int. *)
+  let float_repr (f : float) : string =
+    if Float.is_nan f then "NaN"
+    else if f = Float.infinity then "Inf"
+    else if f = Float.neg_infinity then "-Inf"
+    else if f = 0.0 then if 1.0 /. f < 0.0 then "-0.0" else "0.0"
+    else begin
+      (* fewest significant digits that still round-trips, as normalized
+         "d.ddde±XX" -- 17 always suffices for a binary64 *)
+      let rec shortest p =
+        let s = Printf.sprintf "%.*e" p f in
+        if p >= 16 || float_of_string s = f then s else shortest (p + 1)
+      in
+      let s = shortest 0 in
+      let epos = String.index s 'e' in
+      let mant = String.sub s 0 epos in
+      let exp = int_of_string (String.sub s (epos + 1) (String.length s - epos - 1)) in
+      let neg = mant.[0] = '-' in
+      let mant = if neg then String.sub mant 1 (String.length mant - 1) else mant in
+      let digits = String.concat "" (String.split_on_char '.' mant) in
+      let nd = String.length digits in
+      let sign = if neg then "-" else "" in
+      if exp >= -4 && exp <= 5 then
+        if exp >= 0 then begin
+          let int_len = exp + 1 in
+          if nd <= int_len then sign ^ digits ^ String.make (int_len - nd) '0' ^ ".0"
+          else sign ^ String.sub digits 0 int_len ^ "." ^ String.sub digits int_len (nd - int_len)
+        end
+        else sign ^ "0." ^ String.make ((-exp) - 1) '0' ^ digits
+      else begin
+        let frac = if nd = 1 then "0" else String.sub digits 1 (nd - 1) in
+        Printf.sprintf "%s%c.%se%d" sign digits.[0] frac exp
+      end
+    end
+
   (* shared by VComplex/VComplexVec/VComplexMat's own `show` cases below *)
-  let show_complex_pair re im = Printf.sprintf "%.3f %s %.3fim" re (if im < 0.0 then "-" else "+") (Float.abs im)
+  let show_complex_pair re im =
+    Printf.sprintf "%s %s %sim" (float_repr re) (if im < 0.0 then "-" else "+") (float_repr (Float.abs im))
 
   let rec show = function
+    | VModule n -> n
     | VInt n -> string_of_int n
-    | VFloat f -> Printf.sprintf "%.3f" f
+    | VFloat f -> float_repr f
     | VBool b -> string_of_bool b
     | VStr s -> s
     | VNothing -> "nothing"
     | VRange (a, 1, b) -> Printf.sprintf "%d:%d" a b
     | VRange (a, s, b) -> Printf.sprintf "%d:%d:%d" a s b
-    | VFRange (a, s, b) when s = 1.0 -> Printf.sprintf "%.3f:%.3f" a b
-    | VFRange (a, s, b) -> Printf.sprintf "%.3f:%.3f:%.3f" a s b
-    | VVec v -> "[" ^ String.concat ", " (Array.to_list (Array.map string_of_float (vecbuf_to_array v))) ^ "]"
-    | VArr { cells; _ } -> "[" ^ String.concat ", " (Array.to_list (Array.map show (arrbuf_to_array cells))) ^ "]"
+    | VFRange (a, s, b) when s = 1.0 -> Printf.sprintf "%s:%s" (float_repr a) (float_repr b)
+    | VFRange (a, s, b) -> Printf.sprintf "%s:%s:%s" (float_repr a) (float_repr s) (float_repr b)
+    | VVec v -> "[" ^ String.concat ", " (Array.to_list (Array.map float_repr (vecbuf_to_array v))) ^ "]"
+    | VArr { cells; _ } -> "[" ^ String.concat ", " (Array.to_list (Array.map show_elem (arrbuf_to_array cells))) ^ "]"
     | VMat rows ->
       "["
       ^ String.concat "; "
           (Array.to_list
-             (Array.map
-                (fun row -> String.concat " " (Array.to_list (Array.map string_of_float row)))
-                rows))
+             (Array.map (fun row -> String.concat " " (Array.to_list (Array.map float_repr row))) rows))
       ^ "]"
     | VGenMat { rows; cols; cells; _ } ->
       "["
       ^ String.concat "; "
-          (List.init rows (fun i -> String.concat " " (List.init cols (fun j -> show cells.((i * cols) + j)))))
+          (List.init rows (fun i -> String.concat " " (List.init cols (fun j -> show_elem cells.((i * cols) + j)))))
       ^ "]"
     | VStruct { kind = "ErrorException"; fields } ->
       (* real Julia's own `ErrorException` shows as just the bare message,
@@ -588,9 +747,10 @@
        | None -> kind)
     | VStruct s ->
       s.kind ^ "("
-      ^ String.concat ", " (Array.to_list (Array.map (fun (n, r) -> n ^ "=" ^ show !r) s.fields))
+      ^ String.concat ", " (Array.to_list (Array.map (fun (n, r) -> n ^ "=" ^ show_elem !r) s.fields))
       ^ ")"
     | VClosure _ -> "#<function>"
+    | VJS x -> "JSValue(" ^ Js_of_ocaml.Js.to_string (Js_of_ocaml.Js.typeof x) ^ ")"
     | VDict d ->
       (* real Julia's own display shape, minus the {K,V} it can't know here.
          Insertion order (see dict_pairs), so this is reproducible. *)
@@ -598,14 +758,15 @@
         Hashtbl.fold (fun _ (seq, k, v) acc -> (seq, k, v) :: acc) d.dtbl []
         |> List.sort (fun (a, _, _) (b, _, _) -> compare a b)
       in
-      "Dict(" ^ String.concat ", " (List.map (fun (_, k, v) -> show k ^ " => " ^ show v) pairs) ^ ")"
-    | VTuple vs -> "(" ^ String.concat ", " (Array.to_list (Array.map show vs)) ^ ")"
+      "Dict(" ^ String.concat ", " (List.map (fun (_, k, v) -> show_elem k ^ " => " ^ show_elem v) pairs) ^ ")"
+    | VTuple vs -> "(" ^ String.concat ", " (Array.to_list (Array.map show_elem vs)) ^ ")"
+    | VPair (a, b) -> show_elem a ^ " => " ^ show_elem b
     | VComplex (re, im) -> show_complex_pair re im
     | VRational (n, d) -> Printf.sprintf "%d//%d" n d
     | VSymbol (name, _) -> ":" ^ name
     | VExpr { head; args } ->
       ":(" ^ head ^ " " ^ String.concat " " (Array.to_list (Array.map show args)) ^ ")"
-    | VUniformScaling c -> if c = 1.0 then "I" else Printf.sprintf "%.3f*I" c
+    | VUniformScaling c -> if c = 1.0 then "I" else float_repr c ^ "*I"
     | VComplexVec v ->
       "[" ^ String.concat ", " (Array.to_list (Array.map (fun (re, im) -> show_complex_pair re im) !v)) ^ "]"
     | VComplexMat rows ->
@@ -625,9 +786,120 @@
     | VFixedInt { v; _ } -> string_of_int v
     | VType s -> s
 
+  (* An element shown INSIDE a container, where real Julia switches from
+     `print` to `show`: a bare `println("hi")` prints hi, but the same string
+     inside a Vector/Tuple/Dict/struct prints "hi", quotes and all -- which is
+     the difference between reading a container's contents and guessing at
+     them (`(1, a)` gave no way to tell the string "a" from a variable's
+     value). Nothing else displays differently between the two. *)
+  and show_elem = function
+    | VStr s ->
+      let b = Buffer.create (String.length s + 2) in
+      Buffer.add_char b '"';
+      String.iter
+        (fun c ->
+          match c with
+          | '"' -> Buffer.add_string b "\\\""
+          | '\\' -> Buffer.add_string b "\\\\"
+          | '\n' -> Buffer.add_string b "\\n"
+          | '\t' -> Buffer.add_string b "\\t"
+          | c -> Buffer.add_char b c)
+        s;
+      Buffer.add_char b '"';
+      Buffer.contents b
+    | v -> show v
+
+  (* --- values crossing to the JS host ---------------------------------
+     Two directions, and deliberately not symmetric.
+
+     OUT (`js_of_value`) COPIES, deeply: a Dict becomes a plain object, an
+     Array an Array, a closure a real JS function. That is what a host
+     function -- `h(tag, props, children)`, `addEventListener` -- wants to be
+     handed, and none of it is something Tsubaki still has a claim on
+     afterwards.
+
+     IN (`value_of_js_shallow`) does NOT copy: a number/string/boolean/null
+     becomes the Tsubaki value it obviously is, and everything else stays a
+     `VJS` handle. So a field read and a call result both stop at the
+     surface, and `document` survives being touched. `fromjs(x)` (see
+     JsBridge) is the deep read, for a JS object that really is only data. *)
+  let value_of_js_shallow (x : Js_of_ocaml.Js.Unsafe.any) : value =
+    let open Js_of_ocaml in
+    match Js.to_string (Js.typeof x) with
+    | "number" ->
+      let f = Js.float_of_number (Js.Unsafe.coerce x) in
+      if Float.is_integer f && Float.abs f < 9007199254740992.0 then VInt (int_of_float f) else VFloat f
+    | "string" -> VStr (Js.to_string (Js.Unsafe.coerce x))
+    | "boolean" -> VBool (Js.to_bool (Js.Unsafe.coerce x))
+    | "undefined" -> VNothing
+    | _ -> if x == Js.Unsafe.inject Js.null then VNothing else VJS x
+
+  let rec js_of_value (v : value) : Js_of_ocaml.Js.Unsafe.any =
+    let open Js_of_ocaml in
+    let inject = Js.Unsafe.inject in
+    let num f = inject (Js.number_of_float f) in
+    match v with
+    | VInt i -> num (float_of_int i)
+    | VFloat f -> num f
+    | VFixedInt { v; _ } -> num (float_of_int v)
+    | VBool b -> inject (Js.bool b)
+    | VStr s -> inject (Js.string s)
+    | VNothing -> inject Js.null
+    | VJS x -> x
+    | VVec { vdata; vlen } -> inject (Js.array (Array.init vlen (fun i -> Js.number_of_float vdata.(i))))
+    | VArr { cells; _ } -> inject (Js.array (Array.init cells.alen (fun i -> js_of_value cells.adata.(i))))
+    | VTuple a -> inject (Js.array (Array.map js_of_value a))
+    | VPair (a, b) -> inject (Js.array [| js_of_value a; js_of_value b |])
+    | VDict d ->
+      let entries = Hashtbl.fold (fun _ (stamp, k, v) acc -> (stamp, k, v) :: acc) d.dtbl [] in
+      let entries = List.sort (fun (a, _, _) (b, _, _) -> compare a b) entries in
+      let key = function VStr s -> s | VSymbol (s, _) -> s | k -> show k in
+      Js.Unsafe.obj (Array.of_list (List.map (fun (_, k, v) -> (key k, js_of_value v)) entries))
+    | VStruct { kind; fields } ->
+      Js.Unsafe.obj
+        (Array.append
+           [| ("__type", inject (Js.string kind)) |]
+           (Array.map (fun (n, r) -> (n, js_of_value !r)) fields))
+    | VClosure (arity, impl) ->
+      (* handed over as a real JS function -- an event listener, a Preact
+         `onClick`. JS calls it with whatever it likes; the closure receives
+         exactly as many arguments as it declared (any it doesn't get is
+         `nothing`), so `() -> refresh()` survives being called with an
+         event. *)
+      inject
+        (Js.Unsafe.callback_with_arguments (fun (args : Js.Unsafe.any_js_array) ->
+             let args : Js.Unsafe.any Js.js_array Js.t = Js.Unsafe.coerce args in
+             let arg i =
+               match Js.Optdef.to_option (Js.array_get args i) with
+               | Some a -> value_of_js_shallow a
+               | None -> VNothing
+             in
+             js_of_value (impl (List.init arity arg))))
+    | other -> inject (Js.string (show other))
+
   (* --- struct field access, the thing that replaces bespoke record types --- *)
+  (* `module M ... end` の中で置かれた**値**。関数と型はもう名前空間を持って
+     いる(Dispatch.methods / struct_defs が "M.name" で覚えている)けれど、
+     値の束縛だけが行き場を持っていなかった -- Julia では module の中の
+     `const x = 1` も `M.x` で読める。鍵は "M.x"。 *)
+  let module_values : (string, value) Hashtbl.t = Hashtbl.create 16
+
+  (* その名前は module か。表がまだ下に居るので、ここは口だけ開けておく
+     (Dispatch と struct_defs が出そろってから差し込む -- register_inlinable
+     などと同じ形) *)
+  let is_module_name : (string -> bool) ref = ref (fun _ -> false)
+
   let get_field v name =
     match v with
+    (* `M.x` -- module の中で置かれた値。入れ子の module も、そのまま次の `.`
+       が読める(`Outer.Inner.b`) *)
+    | VModule m -> (
+      let full = m ^ "." ^ name in
+      match Hashtbl.find_opt module_values full with
+      | Some v -> v
+      | None ->
+        if !is_module_name full then VModule full
+        else failwith (Printf.sprintf "UndefVarError: %s not defined" full))
     | VStruct s -> (
       match Array.find_opt (fun (n, _) -> n = name) s.fields with
       | Some (_, r) -> !r
@@ -642,6 +914,18 @@
       | "head" -> VSymbol (head, None)
       | "args" -> VArr { declared = None; cells = arrbuf_of_array (Array.copy args) }
       | _ -> failwith (Printf.sprintf "Expr has no field %s (only .head/.args)" name))
+    | VPair (a, b) -> (
+      match name with
+      | "first" -> a
+      | "second" -> b
+      | _ -> failwith (Printf.sprintf "Pair has no field %s (only .first/.second)" name))
+    | VJS x ->
+      (* a property of a JS object, read at the surface -- `el.value`,
+         `win.document`. A method read this way arrives UNBOUND (a plain
+         handle to the function); calling it as `obj.meth(...)` keeps the
+         receiver instead, which is why Eval takes that shape apart itself
+         rather than reading the field first. *)
+      value_of_js_shallow (Js_of_ocaml.Js.Unsafe.get x (Js_of_ocaml.Js.string name))
     | _ -> failwith (Printf.sprintf "%s is not a struct, has no fields" (tag v))
 
   let as_float = function
@@ -740,6 +1024,31 @@
 
   let mk_dict () : value = VDict { dtbl = Hashtbl.create 8; dnext = 0 }
 
+  (* the deep read coming IN -- the counterpart of what js_of_value already
+     does going out. Reached only when asked for (`fromjs`), never behind the
+     reader's back: an object becomes a Dict, an all-numeric Array a Vector.
+     A function stays a handle, because there is nothing to copy it into. *)
+  let rec value_of_js (x : Js_of_ocaml.Js.Unsafe.any) : value =
+    let open Js_of_ocaml in
+    let is_array () = Js.to_bool (Js.Unsafe.fun_call (Js.Unsafe.js_expr "Array.isArray") [| x |]) in
+    if Js.to_string (Js.typeof x) <> "object" || x == Js.Unsafe.inject Js.null then value_of_js_shallow x
+    else if is_array () then (
+      let arr = Js.to_array (Js.Unsafe.coerce x) in
+      let all_numbers = Array.for_all (fun e -> Js.to_string (Js.typeof e) = "number") arr in
+      if all_numbers then VVec (vecbuf_of_array (Array.map (fun e -> Js.float_of_number (Js.Unsafe.coerce e)) arr))
+      else (
+        let cells = Array.map value_of_js arr in
+        VArr { declared = None; cells = { adata = cells; alen = Array.length cells; atag = None } }))
+    else (
+      let d = { dtbl = Hashtbl.create 8; dnext = 0 } in
+      let keys = Js.to_array (Js.Unsafe.fun_call (Js.Unsafe.js_expr "Object.keys") [| x |]) in
+      Array.iter
+        (fun k ->
+          let ks = Js.to_string k in
+          dict_set d (VStr ks) (value_of_js (Js.Unsafe.get x (Js.string ks))))
+        keys;
+      VDict d)
+
   (* an inferred (not `Matrix{T}(undef,...)`-declared) generic Matrix -- what
      an elementwise op on VGenMat operands produces *)
   let mk_gen_mat (rows : int) (cols : int) (cells : value array) : value = VGenMat { declared = None; rows; cols; cells }
@@ -772,6 +1081,78 @@
      file's own directory while it runs, so includes nest correctly. Set by
      Main for the top-level script, pushed/popped by Eval's `include`. *)
   let current_file_dir : string ref = ref ""
+
+  (* Where execution currently IS: the source file's name and the line of the
+     statement being run. `current_line` is set by evaluating an `SLine`
+     marker (see Ast) -- the whole reason those markers exist. Together they
+     turn "MethodError: no method matching describe(String)" into the same
+     message with a place attached.
+
+     The frame stack holds what lies between the top level and here: for each
+     call, the function's name and the line its CALLER was on, which is what
+     makes a traceback readable ("f, called from line 12"). Pushed and popped
+     around every tree-walked call in Eval.
+
+     Two parallel growable arrays, not a list of tuples. A list allocated two
+     blocks on EVERY call, which measured at +14% on `fib(25)` -- this
+     interpreter's most call-dense benchmark -- and that is far too much to
+     pay for something only an error ever reads. A push is now two array
+     writes and an increment; a pop is a decrement; and a real list is built
+     only where one is genuinely wanted, at the moment an error is captured. *)
+  let current_file : string ref = ref ""
+  let current_line : int ref = ref 0
+  let frame_names = ref (Array.make 256 "")
+  let frame_lines = ref (Array.make 256 0)
+  let frame_top = ref 0
+
+  let push_frame name line =
+    let cap = Array.length !frame_names in
+    if !frame_top >= cap then (
+      let names' = Array.make (cap * 2) "" and lines' = Array.make (cap * 2) 0 in
+      Array.blit !frame_names 0 names' 0 cap;
+      Array.blit !frame_lines 0 lines' 0 cap;
+      frame_names := names';
+      frame_lines := lines');
+    !frame_names.(!frame_top) <- name;
+    !frame_lines.(!frame_top) <- line;
+    incr frame_top
+
+  let pop_frame () = if !frame_top > 0 then decr frame_top
+
+  (* the live frames, innermost first *)
+  let frames_snapshot () =
+    List.init !frame_top (fun i ->
+        let j = !frame_top - 1 - i in
+        !frame_names.(j), !frame_lines.(j))
+
+  (* Everything an error report needs is simply where execution stood when the
+     error was raised -- nothing unwinds it on the way out (see Eval's
+     tree_walk_impl), so `current_file`, `current_line` and the frames are
+     still exactly there by the time the top level prints them.
+
+     Which means whoever CATCHES an error is the one who has to put things
+     back: Eval's STry saves this triple on the way in and restores it in its
+     handler, and the REPL does the same around each entry. *)
+  type site = { s_file : string; s_line : int; s_top : int }
+
+  let here () = { s_file = !current_file; s_line = !current_line; s_top = !frame_top }
+
+  let restore_site s =
+    current_file := s.s_file;
+    current_line := s.s_line;
+    frame_top := s.s_top
+
+  (* Whether execution is currently inside a Tsubaki function's body. A frame
+     is pushed only by a tree-walked call, which is exactly the question --
+     used by Eval's `function` declaration to decide whether the name being
+     declared is a local of the call that is running, or a global. *)
+  let inside_function_body () = !frame_top > 0
+
+
+  (* "file:line", "" if unknown (the built-in demo has no file, and nothing
+     has run yet at startup) *)
+  let position_of file line =
+    if line = 0 then "" else if file = "" then Printf.sprintf "line %d" line else Printf.sprintf "%s:%d" file line
 
   (* a side-channel like current_module_prefix above: `Some name` while one
      of struct `name`'s own inner constructors is running (set right before
@@ -819,6 +1200,9 @@
      placeholder like "T" is never itself a registered type, so it always
      safely falls through unchanged regardless. *)
   let resolve_type_name n =
+    (* real Julia's `Float64`/`Int64` spellings normalize to this file's own
+       tags first, before any module qualification -- see Types.canonical *)
+    let n = Types.canonical n in
     if !current_module_prefix = "" then n
     else (
       match String.index_opt n '{' with
@@ -871,7 +1255,9 @@
   module Dispatch = struct
     (* each parameter's declared type is a list of alternatives -- a plain type
        is a singleton, "Any" is ["Any"], and Union{A,B,C} is ["A";"B";"C"] *)
-    type method_ = { sig_ : string list list; impl : value list -> value }
+    (* `vararg` は `f(a, xs...)` -- 最後の alt は「残り全部が、これ」を言う。
+       数が合っていなくても applicable になるのは、この一つだけ。 *)
+    type method_ = { sig_ : string list list; vararg : bool; impl : value list -> value }
 
     let methods : (string, method_ list) Hashtbl.t = Hashtbl.create 64
 
@@ -880,26 +1266,68 @@
        changed since you were resolved, redo the full lookup" *)
     let generation = ref 0
 
-    let defmethod name sig_ impl =
+    let defmethod ?(vararg = false) name sig_ impl =
       incr generation;
       let existing = Option.value (Hashtbl.find_opt methods name) ~default:[] in
       (* redefining a method with the exact same signature replaces it --
          matching real Julia -- rather than accumulating an ever-growing
          pile of identical, eventually-ambiguous candidates *)
-      let existing = List.filter (fun m -> m.sig_ <> sig_) existing in
-      Hashtbl.replace methods name ({ sig_; impl } :: existing)
+      let existing = List.filter (fun m -> not (m.sig_ = sig_ && m.vararg = vararg)) existing in
+      Hashtbl.replace methods name ({ sig_; vararg; impl } :: existing)
+
+    let rec take n = function [] -> [] | _ when n <= 0 -> [] | x :: rest -> x :: take (n - 1) rest
+    let rec drop n = function [] -> [] | l when n <= 0 -> l | _ :: rest -> drop (n - 1) rest
 
     let matches_alt arg alts = List.exists (fun alt -> Types.distance_to arg alt <> None) alts
     let best_distance arg alts = List.filter_map (Types.distance_to arg) alts |> List.fold_left min max_int
 
-    let applicable m arg_tags =
-      List.length m.sig_ = List.length arg_tags
-      && List.for_all2 (fun alts arg -> matches_alt arg alts) m.sig_ arg_tags
+    (* `f(a, xs...)` は「最初の n-1 個が名前どおりで、残りは全部おしまいの
+       alt」。残りがゼロ個でもいい(`f(1)` は `f(a, xs...)` に当たって、
+       xs は空のタプルになる)。 *)
+    let split_last l =
+      match List.rev l with
+      | [] -> [], []
+      | last :: rev_init -> List.rev rev_init, [ last ]
 
+    let applicable m arg_tags =
+      if not m.vararg then
+        List.length m.sig_ = List.length arg_tags
+        && List.for_all2 (fun alts arg -> matches_alt arg alts) m.sig_ arg_tags
+      else (
+        let fixed, rest_alt = split_last m.sig_ in
+        let n = List.length fixed in
+        List.length arg_tags >= n
+        && List.for_all2 (fun alts arg -> matches_alt arg alts) fixed (take n arg_tags)
+        &&
+        match rest_alt with
+        | [ alts ] -> List.for_all (fun arg -> matches_alt arg alts) (drop n arg_tags)
+        | _ -> true)
+
+    (* 遠さの合計。`...` で受けたものは、数がぴったりの method に負けるように
+       一つ余分に足す -- Julia でも `f(a, b)` が `f(a, xs...)` より先に選ばれる *)
     let specificity m arg_tags =
-      List.fold_left2 (fun acc alts arg -> acc + best_distance arg alts) 0 m.sig_ arg_tags
+      if not m.vararg then
+        List.fold_left2 (fun acc alts arg -> acc + best_distance arg alts) 0 m.sig_ arg_tags
+      else (
+        let fixed, rest_alt = split_last m.sig_ in
+        let n = List.length fixed in
+        let acc = List.fold_left2 (fun acc alts arg -> acc + best_distance arg alts) 0 fixed (take n arg_tags) in
+        let acc =
+          match rest_alt with
+          | [ alts ] -> List.fold_left (fun acc arg -> acc + best_distance arg alts) acc (drop n arg_tags)
+          | _ -> acc
+        in
+        acc + 1)
 
     let show_sig sig_ = String.concat ", " (List.map (String.concat "|") sig_)
+
+    (* a の署名は b の署名に収まるか(どの場所でも、a の型が b の型の中)。
+       これが Julia の「どちらが狭いか」で、遠さの合計とは別のものさし --
+       `f(x::Int, y)` と `f(x, y::Float64)` は `f(1, 1.0)` にどちらも当たる
+       けれど、どちらが狭いとも言えない。そこで Julia は決めない。 *)
+    let alts_within x y = List.for_all (fun xa -> List.exists (fun ya -> Types.distance_to xa ya <> None) y) x
+
+    let sig_within a b = List.length a = List.length b && List.for_all2 alts_within a b
 
     (* the actual resolution algorithm, shared by both the uncached and the
        inline-cached call paths below *)
@@ -914,11 +1342,24 @@
         let scored = List.map (fun m -> specificity m arg_tags, m) ms in
         let sorted = List.sort (fun (s1, _) (s2, _) -> compare s1 s2) scored in
         match sorted with
-        | (best, m1) :: (second, _) :: _ when second = best ->
-          failwith
-            (Printf.sprintf "MethodError: ambiguous method for %s(%s) -- signature (%s) ties"
-               name (String.concat ", " arg_tags) (show_sig m1.sig_))
-        | (_, m) :: _ -> m
+        | (_, m) :: rest ->
+          (* いちばん近いものが、ほかのどれとも「どちらが狭いとも言えない」
+             ままなら、決めない。引数の数の扱いが違うもの(`...` や既定つき)は、
+             そこで先に決まっているので見ない *)
+          List.iter
+            (fun (_, other) ->
+              if
+                (not m.vararg) && (not other.vararg)
+                && List.length m.sig_ = List.length other.sig_
+                && (not (sig_within m.sig_ other.sig_))
+                && not (sig_within other.sig_ m.sig_)
+              then
+                failwith
+                  (Printf.sprintf
+                     "MethodError: %s(%s) is ambiguous -- (%s) and (%s) are equally close" name
+                     (String.concat ", " arg_tags) (show_sig other.sig_) (show_sig m.sig_)))
+            rest;
+          m
         | [] -> assert false)
 
     let call name args =
@@ -956,6 +1397,23 @@
     }
 
     let new_cache () : call_cache = { gen = -1; entry = None; shadow_gen = -1; struct_gen = -1 }
+
+    (* 番号 -> セル。AST のノードが持っているのは Caches.fresh_call () で
+       もらった番号だけで、セルはここにある。番号は単調に増えるので、要る
+       ところまで倍々に伸ばす(伸ばすのは初回だけ、あとは配列を引くだけ)。 *)
+    let cache_table : call_cache array ref = ref (Array.init 256 (fun _ -> new_cache ()))
+
+    let grow_cache_table (i : int) : call_cache =
+      let t = !cache_table in
+      let old_n = Array.length t in
+      let n = max (i + 1) (2 * old_n) in
+      let bigger = Array.init n (fun k -> if k < old_n then Array.unsafe_get t k else new_cache ()) in
+      cache_table := bigger;
+      Array.unsafe_get bigger i
+
+    let cache_at (i : int) : call_cache =
+      let t = !cache_table in
+      if i < Array.length t then Array.unsafe_get t i else grow_cache_table i
 
     (* compares cached tags against args WITHOUT building a fresh `List.map
        tag args` list first -- on a cache hit (the overwhelmingly common
@@ -997,10 +1455,23 @@
 
   let new_var_cache () : var_cache = { depth = 0 }
 
-  (* funcdecl_cache_state/funcdecl_cache are defined further below, right
-     after the Host module -- FC_host_compiled needs Host.program, and Host
-     needs get_field/construct/Dispatch, all defined between here and there.
-     See that later comment for the full rationale. *)
+  (* 同じ形の表を var_cache にも。EVar/EAssign が持つのは番号だけ。 *)
+  let var_cache_table : var_cache array ref = ref (Array.init 256 (fun _ -> { depth = 0 }))
+
+  let grow_var_cache_table (i : int) : var_cache =
+    let t = !var_cache_table in
+    let old_n = Array.length t in
+    let n = max (i + 1) (2 * old_n) in
+    let bigger = Array.init n (fun k -> if k < old_n then Array.unsafe_get t k else { depth = 0 }) in
+    var_cache_table := bigger;
+    Array.unsafe_get bigger i
+
+  let var_cache_at (i : int) : var_cache =
+    let t = !var_cache_table in
+    if i < Array.length t then Array.unsafe_get t i else grow_var_cache_table i
+
+  (* funcdecl_cache_state/funcdecl_cache are defined further below --
+     they need get_field/construct/Dispatch, defined between here and there. *)
 
   (* --- struct constructors: a struct/abstract-type declaration is data, produced
      by the parser, not a hardcoded OCaml type. A struct declared `Box{T}` (or
@@ -1025,6 +1496,19 @@
     }
 
   let struct_defs : (string, struct_def) Hashtbl.t = Hashtbl.create 32
+
+  (* 上で開けておいた口に、表がそろったので差し込む。member を一つでも
+     持っていれば module と見なす -- `M.nope` が「M なんて名前は無い」では
+     なく「M.nope が無い」と言えるように *)
+  let () =
+    is_module_name :=
+      fun n ->
+        let qp = n ^ "." in
+        let qplen = String.length qp in
+        let starts k = String.length k > qplen && String.equal (String.sub k 0 qplen) qp in
+        Hashtbl.fold (fun k _ acc -> acc || starts k) Dispatch.methods false
+        || Hashtbl.fold (fun k _ acc -> acc || starts k) struct_defs false
+        || Hashtbl.fold (fun k _ acc -> acc || starts k) module_values false
 
   (* bumped on every struct declaration -- lets ECall's own "is `name`
      possibly a struct constructor" pre-check (see Eval, `call_cache`'s
@@ -1325,6 +1809,7 @@
         in
         r := newv
       | None -> failwith (Printf.sprintf "type %s has no field %s" s.kind name))
+    | VJS x -> Js_of_ocaml.Js.Unsafe.set x (Js_of_ocaml.Js.string name) (js_of_value newv)
     | _ -> failwith (Printf.sprintf "%s is not a struct, has no fields" (tag v))
 
   (* `using Name` -- merges everything `Name` declared into the bare/global
@@ -1359,16 +1844,31 @@
     let methods_to_merge =
       Hashtbl.fold (fun k v acc -> if has_prefix k then (bare_of k, v) :: acc else acc) Dispatch.methods []
     in
+    (* the same method record can already be on the bare name -- `using X` twice,
+       or `import X` (which is a `using` here) followed by `using X`. Appending
+       it again would make every call to it ambiguous with itself, so only what
+       isn't already there is merged, and the generation moves only if something
+       really did. *)
+    let merged = ref false in
     List.iter
       (fun (bare, ms) ->
         let existing = Option.value (Hashtbl.find_opt Dispatch.methods bare) ~default:[] in
-        Hashtbl.replace Dispatch.methods bare (ms @ existing))
+        match List.filter (fun m -> not (List.memq m existing)) ms with
+        | [] -> ()
+        | fresh ->
+          merged := true;
+          Hashtbl.replace Dispatch.methods bare (fresh @ existing))
       methods_to_merge;
-    if methods_to_merge <> [] then incr Dispatch.generation;
+    if !merged then incr Dispatch.generation;
     let structs_to_merge =
       Hashtbl.fold (fun k v acc -> if has_prefix k then (bare_of k, v) :: acc else acc) struct_defs []
     in
     List.iter (fun (bare, sd) -> Hashtbl.replace struct_defs bare sd) structs_to_merge;
+    (* module の中で置かれた値も、裸の名前で引けるように(関数や型と同じ扱い) *)
+    let values_to_merge =
+      Hashtbl.fold (fun k v acc -> if has_prefix k then (bare_of k, v) :: acc else acc) module_values []
+    in
+    List.iter (fun (bare, v) -> Hashtbl.replace module_values bare v) values_to_merge;
     let types_to_merge =
       Hashtbl.fold (fun k v acc -> if has_prefix k then (bare_of k, v) :: acc else acc) Types.parent []
     in
@@ -1398,12 +1898,26 @@
     let methods_to_merge =
       Hashtbl.fold (fun k v acc -> if has_wanted_prefix k then (bare_of k, v) :: acc else acc) Dispatch.methods []
     in
+    (* the same method record can already be on the bare name -- `using X` twice,
+       or `import X` (which is a `using` here) followed by `using X`. Appending
+       it again would make every call to it ambiguous with itself, so only what
+       isn't already there is merged, and the generation moves only if something
+       really did. *)
+    let merged = ref false in
     List.iter
       (fun (bare, ms) ->
         let existing = Option.value (Hashtbl.find_opt Dispatch.methods bare) ~default:[] in
-        Hashtbl.replace Dispatch.methods bare (ms @ existing))
+        match List.filter (fun m -> not (List.memq m existing)) ms with
+        | [] -> ()
+        | fresh ->
+          merged := true;
+          Hashtbl.replace Dispatch.methods bare (fresh @ existing))
       methods_to_merge;
-    if methods_to_merge <> [] then incr Dispatch.generation;
+    if !merged then incr Dispatch.generation;
+    let values_to_merge =
+      Hashtbl.fold (fun k v acc -> if has_wanted_prefix k then (bare_of k, v) :: acc else acc) module_values []
+    in
+    List.iter (fun (bare, v) -> Hashtbl.replace module_values bare v) values_to_merge;
     let structs_to_merge =
       Hashtbl.fold (fun k v acc -> if has_wanted_prefix k then (bare_of k, v) :: acc else acc) struct_defs []
     in
@@ -1708,350 +2222,6 @@
     let v = Js.to_float (Js.Unsafe.get result 1) in
     if tag = 0.0 then VInt (int_of_float v) else if tag = 1.0 then VFloat v else VBool (v <> 0.0)
 
-  (* --- A second, separate compile target from run_bytecode above: an
-     ECS-"system"-shaped function (query a set of entities, read struct
-     fields, construct a new struct, call host builtins like
-     get_component/add_component!) never qualifies for Compile.try_compile's
-     restricted numeric ISA at all -- no structs, no strings, no function
-     calls with arguments exist in that instruction set. This doesn't hoist
-     anything into Rust (there is no native codegen path for structs/
-     dispatch, same reason a genuine JIT was rejected for run_bytecode's own
-     numeric case); the entire saving is staying inside OCaml but skipping
-     Eval.eval_expr/exec_stmt's full AST-node pattern match (dozens of cases,
-     most irrelevant to this shape) and Eval's environment/scope-chain walk,
-     in favor of a flat locals array indexed by a slot resolved once at
-     compile time. Every actual field read, struct construction, and host
-     call below still goes through the exact same get_field/construct/
-     Dispatch.call_cached the tree-walking interpreter itself uses --
-     nothing about *how* those work is reimplemented, only *how they're
-     reached* per call is made more direct. Lives here (not in Compile,
-     which depends on Ast) so the AST-walking compiler in Compile can build
-     a Host.program without this module ever depending on Ast -- same split
-     as run_bytecode/Compile.encode just above. *)
-  module Host = struct
-    (* Ecs (bin/ecs.ml) depends on Runtime, not the other way around, so
-       this module can't call straight into it -- the same problem, and the
-       same solution, as current_kwargs/current_end/current_module_prefix
-       elsewhere in this file: a side-channel ref that the OTHER module
-       fills in once, at its own load time. Compile.try_compile_host
-       specializes get_component/add_component!/query/... call sites
-       directly to the opcodes below (see there) when it can prove, at
-       compile time, that the name hasn't been given some OTHER, unrelated
-       overload (Dispatch.methods has exactly the one method Ecs itself
-       registered) -- bypassing Dispatch.call_cached's name/argument-type
-       resolution entirely for those, not just the AST/environment overhead
-       every other Host opcode already skips. *)
-    (* --- where an SoA column's floats actually live -----------------------
-       A Bigarray, not an OCaml `float array`. Under wasm_of_ocaml a Bigarray
-       IS a JS typed array: the runtime's own bigarray.wat holds its data as an
-       `(ref extern)` built by a `ta_create` call out to JS. An OCaml float
-       array, by contrast, lives in the WasmGC heap, which JS cannot address at
-       all -- every element has to be boxed across one at a time (measured:
-       handing 100k entities' Position to JS that way costs ~6.7ms, more than
-       a whole frame's budget). A column that is already a Float64Array can
-       instead be laid straight over a SharedArrayBuffer and read by a worker
-       with no copy at all.
-
-       The price is that every element access is now a call out to JS. On the
-       raw loop that is 12.7x (0.167ms -> 2.117ms per 100k-entity frame's worth
-       of column arithmetic) -- but the interpreter around it spends 43.4ms on
-       that same frame, so against the whole system it is about +4.5%. Measured
-       both ways before this was written; see the SoA scale bench. *)
-    type fcol = (float, Bigarray.float64_elt, Bigarray.c_layout) Bigarray.Array1.t
-
-    (* the presence bitmap shares a column's fate: a worker reading a column
-       also has to know WHICH entities are in it, and a compiled
-       HEcsSoaFieldRead checks exactly this before every read. If the floats
-       are shared but the bitmap isn't, a worker sees a full column and an
-       empty world. So it is a Bigarray as well -- a Uint8Array on the JS
-       side, 0/1 rather than OCaml's `bool`. *)
-    type bcol = (int, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t
-
-    (* a Bigarray can be laid directly over a typed array JS already owns
-       (`caml_ba_from_typed_array` is a wasm_of_ocaml runtime primitive, see its
-       bigarray.wat) -- which is how a column comes to live on a
-       SharedArrayBuffer: JS allocates the buffer, OCaml just points at it.
-       Verified end to end before this was written: OCaml writes, a worker's JS
-       reads the same bytes, no copy anywhere. *)
-    external ba_of_ta : Js_of_ocaml.Js.Unsafe.any -> ('a, 'b, Bigarray.c_layout) Bigarray.Array1.t
-      = "caml_ba_from_typed_array"
-
-    external ta_of_ba : ('a, 'b, Bigarray.c_layout) Bigarray.Array1.t -> Js_of_ocaml.Js.Unsafe.any
-      = "caml_ba_to_typed_array"
-
-    (* the host allocates every column, so that it CAN be shared -- but only if
-       the host offers to. A plain browser page has no SharedArrayBuffer unless
-       it's cross-origin-isolated (COOP/COEP), and a bare `node` run of a test
-       harness may have no host functions at all; both fall back to an ordinary
-       Bigarray, which is correct in every way except that no worker can see it.
-       Nothing silently half-works: parallel_each is what asks for sharing, and
-       it says so plainly if it isn't there. *)
-    let host_alloc (name : string) (n : int) : Js_of_ocaml.Js.Unsafe.any option =
-      let open Js_of_ocaml in
-      let f : Js.Unsafe.any = Js.Unsafe.get Js.Unsafe.global name in
-      if Js.to_string (Js.typeof f) = "function" then Some (Js.Unsafe.fun_call f [| Js.Unsafe.inject n |]) else None
-
-    let fcol_create (n : int) : fcol =
-      match host_alloc "host_shared_f64" n with
-      | Some ta -> ba_of_ta ta
-      | None ->
-        let c = Bigarray.Array1.create Bigarray.float64 Bigarray.c_layout n in
-        Bigarray.Array1.fill c 0.0;
-        c
-
-    let bcol_create (n : int) : bcol =
-      match host_alloc "host_shared_u8" n with
-      | Some ta -> ba_of_ta ta
-      | None ->
-        let c = Bigarray.Array1.create Bigarray.int8_unsigned Bigarray.c_layout n in
-        Bigarray.Array1.fill c 0;
-        c
-
-    let bcol_get (c : bcol) (i : int) : bool = Bigarray.Array1.get c i <> 0
-    let bcol_set (c : bcol) (i : int) (v : bool) : unit = Bigarray.Array1.set c i (if v then 1 else 0)
-
-    (* --- storage identity, for the worker pool (see parallelBridge.ml) -------
-       Every column is grow-on-write and doubles by ALLOCATING A NEW BUFFER. A
-       worker holding a view of the old buffer would then be writing into
-       memory nobody reads any more -- silently, which is the one thing this
-       codebase keeps refusing to do. So two things guard it:
-
-       - `storage_gen` counts every reallocation (and every new column). A
-         worker rebinds its views whenever it sees a generation it hasn't bound
-         yet, so a grow on the main thread is simply the next frame's rebind.
-       - inside a worker, a grow is an ERROR rather than a silent divergence:
-         the worker's fresh buffer would be its own, unshared. A parallel system
-         may write components an entity ALREADY has (that's a column write, in
-         shared memory) but may not spawn entities or give one a component it
-         didn't have -- exactly the "systems don't change the world's shape"
-         rule an ECS scheduler needs anyway. *)
-    let storage_gen = ref 0
-    let in_worker = ref false
-
-    let grow_guard (what : string) =
-      if !in_worker then
-        failwith
-          (Printf.sprintf
-             "parallel system: cannot grow %s storage inside a worker -- a parallel system may only write \
-              components an entity already has (no create_entity!/new component kinds). Do that on the main thread."
-             what)
-
-    (* the same grow-on-write, doubling, never-shrink policy `ensure_len` above
-       applies to every other column -- a Bigarray just can't reuse it, having
-       no `Array.make`/`Array.blit`. *)
-    let ensure_fcol (col : fcol ref) (n : int) : unit =
-      let len = Bigarray.Array1.dim !col in
-      if n >= len then (
-        let new_len = ref (max 1 len) in
-        while n >= !new_len do
-          new_len := !new_len * 2
-        done;
-        grow_guard "component column";
-        let bigger = fcol_create !new_len in
-        Bigarray.Array1.blit !col (Bigarray.Array1.sub bigger 0 len);
-        col := bigger;
-        incr storage_gen)
-
-    let ensure_bcol (col : bcol ref) (n : int) : unit =
-      let len = Bigarray.Array1.dim !col in
-      if n >= len then (
-        let new_len = ref (max 1 len) in
-        while n >= !new_len do
-          new_len := !new_len * 2
-        done;
-        grow_guard "presence bitmap";
-        let bigger = bcol_create !new_len in
-        Bigarray.Array1.blit !col (Bigarray.Array1.sub bigger 0 len);
-        col := bigger;
-        incr storage_gen)
-
-    type ecs_hooks =
-      { get_component : int -> string -> value
-      ; add_component : int -> value -> unit
-      ; query : string list -> int array
-      ; create_entity : unit -> int
-      ; destroy_entity : int -> unit
-      ; has_component : int -> string -> bool
-      ; remove_component : int -> string -> unit
-      ; (* None if `kind` isn't SoA-eligible (see soa_eligible above) --
-           otherwise the field names in declaration order, one column (see
-           `fcol` below)
-           ref cell per field (SAME order), and the shared presence-bitmap
-           ref cell for the whole column. These are the ACTUAL mutable ref
-           cells Ecs's own storage uses, not a snapshot: Compile.
-           try_compile_host resolves this ONCE per compiled call site (at
-           compile time) and bakes the returned ref cells directly into the
-           HEcsSoaFieldRead/HEcsSoaWrite opcode below, so a later `ensure_len`
-           grow (Ecs replaces a ref cell's CONTENTS, never the cell itself)
-           stays visible with no re-resolution needed, ever -- same
-           "resolve once, cache forever" idea as every other inline cache in
-           this file. *)
-        soa_column_info : string -> (string array * fcol ref array * bcol ref) option
-      }
-
-    let ecs_hooks : ecs_hooks option ref = ref None
-    let register_ecs_hooks h = ecs_hooks := Some h
-    let ecs () = match !ecs_hooks with Some h -> h | None -> failwith "ECS is not linked into this build"
-
-    let as_entity_id = function
-      | VInt e -> e
-      | v -> failwith (Printf.sprintf "expected an Int entity id, got %s" (tag v))
-
-    (* grows `arr` (via its ref cell, in place) until index `n` is valid --
-       same helper Ecs.ensure_len provides for its own storage, duplicated
-       (not shared) for the same reason Host.iterate duplicates Eval's
-       iter_values_do: no dependency from this module onto Ecs. A compiled
-       SoA write can't call Ecs.ensure_len directly, but needs the exact
-       same grow-on-write policy since it writes straight into Ecs's own
-       ref cells. *)
-    let ensure_len (arr : 'a array ref) (fill : 'a) (n : int) : unit =
-      let len = Array.length !arr in
-      if n >= len then (
-        let new_len = ref (max 1 len) in
-        while n >= !new_len do
-          new_len := !new_len * 2
-        done;
-        let bigger = Array.make !new_len fill in
-        Array.blit !arr 0 bigger 0 len;
-        arr := bigger)
-
-    type hexpr =
-      | HConst of value
-      | HLoad of int
-      | HField of hexpr * string
-      | HMakeArray of hexpr list
-      | HConstruct of string * hexpr list
-      | HCallHost of string * hexpr list * Dispatch.call_cache
-      | HBin of string * hexpr * hexpr * Dispatch.call_cache
-      | HEcsGetComponent of hexpr * string
-      | HEcsAddComponent of hexpr * hexpr
-      | HEcsCreateEntity
-      | HEcsDestroyEntity of hexpr
-      | HEcsHasComponent of hexpr * string
-      | HEcsRemoveComponent of hexpr * string
-      | HEcsQuery of string list
-      | HEcsSoaFieldRead of hexpr * fcol ref * bcol ref * string * string
-        (* entity expr, this field's column ref, the column's shared
-           presence ref, kind name, field name -- the last two only used
-           to phrase an error if the component turns out absent *)
-      | HEcsSoaWrite of hexpr * (fcol ref * hexpr) array * bcol ref
-        (* entity expr, one (column ref, compiled value expr) pair per
-           field IN DECLARATION ORDER, the column's shared presence ref *)
-
-    type hstmt =
-      | HAssign of int * hexpr
-      | HExprStmt of hexpr
-      | HIf of (hexpr * hstmt array) list * hstmt array option
-      | HForEach of int * hexpr * hstmt array
-      | HReturn of hexpr option
-
-    type program = hstmt array
-
-    exception Return_val of value
-
-    (* the same four iterable kinds Eval.iter_values_do supports, duplicated
-       (not shared) deliberately -- this module has no dependency on Eval
-       (which depends on Compile, which depends on this), and the logic is
-       small enough that sharing it would mean inverting that dependency
-       direction just to save a dozen lines. *)
-    let iterate (v : value) (f : value -> unit) : unit =
-      match v with
-      | VRange (a, s, b) ->
-        if s = 0 then failwith "range step cannot be 0"
-        else (
-          let i = ref a in
-          while (if s > 0 then !i <= b else !i >= b) do
-            f (VInt !i);
-            i := !i + s
-          done)
-      | VFRange (a, s, b) ->
-        if s = 0.0 then failwith "range step cannot be 0"
-        else (
-          let count = int_of_float (Float.round ((b -. a) /. s)) in
-          for i = 0 to count do
-            f (VFloat (a +. (float_of_int i *. s)))
-          done)
-      | VVec r -> Array.iter (fun x -> f (VFloat x)) (vecbuf_to_array r)
-      | VArr { cells; _ } -> Array.iter f (arrbuf_to_array cells)
-      | _ -> failwith "expected a Range, Vector, or Array to iterate"
-
-    let rec eval_expr (locals : value array) (e : hexpr) : value =
-      match e with
-      | HConst v -> v
-      | HLoad slot -> locals.(slot)
-      | HField (obj, name) -> get_field (eval_expr locals obj) name
-      | HMakeArray es -> mk_arr (Array.of_list (List.map (eval_expr locals) es))
-      | HConstruct (name, es) -> construct name (List.map (eval_expr locals) es)
-      | HCallHost (name, es, cache) -> Dispatch.call_cached cache name (List.map (eval_expr locals) es)
-      | HBin (op, a, b, cache) -> Dispatch.call_cached cache op [ eval_expr locals a; eval_expr locals b ]
-      | HEcsGetComponent (e, kind) -> (ecs ()).get_component (as_entity_id (eval_expr locals e)) kind
-      | HEcsAddComponent (e, c) ->
-        (ecs ()).add_component (as_entity_id (eval_expr locals e)) (eval_expr locals c);
-        VNothing
-      | HEcsCreateEntity -> VInt ((ecs ()).create_entity ())
-      | HEcsDestroyEntity e ->
-        (ecs ()).destroy_entity (as_entity_id (eval_expr locals e));
-        VNothing
-      | HEcsHasComponent (e, kind) -> VBool ((ecs ()).has_component (as_entity_id (eval_expr locals e)) kind)
-      | HEcsRemoveComponent (e, kind) ->
-        (ecs ()).remove_component (as_entity_id (eval_expr locals e)) kind;
-        VNothing
-      | HEcsQuery kinds -> mk_arr (Array.map (fun e -> VInt e) ((ecs ()).query kinds))
-      | HEcsSoaFieldRead (e, col, present, kind, field) ->
-        let eid = as_entity_id (eval_expr locals e) in
-        if eid < Bigarray.Array1.dim !present && eid < Bigarray.Array1.dim !col && bcol_get !present eid then
-          VFloat (Bigarray.Array1.get !col eid)
-        else failwith (Printf.sprintf "type %s has no field %s (component not present on this entity)" kind field)
-      | HEcsSoaWrite (e, field_writes, present) ->
-        let eid = as_entity_id (eval_expr locals e) in
-        Array.iter
-          (fun (col, val_e) ->
-            let v =
-              match eval_expr locals val_e with
-              | VFloat f -> f
-              | VInt n -> float_of_int n
-              | v -> failwith (Printf.sprintf "expected a number, got %s" (tag v))
-            in
-            ensure_fcol col eid;
-            Bigarray.Array1.set !col eid v)
-          field_writes;
-        ensure_bcol present eid;
-        bcol_set !present eid true;
-        VNothing
-
-    let rec exec_stmt (locals : value array) (s : hstmt) : unit =
-      match s with
-      | HAssign (slot, e) -> locals.(slot) <- eval_expr locals e
-      | HExprStmt e -> ignore (eval_expr locals e)
-      | HIf (branches, else_body) ->
-        let rec go = function
-          | [] -> (
-            match else_body with
-            | Some b -> exec_stmts locals b
-            | None -> ())
-          | (cond, body) :: rest -> (
-            match eval_expr locals cond with
-            | VBool true -> exec_stmts locals body
-            | VBool false -> go rest
-            | v -> failwith (Printf.sprintf "expected a Bool, got %s" (tag v)))
-        in
-        go branches
-      | HForEach (slot, iter_e, body) ->
-        let v = eval_expr locals iter_e in
-        iterate v (fun item ->
-          locals.(slot) <- item;
-          exec_stmts locals body)
-      | HReturn e -> raise (Return_val (match e with Some e -> eval_expr locals e | None -> VNothing))
-
-    and exec_stmts locals stmts = Array.iter (exec_stmt locals) stmts
-
-    let run (prog : program) (nslots : int) : value =
-      let locals = Array.make nslots VNothing in
-      try
-        exec_stmts locals prog;
-        VNothing
-      with Return_val v -> v
-  end
 
   (* a JIT-style compile cache for `function` declarations: allocated once
      at PARSE time (see Parser), attached to this exact declaration SITE,
@@ -2064,7 +2234,7 @@
      than recomputing. Two independent compiled forms can apply to the same
      site now: FC_compiled (Compile's restricted numeric ISA, run_bytecode,
      crosses into Rust) is tried first (best win for pure arithmetic, see
-     AST_IN_RUST_EXPERIMENT.md); FC_host_compiled (Host, just above) is the
+     AST_IN_RUST_EXPERIMENT.md); FC_host_compiled (bin/host.ml) is the
      fallback for the ECS/struct/host-call shape that numeric compilation
      can never accept, and never leaves OCaml at all. Stores the
      ALREADY-ENCODED forms (a plain float array for the former, a
@@ -2074,12 +2244,30 @@
   type funcdecl_cache_state =
     | FC_unattempted
     | FC_compiled of float array * int (* encoded bytecode, nslots *)
-    | FC_host_compiled of Host.program * int (* program, nslots *)
+    | FC_host_compiled of (unit -> value)
+      (* もう「呼ぶだけ」の形。中で何が走るか(Host の program)は、ここでは
+         知らない -- そのおかげで Runtime は Host を知らなくていい *)
     | FC_ineligible
 
   type funcdecl_cache = { mutable fc_state : funcdecl_cache_state }
 
   let new_funcdecl_cache () : funcdecl_cache = { fc_state = FC_unattempted }
+
+  (* SFuncDecl の分。宣言の場所ひとつにセルひとつ、というのは前と同じ。 *)
+  let funcdecl_cache_table : funcdecl_cache array ref =
+    ref (Array.init 64 (fun _ -> { fc_state = FC_unattempted }))
+
+  let grow_funcdecl_cache_table (i : int) : funcdecl_cache =
+    let t = !funcdecl_cache_table in
+    let old_n = Array.length t in
+    let n = max (i + 1) (2 * old_n) in
+    let bigger = Array.init n (fun k -> if k < old_n then Array.unsafe_get t k else { fc_state = FC_unattempted }) in
+    funcdecl_cache_table := bigger;
+    Array.unsafe_get bigger i
+
+  let funcdecl_cache_at (i : int) : funcdecl_cache =
+    let t = !funcdecl_cache_table in
+    if i < Array.length t then Array.unsafe_get t i else grow_funcdecl_cache_table i
 
   (* --- built-in operators/functions, registered the same way user `function`
      declarations are -- there is no privileged syntax, "+" is just a name. --- *)
@@ -2113,6 +2301,10 @@
         VFloat (if r <> 0.0 && (r < 0.0) <> (b < 0.0) then r +. b else r));
     (* logical not -- see Parser.parse_unary for why `!x` is just an
        ordinary call to this, not a dedicated AST node *)
+    (* `~x` -- ビットを裏返す。`!` と同じで、名前のついた関数 *)
+    Dispatch.defmethod "~" [ [ "Int" ] ] (function
+      | [ VInt a ] -> VInt (lnot a)
+      | _ -> assert false);
     Dispatch.defmethod "!" [ [ "Bool" ] ] (function
       | [ VBool b ] -> VBool (not b)
       | _ -> assert false);
@@ -2222,6 +2414,18 @@
         if float_of_int i <> f then failwith (Printf.sprintf "InexactError: Int(%s) is not an exact integer" (show x));
         VInt i
       | _ -> assert false);
+    (* A conversion is a CALL, not a type annotation, so Types.canonical never
+       sees it -- `Int64(3)` and `Float64(3)` need methods of their own. And
+       widening to Float had no spelling at all before this: `Float(3)` was as
+       absent as `Float64(3)`, so the only way to get a Float from an Int was
+       arithmetic. *)
+    Dispatch.defmethod "Int64" [ [ "Number" ] ] (fun args -> Dispatch.call "Int" args);
+    let to_float = function
+      | [ x ] -> VFloat (as_float x)
+      | _ -> assert false
+    in
+    Dispatch.defmethod "Float" [ [ "Number" ] ] to_float;
+    Dispatch.defmethod "Float64" [ [ "Number" ] ] to_float;
     (* Complex arithmetic, only for mandelperf's needs: +, -, * and ^ with a
        non-negative Int exponent (repeated multiplication -- no general
        floating-point power here, mandel only ever squares) *)
@@ -2268,6 +2472,30 @@
       | _ -> assert false);
     Dispatch.defmethod "^" [ [ "Number" ]; [ "Number" ] ] (function
       | [ a; b ] -> VFloat (as_float a ** as_float b)
+      | _ -> assert false);
+    (* Integer division, all three of real Julia's roundings -- `7 % 2` was
+       here but `div(7, 2)` was not, so there was no way to write the other
+       half of a divmod at all. `÷` is real Julia's own spelling of `div`
+       (U+00F7), lexed as its own operator. Truncated / floored / ceiling,
+       exactly as real Julia defines them: div(-7,2) = -3, fld(-7,2) = -4,
+       cld(7,2) = 4. *)
+    let to_i v = match v with VInt n -> n | VFixedInt { v; _ } -> v | other -> int_of_float (as_float other) in
+    let int2 name f =
+      Dispatch.defmethod name [ [ "Integer" ]; [ "Integer" ] ] (function
+        | [ a; b ] -> (
+          let x = to_i a and y = to_i b in
+          match y with 0 -> failwith "DivideError: integer division error" | _ -> VInt (f x y))
+        | _ -> assert false)
+    in
+    int2 "div" (fun x y -> x / y);
+    int2 "\xc3\xb7" (fun x y -> x / y);
+    int2 "fld" (fun x y -> if x * y < 0 && x mod y <> 0 then (x / y) - 1 else x / y);
+    int2 "cld" (fun x y -> if x * y > 0 && x mod y <> 0 then (x / y) + 1 else x / y);
+    Dispatch.defmethod "sign" [ [ "Integer" ] ] (function
+      | [ a ] -> VInt (compare (to_i a) 0)
+      | _ -> assert false);
+    Dispatch.defmethod "sign" [ [ "Float" ] ] (function
+      | [ VFloat a ] -> VFloat (if a > 0.0 then 1.0 else if a < 0.0 then -1.0 else a)
       | _ -> assert false);
     Dispatch.defmethod "abs" [ [ "Int" ] ] (function
       | [ VInt a ] -> VInt (abs a)
@@ -2353,1120 +2581,80 @@
     num2 ">=" (fun a b -> VBool (a >= b)) (fun a b -> VBool (a >= b));
     num2 "==" (fun a b -> VBool (a = b)) (fun a b -> VBool (a = b));
     num2 "!=" (fun a b -> VBool (a <> b)) (fun a b -> VBool (a <> b));
+    (* `==` used to answer for Numbers and NOTHING else, so `true == true`,
+       `"a" == "a"`, `nothing == nothing`, `:a == :a` and comparing two
+       structs all raised a MethodError -- one of the first things anyone
+       sitting down to write a program reaches for.
+
+       Real Julia's `==` falls back to `===`, which for an IMMUTABLE struct
+       compares field by field and for a `mutable struct` is object identity.
+       This mirrors that, and recurses into containers by DISPATCHING each
+       element back through `==`, so a user's own `==` method on their own
+       type still governs its own values, even nested inside a Tuple or an
+       Array. Physical equality short-circuits first, which is also what
+       keeps a self-referential struct (`n.next === n`) from recursing
+       forever. Registered on (Any, Any), the least specific signature there
+       is, so every existing and future more-specific `==` still wins. *)
+    let elem_eq a b = match Dispatch.call "==" [ a; b ] with VBool r -> r | _ -> false in
+    let array_eq xs ys = Array.length xs = Array.length ys && (
+      let ok = ref true in
+      Array.iteri (fun i x -> if !ok && not (elem_eq x ys.(i)) then ok := false) xs;
+      !ok)
+    in
+    let generic_eq a b =
+      if a == b then true
+      else
+        match a, b with
+        | VStr x, VStr y -> String.equal x y
+        | VBool x, VBool y -> x = y
+        | VNothing, VNothing -> true
+        | VSymbol (x, _), VSymbol (y, _) -> String.equal x y
+        | VType x, VType y -> String.equal x y
+        | VRange (a1, s1, b1), VRange (a2, s2, b2) -> a1 = a2 && s1 = s2 && b1 = b2
+        | VTuple xs, VTuple ys -> array_eq xs ys
+        | VArr { cells = xs; _ }, VArr { cells = ys; _ } -> array_eq (arrbuf_to_array xs) (arrbuf_to_array ys)
+        | VVec xs, VVec ys -> vecbuf_to_array xs = vecbuf_to_array ys
+        | VMat xs, VMat ys -> xs = ys
+        | VDict d1, VDict d2 ->
+          dict_length d1 = dict_length d2
+          && List.for_all
+               (fun (k, v) ->
+                 match Hashtbl.find_opt d2.dtbl (dict_key k) with
+                 | Some (_, _, v2) -> elem_eq v v2
+                 | None -> false)
+               (dict_pairs d1)
+        | VStruct s1, VStruct s2 ->
+          String.equal s1.kind s2.kind
+          && (match Hashtbl.find_opt struct_defs s1.kind with
+             (* a mutable struct is compared by identity, which the physical
+                check above already settled -- two distinct ones are not
+                equal however alike their fields look, same as real Julia *)
+             | Some sd when sd.mutable_ -> false
+             | _ ->
+               Array.length s1.fields = Array.length s2.fields
+               && array_eq (Array.map (fun (_, r) -> !r) s1.fields) (Array.map (fun (_, r) -> !r) s2.fields))
+        | _ -> false
+    in
+    Dispatch.defmethod "==" [ [ "Any" ]; [ "Any" ] ] (function
+      | [ a; b ] -> VBool (generic_eq a b)
+      | _ -> assert false);
+    Dispatch.defmethod "!=" [ [ "Any" ]; [ "Any" ] ] (function
+      | [ a; b ] -> VBool (not (generic_eq a b))
+      | _ -> assert false);
+    (* lexicographic String ordering, real Julia's own -- what `sort` on a
+       Vector of names needs, since sorting goes through this `<` *)
+    let str_cmp name op =
+      Dispatch.defmethod name [ [ "String" ]; [ "String" ] ] (function
+        | [ VStr a; VStr b ] -> VBool (op (compare a b) 0)
+        | _ -> assert false)
+    in
+    str_cmp "<" ( < );
+    str_cmp "<=" ( <= );
+    str_cmp ">" ( > );
+    str_cmp ">=" ( >= );
     (* String support: concatenation via "+" too, same name, different signature *)
     Dispatch.defmethod "+" [ [ "String" ]; [ "String" ] ] (function
       | [ VStr a; VStr b ] -> VStr (a ^ b)
-      | _ -> assert false);
-    (* Vector,Vector elementwise arithmetic *)
-    Dispatch.defmethod "+" [ [ "Vector" ]; [ "Vector" ] ] (function
-      | [ VVec a; VVec b ] -> VVec (vecbuf_of_array (Array.map2 ( +. ) (vecbuf_to_array a) (vecbuf_to_array b)))
-      | _ -> assert false);
-    Dispatch.defmethod "-" [ [ "Vector" ]; [ "Vector" ] ] (function
-      | [ VVec a; VVec b ] -> VVec (vecbuf_of_array (Array.map2 ( -. ) (vecbuf_to_array a) (vecbuf_to_array b)))
-      | _ -> assert false);
-    Dispatch.defmethod "*" [ [ "Number" ]; [ "Vector" ] ] (function
-      | [ s; VVec b ] -> VVec (vecbuf_of_array (Array.map (fun x -> as_float s *. x) (vecbuf_to_array b)))
-      | _ -> assert false);
-    Dispatch.defmethod "*" [ [ "Vector" ]; [ "Number" ] ] (function
-      | [ VVec a; s ] -> VVec (vecbuf_of_array (Array.map (fun x -> x *. as_float s) (vecbuf_to_array a)))
-      | _ -> assert false);
-    Dispatch.defmethod "*" [ [ "Number" ]; [ "Matrix" ] ] (function
-      | [ s; VMat rows ] -> VMat (Array.map (Array.map (fun x -> as_float s *. x)) rows)
-      | _ -> assert false);
-    Dispatch.defmethod "*" [ [ "Matrix" ]; [ "Number" ] ] (function
-      | [ VMat rows; s ] -> VMat (Array.map (Array.map (fun x -> x *. as_float s)) rows)
-      | _ -> assert false);
-    (* the real cross-module call: Matrix * Vector/Matrix via Rust/faer.
-       host_matmul (unlike the older host_matvec rotate2d still uses) isn't
-       square-only -- a Vector is just treated as its own k x 1 Matrix. Both
-       check inner dimensions agree before crossing the FFI boundary --
-       host_matmul itself trusts its m/k/n args completely (see its own
-       comment), so a real Julia-style DimensionMismatch has to be raised
-       here, on the OCaml side, or a mismatched call would silently read
-       past what the smaller side actually has. *)
-    Dispatch.defmethod "*" [ [ "Matrix" ]; [ "Vector" ] ] (function
-      | [ VMat rows; VVec b ] ->
-        let b = vecbuf_to_array b in
-        let k = if Array.length rows = 0 then 0 else Array.length rows.(0) in
-        if k <> Array.length b then
-          failwith
-            (Printf.sprintf "DimensionMismatch: Matrix has %d columns, Vector has %d elements" k (Array.length b))
-        else (
-          let col = Array.map (fun x -> [| x |]) b in
-          VVec (vecbuf_of_array (Array.map (fun row -> row.(0)) (host_matmul rows col))))
-      | _ -> assert false);
-    Dispatch.defmethod "*" [ [ "Matrix" ]; [ "Matrix" ] ] (function
-      | [ VMat a; VMat b ] ->
-        let ka = if Array.length a = 0 then 0 else Array.length a.(0) in
-        let kb = Array.length b in
-        if ka <> kb then
-          failwith (Printf.sprintf "DimensionMismatch: %d-column Matrix times %d-row Matrix" ka kb)
-        else VMat (host_matmul a b)
-      | _ -> assert false);
-    (* transpose(A)/A' -- for a Matrix, a fresh Matrix with rows/cols
-       swapped; for a Vector, real Julia's `transpose` returns a lazy 1xN
-       row-vector view (`Transpose{Float64, Vector{Float64}}`), a genuinely
-       different type from Matrix -- Tsubaki has no such wrapper type, so
-       this materializes an actual 1xN Matrix instead. Disclosed
-       simplification, not a lazy view; a later transpose of THAT result
-       still round-trips correctly (just pays for a second real copy). *)
-    Dispatch.defmethod "transpose" [ [ "Matrix" ] ] (function
-      | [ VMat rows ] ->
-        let m = Array.length rows in
-        let n = if m = 0 then 0 else Array.length rows.(0) in
-        VMat (Array.init n (fun j -> Array.init m (fun i -> rows.(i).(j))))
-      | _ -> assert false);
-    Dispatch.defmethod "transpose" [ [ "Vector" ] ] (function
-      | [ VVec v ] -> VMat [| Array.copy (vecbuf_to_array v) |]
-      | _ -> assert false);
-    (* dot(a,b)/a⋅b -- real LinearAlgebra's Euclidean inner product; both
-       spellings share this one impl, registered under both names *)
-    let dot_impl = function
-      | [ VVec a; VVec b ] ->
-        let a = vecbuf_to_array a and b = vecbuf_to_array b in
-        if Array.length a <> Array.length b then
-          failwith "DimensionMismatch: dot product needs two Vectors of the same length"
-        else VFloat (Array.fold_left ( +. ) 0.0 (Array.map2 ( *. ) a b))
-      | _ -> assert false
-    in
-    Dispatch.defmethod "dot" [ [ "Vector" ]; [ "Vector" ] ] dot_impl;
-    Dispatch.defmethod "\xe2\x8b\x85" [ [ "Vector" ]; [ "Vector" ] ] dot_impl;
-    (* norm(v) (Euclidean/2-norm) and norm(v,p) (general p-norm) -- matrix
-       norms (operator/spectral norm, needing an SVD) aren't covered, same
-       "vector case only" scope as the rest of this LinearAlgebra round *)
-    Dispatch.defmethod "norm" [ [ "Vector" ] ] (function
-      | [ VVec v ] -> VFloat (sqrt (Array.fold_left (fun acc x -> acc +. (x *. x)) 0.0 (vecbuf_to_array v)))
-      | _ -> assert false);
-    Dispatch.defmethod "norm" [ [ "Vector" ]; [ "Number" ] ] (function
-      | [ VVec v; p ] ->
-        let p = as_float p in
-        VFloat (Array.fold_left (fun acc x -> acc +. (Float.abs x ** p)) 0.0 (vecbuf_to_array v) ** (1.0 /. p))
-      | _ -> assert false);
-    (* zeros/ones -- Vector for one dimension, Matrix for two, matching real
-       Julia's own zeros(n)/zeros(n,m) overload shape *)
-    Dispatch.defmethod "zeros" [ [ "Int" ] ] (function
-      | [ VInt n ] -> VVec (vecbuf_of_array (Array.make n 0.0))
-      | _ -> assert false);
-    Dispatch.defmethod "ones" [ [ "Int" ] ] (function
-      | [ VInt n ] -> VVec (vecbuf_of_array (Array.make n 1.0))
-      | _ -> assert false);
-    Dispatch.defmethod "zeros" [ [ "Int" ]; [ "Int" ] ] (function
-      | [ VInt n; VInt m ] -> VMat (Array.make_matrix n m 0.0)
-      | _ -> assert false);
-    Dispatch.defmethod "ones" [ [ "Int" ]; [ "Int" ] ] (function
-      | [ VInt n; VInt m ] -> VMat (Array.make_matrix n m 1.0)
-      | _ -> assert false);
-    (* size(A) -- a Matrix's (rows, cols) tuple, or a single dimension via
-       size(A, dim); size(v) for a Vector matches real Julia's own 1-tuple *)
-    Dispatch.defmethod "size" [ [ "Matrix" ] ] (function
-      | [ VMat rows ] -> VTuple [| VInt (Array.length rows); VInt (if Array.length rows = 0 then 0 else Array.length rows.(0)) |]
-      | _ -> assert false);
-    Dispatch.defmethod "size" [ [ "Matrix" ]; [ "Int" ] ] (function
-      | [ VMat rows; VInt 1 ] -> VInt (Array.length rows)
-      | [ VMat rows; VInt 2 ] -> VInt (if Array.length rows = 0 then 0 else Array.length rows.(0))
-      | [ VMat _; VInt d ] -> failwith (Printf.sprintf "BoundsError: a Matrix has no dimension %d" d)
-      | _ -> assert false);
-    Dispatch.defmethod "size" [ [ "Vector" ] ] (function
-      | [ VVec v ] -> VTuple [| VInt (vecbuf_length v) |]
-      | _ -> assert false);
-    Dispatch.defmethod "size" [ [ "ComplexVector" ] ] (function
-      | [ VComplexVec v ] -> VTuple [| VInt (Array.length !v) |]
-      | _ -> assert false);
-    Dispatch.defmethod "size" [ [ "ComplexMatrix" ] ] (function
-      | [ VComplexMat rows ] ->
-        VTuple [| VInt (Array.length rows); VInt (if Array.length rows = 0 then 0 else Array.length rows.(0)) |]
-      | _ -> assert false);
-    (* the generic boxed Matrix{T} (VGenMat) -- same size(A)/size(A,dim)/
-       length(A) shape as the numeric Matrix above, registered once against
-       the shared "GenericMatrix" base so it matches every concrete element
-       type at once (see Types' "GenericMatrix" entry). *)
-    Dispatch.defmethod "size" [ [ "GenericMatrix" ] ] (function
-      | [ VGenMat { rows; cols; _ } ] -> VTuple [| VInt rows; VInt cols |]
-      | _ -> assert false);
-    Dispatch.defmethod "size" [ [ "GenericMatrix" ]; [ "Int" ] ] (function
-      | [ VGenMat { rows; _ }; VInt 1 ] -> VInt rows
-      | [ VGenMat { cols; _ }; VInt 2 ] -> VInt cols
-      | [ VGenMat _; VInt d ] -> failwith (Printf.sprintf "BoundsError: a Matrix has no dimension %d" d)
-      | _ -> assert false);
-    Dispatch.defmethod "length" [ [ "GenericMatrix" ] ] (function
-      | [ VGenMat { rows; cols; _ } ] -> VInt (rows * cols)
-      | _ -> assert false);
-    (* elementwise +/-, scalar *; each cell's operation is resolved through
-       Tsubaki's OWN multiple dispatch on the element type (Dispatch.call),
-       not hardcoded arithmetic -- so a Matrix{Named} works as long as
-       Named itself has +/-/* methods defined, same as real Julia's generic
-       LinearAlgebra over any T. Deliberately no faer acceleration. *)
-    Dispatch.defmethod "+" [ [ "GenericMatrix" ]; [ "GenericMatrix" ] ] (function
-      | [ VGenMat a; VGenMat b ] ->
-        if a.rows <> b.rows || a.cols <> b.cols then
-          failwith
-            (Printf.sprintf "DimensionMismatch: matrices have sizes (%d,%d) and (%d,%d)" a.rows a.cols b.rows b.cols)
-        else mk_gen_mat a.rows a.cols (Array.init (a.rows * a.cols) (fun k -> Dispatch.call "+" [ a.cells.(k); b.cells.(k) ]))
-      | _ -> assert false);
-    Dispatch.defmethod "-" [ [ "GenericMatrix" ]; [ "GenericMatrix" ] ] (function
-      | [ VGenMat a; VGenMat b ] ->
-        if a.rows <> b.rows || a.cols <> b.cols then
-          failwith
-            (Printf.sprintf "DimensionMismatch: matrices have sizes (%d,%d) and (%d,%d)" a.rows a.cols b.rows b.cols)
-        else mk_gen_mat a.rows a.cols (Array.init (a.rows * a.cols) (fun k -> Dispatch.call "-" [ a.cells.(k); b.cells.(k) ]))
-      | _ -> assert false);
-    Dispatch.defmethod "*" [ [ "Number" ]; [ "GenericMatrix" ] ] (function
-      | [ s; VGenMat a ] -> mk_gen_mat a.rows a.cols (Array.map (fun c -> Dispatch.call "*" [ s; c ]) a.cells)
-      | _ -> assert false);
-    Dispatch.defmethod "*" [ [ "GenericMatrix" ]; [ "Number" ] ] (function
-      | [ VGenMat a; s ] -> mk_gen_mat a.rows a.cols (Array.map (fun c -> Dispatch.call "*" [ c; s ]) a.cells)
-      | _ -> assert false);
-    (* A \ b, det(A), inv(A) -- square-A only (a genuine least-squares `\`
-       for a rectangular A, via QR, isn't attempted here). All three go
-       through faer/LU on the Rust side; a genuinely singular A is NOT
-       detected (real Julia's `SingularException`) -- see kernel/src/lib.rs's
-       own comments on `solve`/`inverse` for why that's a real, disclosed gap
-       rather than a small follow-up. *)
-    Dispatch.defmethod "\\" [ [ "Matrix" ]; [ "Vector" ] ] (function
-      | [ VMat rows; VVec b ] ->
-        let b = vecbuf_to_array b in
-        let m = Array.length rows in
-        let n = if m = 0 then 0 else Array.length rows.(0) in
-        if m <> n then failwith "DimensionMismatch: A \\ b only supports a square A (no least-squares here)"
-        else if n <> Array.length b then
-          failwith (Printf.sprintf "DimensionMismatch: A is %dx%d, b has %d elements" m n (Array.length b))
-        else VVec (vecbuf_of_array (host_solve rows b n))
-      | _ -> assert false);
-    Dispatch.defmethod "det" [ [ "Matrix" ] ] (function
-      | [ VMat rows ] ->
-        let m = Array.length rows in
-        let n = if m = 0 then 0 else Array.length rows.(0) in
-        if m <> n then failwith "DimensionMismatch: det needs a square Matrix"
-        else VFloat (host_det rows n)
-      | _ -> assert false);
-    Dispatch.defmethod "inv" [ [ "Matrix" ] ] (function
-      | [ VMat rows ] ->
-        let m = Array.length rows in
-        let n = if m = 0 then 0 else Array.length rows.(0) in
-        if m <> n then failwith "DimensionMismatch: inv needs a square Matrix"
-        else VMat (host_inverse rows n)
-      | _ -> assert false);
-    (* tr(A) -- sum of the diagonal, plain OCaml (no FFI needed, same as
-       dot/norm above -- there's no real work here for faer to do faster) *)
-    Dispatch.defmethod "tr" [ [ "Matrix" ] ] (function
-      | [ VMat rows ] ->
-        let m = Array.length rows in
-        let n = if m = 0 then 0 else Array.length rows.(0) in
-        if m <> n then failwith "DimensionMismatch: tr needs a square Matrix"
-        else VFloat (Array.fold_left ( +. ) 0.0 (Array.init m (fun i -> rows.(i).(i))))
-      | _ -> assert false);
-    (* rank(A) -- any shape, not just square; via a thin SVD (see
-       kernel/src/lib.rs's matrix_rank), matching real Julia's own default
-       method rather than a less robust LU-pivot count *)
-    Dispatch.defmethod "rank" [ [ "Matrix" ] ] (function
-      | [ VMat rows ] ->
-        let m = Array.length rows in
-        let n = if m = 0 then 0 else Array.length rows.(0) in
-        VInt (host_rank rows m n)
-      | _ -> assert false);
-    (* eigvals(A)/eigvecs(A)/eigen(A) -- square Matrix. A SYMMETRIC input
-       takes the cheaper, real-valued path (`eigvals_symmetric`/
-       `eigen_symmetric` -- no eigenvector computation at all for
-       `eigvals`, and eigenvalues come back pre-sorted nondecreasing,
-       matching real Julia's own `Symmetric` path exactly, same as before
-       this round). A NON-symmetric input now takes faer's general
-       eigendecomposition (`eigen_general`, ROADMAP.md's Stage 4 "small
-       genericity slice") instead of raising -- its eigenvalues/eigenvectors
-       are genuinely `ComplexVector`/`ComplexMatrix` even for an all-real
-       input (verified directly against faer: `[[0,-1],[1,0]]`, a real
-       rotation matrix, produces eigenvalues `+-i` exactly, the textbook
-       answer), matching real Julia's own general (non-`Symmetric`) `eigen`
-       always going through the non-symmetric LAPACK path. `ComplexVector`/
-       `ComplexMatrix` are deliberately NOT `Vector`/`Matrix` subtypes (see
-       their own `Types.declare` comment above) -- a caller pattern-matching
-       on `eigvals(A)`'s result needs to handle BOTH a real `Vector` and a
-       `ComplexVector` now, exactly the ambiguity real Julia's own
-       `eigen(::Matrix)` return type already has. *)
-    let is_symmetric rows =
-      let n = Array.length rows in
-      let ok = ref true in
-      for i = 0 to n - 1 do
-        for j = i + 1 to n - 1 do
-          if Float.abs (rows.(i).(j) -. rows.(j).(i)) > 1e-9 then ok := false
-        done
-      done;
-      !ok
-    in
-    let require_square_for rows who =
-      let m = Array.length rows in
-      let n = if m = 0 then 0 else Array.length rows.(0) in
-      if m <> n then failwith (Printf.sprintf "DimensionMismatch: %s needs a square Matrix" who) else n
-    in
-    Dispatch.defmethod "eigvals" [ [ "Matrix" ] ] (function
-      | [ VMat rows ] ->
-        let n = require_square_for rows "eigvals" in
-        if is_symmetric rows then VVec (vecbuf_of_array (host_eigvals_symmetric rows n))
-        else (
-          let vals, _ = host_eigen_general rows n in
-          VComplexVec (ref vals))
-      | _ -> assert false);
-    Dispatch.defmethod "eigvecs" [ [ "Matrix" ] ] (function
-      | [ VMat rows ] ->
-        let n = require_square_for rows "eigvecs" in
-        if is_symmetric rows then (
-          let _, vecs = host_eigen_symmetric rows n in
-          VMat vecs)
-        else (
-          let _, vecs = host_eigen_general rows n in
-          VComplexMat vecs)
-      | _ -> assert false);
-    Dispatch.defmethod "eigen" [ [ "Matrix" ] ] (function
-      | [ VMat rows ] ->
-        let n = require_square_for rows "eigen" in
-        if is_symmetric rows then (
-          let vals, vecs = host_eigen_symmetric rows n in
-          VTuple [| VVec (vecbuf_of_array vals); VMat vecs |])
-        else (
-          let vals, vecs = host_eigen_general rows n in
-          VTuple [| VComplexVec (ref vals); VComplexMat vecs |])
-      | _ -> assert false);
-    (* lu(A)/qr(A)/cholesky(A)/svd(A) -- real Julia's factorization objects,
-       here as VStruct values registered directly via declare_struct (not
-       through a parsed `struct ... end`, since these are host-defined result
-       types, not user code) so field names match real Julia's own
-       (`.L`/`.U`/`.p`, `.Q`/`.R`, `.L`/`.U`, `.U`/`.S`/`.V`). *)
-    declare_struct ~mutable_:false "LU" ~parent:"Any" ~type_params:[]
-      [ "L"; "U"; "p" ] [ [ "Matrix" ]; [ "Matrix" ]; [ "Vector" ] ];
-    declare_struct ~mutable_:false "QR" ~parent:"Any" ~type_params:[] [ "Q"; "R" ]
-      [ [ "Matrix" ]; [ "Matrix" ] ];
-    declare_struct ~mutable_:false "Cholesky" ~parent:"Any" ~type_params:[] [ "L"; "U" ]
-      [ [ "Matrix" ]; [ "Matrix" ] ];
-    declare_struct ~mutable_:false "SVD" ~parent:"Any" ~type_params:[] [ "U"; "S"; "V" ]
-      [ [ "Matrix" ]; [ "Vector" ]; [ "Matrix" ] ];
-    (* lu(A) -- square Matrix only, via faer's partial-pivoting LU (same
-       decomposition `solve`/`inv` already use internally). *)
-    Dispatch.defmethod "lu" [ [ "Matrix" ] ] (function
-      | [ VMat rows ] ->
-        let m = Array.length rows in
-        let n = if m = 0 then 0 else Array.length rows.(0) in
-        if m <> n then failwith "DimensionMismatch: lu needs a square Matrix"
-        else (
-          let l, u, p = host_lu rows n in
-          construct "LU" [ VMat l; VMat u; VVec (vecbuf_of_array p) ])
-      | _ -> assert false);
-    (* qr(A) -- any shape, thin/economy QR (k = min(m, n)), matching real
-       Julia's own default `qr` rather than the full square-Q variant. *)
-    Dispatch.defmethod "qr" [ [ "Matrix" ] ] (function
-      | [ VMat rows ] ->
-        let m = Array.length rows in
-        let n = if m = 0 then 0 else Array.length rows.(0) in
-        let q, r = host_qr rows m n in
-        construct "QR" [ VMat q; VMat r ]
-      | _ -> assert false);
-    (* cholesky(A) -- SYMMETRIC POSITIVE-DEFINITE square Matrix only. Plain
-       symmetry is cheap to check up front (reusing `is_symmetric` above, but
-       NOT `check_symmetric`'s message -- that one is worded for eigen's
-       Complex-result concern, irrelevant here). Positive-definiteness itself
-       isn't cheaply checkable up front -- a non-PD (but symmetric) input
-       reaches the Rust side and panics there (see kernel/src/lib.rs's own
-       comment on `cholesky` for why that's a disclosed gap, same as
-       eigen_symmetric's non-convergence case). *)
-    Dispatch.defmethod "cholesky" [ [ "Matrix" ] ] (function
-      | [ VMat rows ] ->
-        let m = Array.length rows in
-        let n = if m = 0 then 0 else Array.length rows.(0) in
-        if m <> n then failwith "DimensionMismatch: cholesky needs a square Matrix"
-        else if not (is_symmetric rows) then
-          failwith "cholesky needs a symmetric Matrix (real Julia requires an explicit `Symmetric` wrapper here too)"
-        else (
-          let l = host_cholesky rows n in
-          let u = Array.init n (fun i -> Array.init n (fun j -> l.(j).(i))) in
-          construct "Cholesky" [ VMat l; VMat u ])
-      | _ -> assert false);
-    (* svd(A) -- any shape, thin SVD (k = min(m, n)), the same faer call
-       `rank` above already makes. *)
-    Dispatch.defmethod "svd" [ [ "Matrix" ] ] (function
-      | [ VMat rows ] ->
-        let m = Array.length rows in
-        let n = if m = 0 then 0 else Array.length rows.(0) in
-        let u, s, v = host_svd rows m n in
-        construct "SVD" [ VMat u; VVec (vecbuf_of_array s); VMat v ]
-      | _ -> assert false);
-    (* --- Stage 3: Symmetric/Diagonal/UpperTriangular/LowerTriangular --
-       ordinary structs wrapping a dense Matrix (or, for Diagonal, a Vector),
-       CORRECT for `*`/`\`/`det`/`inv`/`tr` -- matching real Julia's own
-       field names (`data` for the three Matrix-wrappers, `diag` for
-       Diagonal). Matching real Julia's actual COMPUTATIONAL COMPLEXITY is a
-       separate, harder goal (see ROADMAP.md Stage 3) -- Diagonal gets the
-       real O(n)/O(n^2) treatment below since it costs nothing extra, but
-       Symmetric/UpperTriangular/LowerTriangular fall back to densifying to
-       a plain Matrix and redispatching through the already-existing dense
-       methods (still O(n^3) under the hood, just correct). *)
-    declare_struct ~mutable_:false "Symmetric" ~parent:"Any" ~type_params:[] [ "data" ] [ [ "Matrix" ] ];
-    declare_struct ~mutable_:false "UpperTriangular" ~parent:"Any" ~type_params:[] [ "data" ] [ [ "Matrix" ] ];
-    declare_struct ~mutable_:false "LowerTriangular" ~parent:"Any" ~type_params:[] [ "data" ] [ [ "Matrix" ] ];
-    declare_struct ~mutable_:false "Diagonal" ~parent:"Any" ~type_params:[] [ "diag" ] [ [ "Vector" ] ];
-    let mat_field = function
-      | VStruct { fields; _ } -> (
-        match !(snd fields.(0)) with
-        | VMat m -> m
-        | _ -> assert false)
-      | _ -> assert false
-    in
-    let vec_field = function
-      | VStruct { fields; _ } -> (
-        match !(snd fields.(0)) with
-        | VVec v -> vecbuf_to_array v
-        | _ -> assert false)
-      | _ -> assert false
-    in
-    (* Symmetric(A) always takes the UPPER triangle as the source of truth
-       (real Julia's own default -- `Symmetric(A, :L)` for the lower-triangle
-       variant isn't attempted here); mirrored eagerly into a genuinely
-       symmetric dense Matrix whenever one is actually needed, rather than
-       lazily at read time. *)
-    let symmetric_dense rows =
-      let n = Array.length rows in
-      Array.init n (fun i -> Array.init n (fun j -> if j >= i then rows.(i).(j) else rows.(j).(i)))
-    in
-    let upper_dense rows =
-      let n = Array.length rows in
-      Array.init n (fun i -> Array.init n (fun j -> if j >= i then rows.(i).(j) else 0.0))
-    in
-    let lower_dense rows =
-      let n = Array.length rows in
-      Array.init n (fun i -> Array.init n (fun j -> if j <= i then rows.(i).(j) else 0.0))
-    in
-    let require_square rows who =
-      let m = Array.length rows in
-      let n = if m = 0 then 0 else Array.length rows.(0) in
-      if m <> n then failwith (Printf.sprintf "DimensionMismatch: %s needs a square Matrix" who)
-    in
-    (* custom 1-arg constructors, purely to raise a real DimensionMismatch
-       immediately (matching real Julia) rather than only failing later, the
-       first time something actually operates on a non-square wrapped Matrix *)
-    Dispatch.defmethod "Symmetric" [ [ "Matrix" ] ] (function
-      | [ VMat rows ] ->
-        require_square rows "Symmetric";
-        construct "Symmetric" [ VMat rows ]
-      | _ -> assert false);
-    Dispatch.defmethod "UpperTriangular" [ [ "Matrix" ] ] (function
-      | [ VMat rows ] ->
-        require_square rows "UpperTriangular";
-        construct "UpperTriangular" [ VMat rows ]
-      | _ -> assert false);
-    Dispatch.defmethod "LowerTriangular" [ [ "Matrix" ] ] (function
-      | [ VMat rows ] ->
-        require_square rows "LowerTriangular";
-        construct "LowerTriangular" [ VMat rows ]
-      | _ -> assert false);
-    (* `*` -- Diagonal gets its real O(n)/O(n^2) shape directly; the other
-       three densify and redispatch to the plain-Matrix `*` already above. *)
-    Dispatch.defmethod "*" [ [ "Diagonal" ]; [ "Vector" ] ] (function
-      | [ d; VVec v ] -> VVec (vecbuf_of_array (Array.map2 ( *. ) (vec_field d) (vecbuf_to_array v)))
-      | _ -> assert false);
-    Dispatch.defmethod "*" [ [ "Diagonal" ]; [ "Matrix" ] ] (function
-      | [ d; VMat rows ] ->
-        let dv = vec_field d in
-        VMat (Array.mapi (fun i row -> Array.map (fun x -> x *. dv.(i)) row) rows)
-      | _ -> assert false);
-    Dispatch.defmethod "*" [ [ "Matrix" ]; [ "Diagonal" ] ] (function
-      | [ VMat rows; d ] ->
-        let dv = vec_field d in
-        VMat (Array.map (fun row -> Array.mapi (fun j x -> x *. dv.(j)) row) rows)
-      | _ -> assert false);
-    Dispatch.defmethod "*" [ [ "Diagonal" ]; [ "Diagonal" ] ] (function
-      | [ a; b ] -> construct "Diagonal" [ VVec (vecbuf_of_array (Array.map2 ( *. ) (vec_field a) (vec_field b))) ]
-      | _ -> assert false);
-    Dispatch.defmethod "*" [ [ "Number" ]; [ "Diagonal" ] ] (function
-      | [ s; d ] -> construct "Diagonal" [ VVec (vecbuf_of_array (Array.map (fun x -> as_float s *. x) (vec_field d))) ]
-      | _ -> assert false);
-    Dispatch.defmethod "*" [ [ "Diagonal" ]; [ "Number" ] ] (function
-      | [ d; s ] -> construct "Diagonal" [ VVec (vecbuf_of_array (Array.map (fun x -> x *. as_float s) (vec_field d))) ]
-      | _ -> assert false);
-    List.iter
-      (fun kind ->
-        let densify = if kind = "Symmetric" then symmetric_dense else if kind = "UpperTriangular" then upper_dense else lower_dense in
-        Dispatch.defmethod "*" [ [ kind ]; [ "Vector" ] ] (fun args ->
-            match args with
-            | [ w; v ] -> Dispatch.call "*" [ VMat (densify (mat_field w)); v ]
-            | _ -> assert false);
-        Dispatch.defmethod "*" [ [ kind ]; [ "Matrix" ] ] (fun args ->
-            match args with
-            | [ w; m ] -> Dispatch.call "*" [ VMat (densify (mat_field w)); m ]
-            | _ -> assert false);
-        Dispatch.defmethod "\\" [ [ kind ]; [ "Vector" ] ] (fun args ->
-            match args with
-            | [ w; b ] -> Dispatch.call "\\" [ VMat (densify (mat_field w)); b ]
-            | _ -> assert false);
-        Dispatch.defmethod "inv" [ [ kind ] ] (fun args ->
-            match args with
-            | [ w ] -> Dispatch.call "inv" [ VMat (densify (mat_field w)) ]
-            | _ -> assert false))
-      [ "Symmetric"; "UpperTriangular"; "LowerTriangular" ];
-    (* `\` -- Diagonal's own O(n) shape (elementwise divide); same disclosed
-       gap as the plain-Matrix `\` above -- a zero diagonal entry isn't
-       turned into a `SingularException`, it silently produces Inf/NaN. *)
-    Dispatch.defmethod "\\" [ [ "Diagonal" ]; [ "Vector" ] ] (function
-      | [ d; VVec b ] -> VVec (vecbuf_of_array (Array.map2 ( /. ) (vecbuf_to_array b) (vec_field d)))
-      | _ -> assert false);
-    (* `det` -- Diagonal AND the two triangular wrappers all have a real,
-       cheap O(n) shortcut (product of the diagonal) that real Julia's own
-       `det` uses too for these types; Symmetric has no such shortcut (a
-       symmetric matrix's determinant still needs a real factorization), so
-       it densifies and redispatches like the others above. *)
-    Dispatch.defmethod "det" [ [ "Diagonal" ] ] (function
-      | [ d ] -> VFloat (Array.fold_left ( *. ) 1.0 (vec_field d))
-      | _ -> assert false);
-    let triangular_det kind =
-      Dispatch.defmethod "det" [ [ kind ] ] (function
-        | [ w ] ->
-          let rows = mat_field w in
-          VFloat (Array.fold_left ( *. ) 1.0 (Array.init (Array.length rows) (fun i -> rows.(i).(i))))
-        | _ -> assert false)
-    in
-    triangular_det "UpperTriangular";
-    triangular_det "LowerTriangular";
-    Dispatch.defmethod "det" [ [ "Symmetric" ] ] (function
-      | [ w ] -> Dispatch.call "det" [ VMat (symmetric_dense (mat_field w)) ]
-      | _ -> assert false);
-    (* `inv` -- Diagonal's own O(n) shape (elementwise reciprocal); same
-       disclosed not-a-`SingularException` gap as `\` above. *)
-    Dispatch.defmethod "inv" [ [ "Diagonal" ] ] (function
-      | [ d ] -> construct "Diagonal" [ VVec (vecbuf_of_array (Array.map (fun x -> 1.0 /. x) (vec_field d))) ]
-      | _ -> assert false);
-    (* `tr` -- all four read straight off the stored diagonal (Symmetric's
-       diagonal is shared between the upper/lower triangles it never
-       actually mirrors, so this needs no densifying at all). *)
-    Dispatch.defmethod "tr" [ [ "Diagonal" ] ] (function
-      | [ d ] -> VFloat (Array.fold_left ( +. ) 0.0 (vec_field d))
-      | _ -> assert false);
-    List.iter
-      (fun kind ->
-        Dispatch.defmethod "tr" [ [ kind ] ] (function
-          | [ w ] ->
-            let rows = mat_field w in
-            VFloat (Array.fold_left ( +. ) 0.0 (Array.init (Array.length rows) (fun i -> rows.(i).(i))))
-          | _ -> assert false))
-      [ "Symmetric"; "UpperTriangular"; "LowerTriangular" ];
-    (* eigvals(F)/eigvecs(F)/eigen(F)/cholesky(F) for F::Symmetric -- the
-       real-Julia-idiomatic way to ask for these (dispatching on TYPE, not
-       the runtime `is_symmetric` value-check the plain-Matrix methods above
-       still need for a bare Matrix argument). Densifying first guarantees
-       genuine symmetry no matter what `data`'s untouched lower triangle
-       happened to hold, so redispatching to the already-checked
-       plain-Matrix method always succeeds. *)
-    List.iter
-      (fun name ->
-        Dispatch.defmethod name [ [ "Symmetric" ] ] (function
-          | [ w ] -> Dispatch.call name [ VMat (symmetric_dense (mat_field w)) ]
-          | _ -> assert false))
-      [ "eigvals"; "eigvecs"; "eigen"; "cholesky" ];
-    (* --- Tridiagonal(dl, d, du) -- the one Stage 3 wrapper NOT built on a
-       single dense-Matrix/Vector field: three separate Vectors (real
-       Julia's own field names), `dl`/`du` one shorter than `d`. Unlike
-       Symmetric/UpperTriangular/LowerTriangular above, `*`/`\`/`det`/`tr`
-       all get their REAL O(n) shape here (not a densify-and-redispatch
-       fallback) -- the whole point of a Tridiagonal type in real Julia is
-       that these algorithms (banded matvec, the Thomas algorithm, the
-       3-term determinant recurrence) are genuinely simple at this
-       bandwidth, not merely possible. Only `inv` still densifies: a
-       tridiagonal matrix's inverse is generally DENSE (no shortcut shape to
-       return it in), so there's nothing cheaper to do than the plain-Matrix
-       path. *)
-    declare_struct ~mutable_:false "Tridiagonal" ~parent:"Any" ~type_params:[] [ "dl"; "d"; "du" ]
-      [ [ "Vector" ]; [ "Vector" ]; [ "Vector" ] ];
-    let tridiag_fields = function
-      | VStruct { fields; _ } ->
-        let get i = match !(snd fields.(i)) with VVec v -> vecbuf_to_array v | _ -> assert false in
-        get 0, get 1, get 2
-      | _ -> assert false
-    in
-    let tridiag_dense dl d du =
-      let n = Array.length d in
-      Array.init n (fun i ->
-          Array.init n (fun j ->
-              if i = j then d.(i)
-              else if j = i - 1 then dl.(j)
-              else if j = i + 1 then du.(i)
-              else 0.0))
-    in
-    (* real Julia raises DimensionMismatch immediately for mismatched
-       lengths, same as the square-check the other three wrappers do at
-       construction *)
-    Dispatch.defmethod "Tridiagonal" [ [ "Vector" ]; [ "Vector" ]; [ "Vector" ] ] (function
-      | [ VVec dl; VVec d; VVec du ] ->
-        let n = vecbuf_length d in
-        if vecbuf_length dl <> n - 1 || vecbuf_length du <> n - 1 then
-          failwith
-            (Printf.sprintf
-               "DimensionMismatch: Tridiagonal needs dl/du one shorter than d (got %d/%d/%d)"
-               (vecbuf_length dl) n (vecbuf_length du))
-        else construct "Tridiagonal" [ VVec dl; VVec d; VVec du ]
-      | _ -> assert false);
-    (* A * v -- each row touches at most 3 entries, real O(n). *)
-    Dispatch.defmethod "*" [ [ "Tridiagonal" ]; [ "Vector" ] ] (function
-      | [ t; VVec v ] ->
-        let dl, d, du = tridiag_fields t in
-        let v = vecbuf_to_array v in
-        let n = Array.length d in
-        VVec
-          (vecbuf_of_array
-             (Array.init n (fun i ->
-                  let diag_term = d.(i) *. v.(i) in
-                  let lower_term = if i > 0 then dl.(i - 1) *. v.(i - 1) else 0.0 in
-                  let upper_term = if i < n - 1 then du.(i) *. v.(i + 1) else 0.0 in
-                  diag_term +. lower_term +. upper_term)))
-      | _ -> assert false);
-    (* A * B (Matrix) -- no banded shortcut worth the code for a right-hand
-       side that's already dense; densify and redispatch, same as
-       Symmetric/UpperTriangular/LowerTriangular's own Matrix case. *)
-    Dispatch.defmethod "*" [ [ "Tridiagonal" ]; [ "Matrix" ] ] (function
-      | [ t; m ] ->
-        let dl, d, du = tridiag_fields t in
-        Dispatch.call "*" [ VMat (tridiag_dense dl d du); m ]
-      | _ -> assert false);
-    (* A \ b -- the Thomas algorithm: one forward elimination sweep, one back-
-       substitution sweep, O(n) total instead of a full O(n^3) dense solve.
-       Naive Thomas (unlike real LAPACK's `dgtsv`, which partial-pivots)
-       has NO pivoting at all, so a zero pivot can turn up mid-sweep even
-       for a perfectly well-conditioned, nonsingular A -- verified this
-       actually happens, not just a theoretical worry (a hand-picked 4x4
-       tridiagonal test case hit `m = 0.0` on the third row and produced
-       NaN throughout before this fallback was added). Rather than ship
-       that silent NaN, a zero pivot bails out to the dense `\` above
-       (still correct, just not the O(n) fast path) -- a genuinely singular
-       A still isn't detected as such, same disclosed gap as every other
-       `\`/`inv` in this file, just via the dense path's own LU instead of
-       Thomas's arithmetic blowing up directly. *)
-    Dispatch.defmethod "\\" [ [ "Tridiagonal" ]; [ "Vector" ] ] (function
-      | [ t; VVec b ] ->
-        let dl, d, du = tridiag_fields t in
-        let b = vecbuf_to_array b in
-        let n = Array.length d in
-        let dense_fallback () = Dispatch.call "\\" [ VMat (tridiag_dense dl d du); VVec (vecbuf_of_array b) ] in
-        if n = 0 then VVec (vecbuf_of_array [||])
-        else if n = 1 then VVec (vecbuf_of_array [| b.(0) /. d.(0) |])
-        else if d.(0) = 0.0 then dense_fallback ()
-        else (
-          let cp = Array.make n 0.0 and dp = Array.make n 0.0 in
-          cp.(0) <- du.(0) /. d.(0);
-          dp.(0) <- b.(0) /. d.(0);
-          let singular = ref false in
-          let i = ref 1 in
-          while (not !singular) && !i <= n - 2 do
-            let m = d.(!i) -. (dl.(!i - 1) *. cp.(!i - 1)) in
-            if m = 0.0 then singular := true
-            else (
-              cp.(!i) <- du.(!i) /. m;
-              dp.(!i) <- (b.(!i) -. (dl.(!i - 1) *. dp.(!i - 1))) /. m);
-            incr i
-          done;
-          if !singular then dense_fallback ()
-          else (
-            let m = d.(n - 1) -. (dl.(n - 2) *. cp.(n - 2)) in
-            if m = 0.0 then dense_fallback ()
-            else (
-              dp.(n - 1) <- (b.(n - 1) -. (dl.(n - 2) *. dp.(n - 2))) /. m;
-              let x = Array.make n 0.0 in
-              x.(n - 1) <- dp.(n - 1);
-              for i = n - 2 downto 0 do
-                x.(i) <- dp.(i) -. (cp.(i) *. x.(i + 1))
-              done;
-              VVec (vecbuf_of_array x))))
-      | _ -> assert false);
-    (* det(A) -- the standard 3-term recurrence for a tridiagonal
-       determinant (D_0 = 1, D_1 = d_1, D_k = d_k*D_{k-1} - dl_{k-1}*du_{k-1}*D_{k-2}),
-       real O(n) instead of a full O(n^3) LU-based det. *)
-    Dispatch.defmethod "det" [ [ "Tridiagonal" ] ] (function
-      | [ t ] ->
-        let dl, d, du = tridiag_fields t in
-        let n = Array.length d in
-        if n = 0 then VFloat 1.0
-        else (
-          let g0 = ref 1.0 and g1 = ref d.(0) in
-          for k = 2 to n do
-            let gk = (d.(k - 1) *. !g1) -. (dl.(k - 2) *. du.(k - 2) *. !g0) in
-            g0 := !g1;
-            g1 := gk
-          done;
-          VFloat !g1)
-      | _ -> assert false);
-    (* inv(A) -- a tridiagonal matrix's inverse is generally dense (no
-       compact shape to return it in), so there's no shortcut here: densify
-       and redispatch, same as Symmetric's own `inv` above. *)
-    Dispatch.defmethod "inv" [ [ "Tridiagonal" ] ] (function
-      | [ t ] ->
-        let dl, d, du = tridiag_fields t in
-        Dispatch.call "inv" [ VMat (tridiag_dense dl d du) ]
-      | _ -> assert false);
-    (* tr(A) -- sum of `d`, real O(n). *)
-    Dispatch.defmethod "tr" [ [ "Tridiagonal" ] ] (function
-      | [ t ] ->
-        let _, d, _ = tridiag_fields t in
-        VFloat (Array.fold_left ( +. ) 0.0 d)
-      | _ -> assert false);
-    (* --- the "long tail" of smaller LinearAlgebra functions (ROADMAP.md
-       Stage 4's own list): issymmetric/ishermitian, isposdef, logdet, cond,
-       pinv, nullspace, kron. Each is either a cheap OCaml-only check/reuse
-       of an existing method (`logdet` redispatches to `det`, `cond`/`pinv`/
-       `nullspace` all redispatch to `svd`) or, for `isposdef`, one small new
-       Rust FFI export (`is_posdef` -- the same Cholesky attempt `cholesky`
-       above makes, just reporting success/failure instead of panicking). *)
-    let is_square_symmetric rows =
-      let m = Array.length rows in
-      let n = if m = 0 then 0 else Array.length rows.(0) in
-      m = n && is_symmetric rows
-    in
-    (* issymmetric(A)/ishermitian(A) -- identical for Tsubaki's real-only
-       Matrix (Hermitian collapses to symmetric with no imaginary part to
-       conjugate away); a non-square Matrix is simply not symmetric, same as
-       real Julia, rather than an error. *)
-    List.iter
-      (fun name ->
-        Dispatch.defmethod name [ [ "Matrix" ] ] (function
-          | [ VMat rows ] -> VBool (is_square_symmetric rows)
-          | _ -> assert false);
-        (* a Symmetric wrapper is trivially symmetric/Hermitian by
-           construction -- no need to even look at its `data` *)
-        Dispatch.defmethod name [ [ "Symmetric" ] ] (function
-          | [ _ ] -> VBool true
-          | _ -> assert false))
-      [ "issymmetric"; "ishermitian" ];
-    (* isposdef(A) -- real Julia's own definition requires symmetry first
-       (`issymmetric(A) && isposdef(cholesky(A; check=false))`); a
-       Symmetric wrapper skips straight to the Cholesky attempt, same as
-       `eigvals`/`cholesky` on Symmetric above. *)
-    Dispatch.defmethod "isposdef" [ [ "Matrix" ] ] (function
-      | [ VMat rows ] -> VBool (is_square_symmetric rows && host_is_posdef rows (Array.length rows))
-      | _ -> assert false);
-    Dispatch.defmethod "isposdef" [ [ "Symmetric" ] ] (function
-      | [ w ] ->
-        let rows = symmetric_dense (mat_field w) in
-        VBool (host_is_posdef rows (Array.length rows))
-      | _ -> assert false);
-    (* logdet(A) -- avoids the overflow a naive `log(det(A))` risks (an
-       enormous `A` can overflow `det` to `Inf` before `log` ever runs) by
-       summing logs of individual factors instead of multiplying them all
-       together first, the same idea real Julia's own factorization-based
-       `logdet` uses. Real Julia also raises for a negative determinant
-       (the honest result would be Complex, which `logdet` promises never
-       to return) -- matched here as a plain `failwith` rather than
-       actually producing a Complex. *)
-    let raise_negative_logdet () =
-      failwith "DomainError: logdet requires a nonnegative determinant (real Julia would return a Complex here)"
-    in
-    (* the parity of a 0-based permutation array (+1 even / -1 odd number of
-       transpositions) -- via cycle decomposition, a cycle of length L
-       contributes (L-1) transpositions. Needed to recover det's SIGN from
-       an LU factorization's `P` (det(A) = sign(P) * prod(U_ii): `P*A = L*U`,
-       det(L) = 1 since L is unit lower-triangular, and det(P) = sign(P) is
-       its own inverse since P is a permutation matrix). *)
-    let permutation_sign p =
-      let n = Array.length p in
-      let visited = Array.make n false in
-      let sign = ref 1 in
-      for i = 0 to n - 1 do
-        if not visited.(i) then (
-          let cycle_len = ref 0 in
-          let j = ref i in
-          while not visited.(!j) do
-            visited.(!j) <- true;
-            j := p.(!j);
-            incr cycle_len
-          done;
-          if (!cycle_len - 1) mod 2 = 1 then sign := - !sign)
-      done;
-      !sign
-    in
-    (* Matrix -- redispatches to the existing `lu`, then sums log|U_ii| with
-       sign tracking (permutation parity * sign of each U_ii), instead of
-       computing the full product (= det) first. *)
-    Dispatch.defmethod "logdet" [ [ "Matrix" ] ] (function
-      | [ v ] -> (
-        match Dispatch.call "lu" [ v ] with
-        | VStruct { fields; _ } -> (
-          match !(snd fields.(1)), !(snd fields.(2)) with
-          | VMat u, VVec p ->
-            let n = Array.length u in
-            let p0 = Array.map (fun x -> int_of_float x - 1) (vecbuf_to_array p) in
-            let sign = ref (permutation_sign p0) in
-            let logsum = ref 0.0 in
-            for i = 0 to n - 1 do
-              let uii = u.(i).(i) in
-              if uii < 0.0 then sign := - !sign;
-              logsum := !logsum +. log (Float.abs uii)
-            done;
-            if !sign < 0 then raise_negative_logdet () else VFloat !logsum
-          | _ -> assert false)
-        | _ -> assert false)
-      | _ -> assert false);
-    (* Diagonal / UpperTriangular / LowerTriangular -- the determinant is
-       already a plain product of diagonal entries (see `det` above for
-       each), so the overflow-avoiding form is even simpler here: sum
-       log|entry| directly, no factorization needed at all. *)
-    Dispatch.defmethod "logdet" [ [ "Diagonal" ] ] (function
-      | [ d ] ->
-        let diag = vec_field d in
-        let sign = ref 1 and logsum = ref 0.0 in
-        Array.iter
-          (fun x ->
-            if x < 0.0 then sign := - !sign;
-            logsum := !logsum +. log (Float.abs x))
-          diag;
-        if !sign < 0 then raise_negative_logdet () else VFloat !logsum
-      | _ -> assert false);
-    List.iter
-      (fun kind ->
-        Dispatch.defmethod "logdet" [ [ kind ] ] (function
-          | [ w ] ->
-            let rows = mat_field w in
-            let sign = ref 1 and logsum = ref 0.0 in
-            for i = 0 to Array.length rows - 1 do
-              let x = rows.(i).(i) in
-              if x < 0.0 then sign := - !sign;
-              logsum := !logsum +. log (Float.abs x)
-            done;
-            if !sign < 0 then raise_negative_logdet () else VFloat !logsum
-          | _ -> assert false))
-      [ "UpperTriangular"; "LowerTriangular" ];
-    (* Symmetric -- no shortcut of its own (same as `det`/`inv` above):
-       densify and redispatch to the now-overflow-avoiding Matrix method. *)
-    Dispatch.defmethod "logdet" [ [ "Symmetric" ] ] (function
-      | [ w ] -> Dispatch.call "logdet" [ VMat (symmetric_dense (mat_field w)) ]
-      | _ -> assert false);
-    (* Tridiagonal -- **disclosed gap, narrower than before**: still
-       `log(det(A))` via the existing 3-term recurrence, which itself can
-       overflow for a large enough `A` before `log` ever runs. A genuinely
-       overflow-safe version would need to carry the recurrence's running
-       sign and log-magnitude through its OWN subtraction step (`D_k = d_k *
-       D_{k-1} - dl_{k-1} * du_{k-1} * D_{k-2}`), which -- unlike the
-       product-only Matrix/Diagonal/triangular cases above -- can't be done
-       by just summing logs; it needs real log-domain arithmetic through a
-       subtraction, a harder numerical-analysis problem than this "long
-       tail" round attempts. Falls through to the generic fallback below. *)
-    Dispatch.defmethod "logdet" [ [ "Any" ] ] (function
-      | [ v ] ->
-        let d = as_float (Dispatch.call "det" [ v ]) in
-        if d < 0.0 then raise_negative_logdet () else VFloat (log d)
-      | _ -> assert false);
-    (* cond(A) -- the 2-norm condition number (largest singular value /
-       smallest), real Julia's own default `cond(A, 2)`; redispatches to
-       the existing `svd`, whose `S` already comes back sorted
-       nonincreasing (see kernel/src/lib.rs's own comment on `svd`). *)
-    Dispatch.defmethod "cond" [ [ "Matrix" ] ] (function
-      | [ VMat rows ] -> (
-        match Dispatch.call "svd" [ VMat rows ] with
-        | VStruct { fields; _ } -> (
-          match !(snd fields.(1)) with
-          | VVec s ->
-            let s = vecbuf_to_array s in
-            let k = Array.length s in
-            if k = 0 then VFloat 0.0 else VFloat (s.(0) /. s.(k - 1))
-          | _ -> assert false)
-        | _ -> assert false)
-      | _ -> assert false);
-    (* pinv(A) -- the Moore-Penrose pseudoinverse via the existing thin SVD:
-       pinv(A) = V * Sigma+ * U', Sigma+ zeroing out any singular value at
-       or below the same rank-tolerance `rank`/`nullspace` already use.
-       Correct for any shape (unlike `nullspace` below, this needs nothing
-       beyond what the thin SVD already provides -- pinv never needs the
-       "extra" null directions a wide matrix's FULL SVD would add). *)
-    Dispatch.defmethod "pinv" [ [ "Matrix" ] ] (function
-      | [ VMat rows ] -> (
-        let m = Array.length rows in
-        let n = if m = 0 then 0 else Array.length rows.(0) in
-        match Dispatch.call "svd" [ VMat rows ] with
-        | VStruct { fields; _ } -> (
-          match !(snd fields.(0)), !(snd fields.(1)), !(snd fields.(2)) with
-          | VMat u, VVec s, VMat v ->
-            let s = vecbuf_to_array s in
-            let k = Array.length s in
-            let smax = Array.fold_left Float.max 0.0 s in
-            let tol = smax *. float_of_int (max m n) *. epsilon_float in
-            VMat
-              (Array.init n (fun i ->
-                   Array.init m (fun j ->
-                       let acc = ref 0.0 in
-                       for r = 0 to k - 1 do
-                         if s.(r) > tol then acc := !acc +. (v.(i).(r) *. u.(j).(r) /. s.(r))
-                       done;
-                       !acc)))
-          | _ -> assert false)
-        | _ -> assert false)
-      | _ -> assert false);
-    (* cond/pinv on the Stage 3 wrapper types -- Diagonal gets its own real
-       O(n) shortcut (same spirit as `det`/`inv`/`tr` on Diagonal above);
-       the other four densify and redispatch to the plain-Matrix methods
-       just above. *)
-    Dispatch.defmethod "cond" [ [ "Diagonal" ] ] (function
-      | [ d ] ->
-        let diag = Array.map Float.abs (vec_field d) in
-        let dmax = Array.fold_left Float.max 0.0 diag in
-        let dmin = Array.fold_left Float.min Float.infinity diag in
-        VFloat (dmax /. dmin)
-      | _ -> assert false);
-    Dispatch.defmethod "pinv" [ [ "Diagonal" ] ] (function
-      | [ d ] ->
-        let diag = vec_field d in
-        let dmax = Array.fold_left (fun acc x -> Float.max acc (Float.abs x)) 0.0 diag in
-        let tol = dmax *. float_of_int (Array.length diag) *. epsilon_float in
-        construct "Diagonal"
-          [ VVec (vecbuf_of_array (Array.map (fun x -> if Float.abs x > tol then 1.0 /. x else 0.0) diag)) ]
-      | _ -> assert false);
-    List.iter
-      (fun kind ->
-        let densify = if kind = "Symmetric" then symmetric_dense else if kind = "UpperTriangular" then upper_dense else lower_dense in
-        Dispatch.defmethod "cond" [ [ kind ] ] (fun args ->
-            match args with
-            | [ w ] -> Dispatch.call "cond" [ VMat (densify (mat_field w)) ]
-            | _ -> assert false);
-        Dispatch.defmethod "pinv" [ [ kind ] ] (fun args ->
-            match args with
-            | [ w ] -> Dispatch.call "pinv" [ VMat (densify (mat_field w)) ]
-            | _ -> assert false))
-      [ "Symmetric"; "UpperTriangular"; "LowerTriangular" ];
-    Dispatch.defmethod "cond" [ [ "Tridiagonal" ] ] (function
-      | [ t ] ->
-        let dl, d, du = tridiag_fields t in
-        Dispatch.call "cond" [ VMat (tridiag_dense dl d du) ]
-      | _ -> assert false);
-    Dispatch.defmethod "pinv" [ [ "Tridiagonal" ] ] (function
-      | [ t ] ->
-        let dl, d, du = tridiag_fields t in
-        Dispatch.call "pinv" [ VMat (tridiag_dense dl d du) ]
-      | _ -> assert false);
-    (* nullspace(A) -- an orthonormal basis for A's null space. Uses the
-       FULL svd's V (host_svd_full_v, n x n -- unlike the thin `svd` builtin
-       above, whose V only has min(m,n) columns), the same way real Julia's
-       own `nullspace` internally calls `svd(A; full=true)` rather than its
-       own thin default: a column index beyond `k = min(m,n)` has no
-       corresponding singular value AT ALL (not even a zero one) and is
-       therefore automatically in the null space -- exactly the `(n - m)`
-       "extra" directions a wide `A` (m < n) has, which a thin V structurally
-       has no room to hold. This used to raise for `m < n` before
-       `svd_full_v` existed; now handles every shape uniformly. *)
-    Dispatch.defmethod "nullspace" [ [ "Matrix" ] ] (function
-      | [ VMat rows ] ->
-        let m = Array.length rows in
-        let n = if m = 0 then 0 else Array.length rows.(0) in
-        let v, s = host_svd_full_v rows m n in
-        let k = Array.length s in
-        let smax = Array.fold_left Float.max 0.0 s in
-        let tol = smax *. float_of_int (max m n) *. epsilon_float in
-        let null_idx = List.filter (fun r -> r >= k || s.(r) <= tol) (List.init n (fun i -> i)) in
-        let ncols = List.length null_idx in
-        let null_idx = Array.of_list null_idx in
-        VMat (Array.init n (fun i -> Array.init ncols (fun c -> v.(i).(null_idx.(c)))))
-      | _ -> assert false);
-    (* kron(A, B) -- the Kronecker product, pure combinatorics (no FFI
-       needed): each (i,j) block of the result is A[ia,ja] * B, so reading
-       it back out is just index arithmetic. Vector,Vector is the same idea
-       one dimension down. *)
-    Dispatch.defmethod "kron" [ [ "Matrix" ]; [ "Matrix" ] ] (function
-      | [ VMat a; VMat b ] ->
-        let ma = Array.length a and na = if Array.length a = 0 then 0 else Array.length a.(0) in
-        let mb = Array.length b and nb = if Array.length b = 0 then 0 else Array.length b.(0) in
-        VMat
-          (Array.init (ma * mb) (fun i ->
-               let ia = i / mb and ib = i mod mb in
-               Array.init (na * nb) (fun j ->
-                   let ja = j / nb and jb = j mod nb in
-                   a.(ia).(ja) *. b.(ib).(jb))))
-      | _ -> assert false);
-    Dispatch.defmethod "kron" [ [ "Vector" ]; [ "Vector" ] ] (function
-      | [ VVec a; VVec b ] ->
-        let a = vecbuf_to_array a and b = vecbuf_to_array b in
-        let na = Array.length a and nb = Array.length b in
-        VVec (vecbuf_of_array (Array.init (na * nb) (fun i -> a.(i / nb) *. b.(i mod nb))))
-      | _ -> assert false);
-    (* --- SparseMatrixCSC (ROADMAP.md Stage 4's sparse-matrix design sketch)
-       -- a plain COO/triplet list (see VSparseMat's own comment for why),
-       rebuilt into a real faer `SparseColMat` fresh on every operation, the
-       same "no cached factorization state across FFI calls" convention
-       every dense decomposition in this file already follows. *)
-    (* sparse(I, J, V, m, n) -- real Julia's own COO constructor: I/J are
-       1-based row/col Vectors, V the matching values, converted to 0-based
-       here before ever crossing into OCaml's own VSparseMat, let alone
-       Rust. *)
-    Dispatch.defmethod "sparse" [ [ "Vector" ]; [ "Vector" ]; [ "Vector" ]; [ "Int" ]; [ "Int" ] ] (function
-      | [ VVec i; VVec j; VVec v; VInt m; VInt n ] ->
-        let rows = Array.map (fun x -> int_of_float x - 1) (vecbuf_to_array i) in
-        let cols = Array.map (fun x -> int_of_float x - 1) (vecbuf_to_array j) in
-        VSparseMat { m; n; rows; cols; vals = Array.copy (vecbuf_to_array v) }
-      | _ -> assert false);
-    (* spzeros(m, n) -- an empty sparse Matrix, zero stored entries. *)
-    Dispatch.defmethod "spzeros" [ [ "Int" ]; [ "Int" ] ] (function
-      | [ VInt m; VInt n ] -> VSparseMat { m; n; rows = [||]; cols = [||]; vals = [||] }
-      | _ -> assert false);
-    (* sparse(A) -- densify's inverse: extract A's nonzero entries into a
-       SparseMatrixCSC. Exactly zero entries are dropped, matching real
-       Julia's own `sparse(::Matrix)` (an entry that's merely small, not
-       exactly 0.0, is still kept -- no tolerance-based thresholding here,
-       same as real Julia). *)
-    Dispatch.defmethod "sparse" [ [ "Matrix" ] ] (function
-      | [ VMat rows_m ] ->
-        let m = Array.length rows_m in
-        let n = if m = 0 then 0 else Array.length rows_m.(0) in
-        let rows = ref [] and cols = ref [] and vals = ref [] in
-        for i = 0 to m - 1 do
-          for j = 0 to n - 1 do
-            if rows_m.(i).(j) <> 0.0 then (
-              rows := i :: !rows;
-              cols := j :: !cols;
-              vals := rows_m.(i).(j) :: !vals)
-          done
-        done;
-        VSparseMat
-          { m; n; rows = Array.of_list !rows; cols = Array.of_list !cols; vals = Array.of_list !vals }
-      | _ -> assert false);
-    (* Matrix(A) -- densify a SparseMatrixCSC back to a plain dense Matrix. *)
-    Dispatch.defmethod "Matrix" [ [ "SparseMatrixCSC" ] ] (function
-      | [ VSparseMat { m; n; rows; cols; vals } ] ->
-        let dense = Array.make_matrix m n 0.0 in
-        Array.iteri (fun k r -> dense.(r).(cols.(k)) <- vals.(k)) rows;
-        VMat dense
-      | _ -> assert false);
-    Dispatch.defmethod "nnz" [ [ "SparseMatrixCSC" ] ] (function
-      | [ VSparseMat { rows; _ } ] -> VInt (Array.length rows)
-      | _ -> assert false);
-    Dispatch.defmethod "size" [ [ "SparseMatrixCSC" ] ] (function
-      | [ VSparseMat { m; n; _ } ] -> VTuple [| VInt m; VInt n |]
-      | _ -> assert false);
-    (* A * v -- faer's own sparse matmul (`sparse_matvec` in
-       kernel/src/lib.rs), any shape (m x n times an n-vector). *)
-    Dispatch.defmethod "*" [ [ "SparseMatrixCSC" ]; [ "Vector" ] ] (function
-      | [ VSparseMat { m; n; rows; cols; vals }; VVec x ] ->
-        let x = vecbuf_to_array x in
-        if n <> Array.length x then
-          failwith (Printf.sprintf "DimensionMismatch: A is %dx%d, x has %d elements" m n (Array.length x))
-        else VVec (vecbuf_of_array (host_sparse_matvec rows cols vals m n x))
-      | _ -> assert false);
-    (* A \ b -- faer's own sparse LU (`sp_lu`, exploiting the sparsity
-       pattern, not a dense fallback), square A only, same disclosed
-       singularity gap as every other `\` in this file. *)
-    Dispatch.defmethod "\\" [ [ "SparseMatrixCSC" ]; [ "Vector" ] ] (function
-      | [ VSparseMat { m; n; rows; cols; vals }; VVec b ] ->
-        let b = vecbuf_to_array b in
-        if m <> n then failwith "DimensionMismatch: A \\ b only supports a square sparse A"
-        else if n <> Array.length b then
-          failwith (Printf.sprintf "DimensionMismatch: A is %dx%d, b has %d elements" m n (Array.length b))
-        else VVec (vecbuf_of_array (host_sparse_solve rows cols vals n b))
-      | _ -> assert false);
-    (* LinearAlgebra.I (UniformScaling) -- lazy, only becomes concrete when
-       combined with a real Matrix/Vector/scalar. `c*I`/`I*c` stays a scaled
-       UniformScaling (so `2I`, `A - 3I` work); `A ± I` needs A square
-       (real Julia's own constraint -- adding a scaled identity to a
-       non-square Matrix is a DimensionMismatch there too). *)
-    let add_scaled_identity rows c sign =
-      let m = Array.length rows in
-      let n = if m = 0 then 0 else Array.length rows.(0) in
-      if m <> n then failwith "DimensionMismatch: A ± I needs a square Matrix"
-      else Array.mapi (fun i row -> Array.mapi (fun j x -> if i = j then x +. (sign *. c) else x) row) rows
-    in
-    Dispatch.defmethod "+" [ [ "Matrix" ]; [ "UniformScaling" ] ] (function
-      | [ VMat rows; VUniformScaling c ] -> VMat (add_scaled_identity rows c 1.0)
-      | _ -> assert false);
-    Dispatch.defmethod "+" [ [ "UniformScaling" ]; [ "Matrix" ] ] (function
-      | [ VUniformScaling c; VMat rows ] -> VMat (add_scaled_identity rows c 1.0)
-      | _ -> assert false);
-    Dispatch.defmethod "-" [ [ "Matrix" ]; [ "UniformScaling" ] ] (function
-      | [ VMat rows; VUniformScaling c ] -> VMat (add_scaled_identity rows c (-1.0))
-      | _ -> assert false);
-    Dispatch.defmethod "-" [ [ "UniformScaling" ]; [ "Matrix" ] ] (function
-      (* I - A = -(A - I) *)
-      | [ VUniformScaling c; VMat rows ] -> VMat (Array.map (Array.map ( ~-. )) (add_scaled_identity rows c (-1.0)))
-      | _ -> assert false);
-    (* `-I` itself never reaches a genuine 1-arg call: unary minus desugars
-       to `0 - e` (see parse_unary), so what actually needs a method here is
-       Int - UniformScaling, not a standalone negation *)
-    Dispatch.defmethod "-" [ [ "Int" ]; [ "UniformScaling" ] ] (function
-      | [ VInt 0; VUniformScaling c ] -> VUniformScaling (-.c)
-      | [ VInt _; VUniformScaling _ ] -> failwith "Int - UniformScaling is only supported for 0 - I (unary negation)"
-      | _ -> assert false);
-    Dispatch.defmethod "*" [ [ "Number" ]; [ "UniformScaling" ] ] (function
-      | [ s; VUniformScaling c ] -> VUniformScaling (as_float s *. c)
-      | _ -> assert false);
-    Dispatch.defmethod "*" [ [ "UniformScaling" ]; [ "Number" ] ] (function
-      | [ VUniformScaling c; s ] -> VUniformScaling (c *. as_float s)
-      | _ -> assert false);
-    Dispatch.defmethod "*" [ [ "Matrix" ]; [ "UniformScaling" ] ] (function
-      | [ VMat rows; VUniformScaling c ] -> VMat (Array.map (Array.map (fun x -> x *. c)) rows)
-      | _ -> assert false);
-    Dispatch.defmethod "*" [ [ "UniformScaling" ]; [ "Matrix" ] ] (function
-      | [ VUniformScaling c; VMat rows ] -> VMat (Array.map (Array.map (fun x -> x *. c)) rows)
-      | _ -> assert false);
-    Dispatch.defmethod "*" [ [ "UniformScaling" ]; [ "Vector" ] ] (function
-      | [ VUniformScaling c; VVec v ] -> VVec (vecbuf_of_array (Array.map (fun x -> x *. c) (vecbuf_to_array v)))
-      | _ -> assert false);
-    Dispatch.defmethod "*" [ [ "Vector" ]; [ "UniformScaling" ] ] (function
-      | [ VVec v; VUniformScaling c ] -> VVec (vecbuf_of_array (Array.map (fun x -> x *. c) (vecbuf_to_array v)))
-      | _ -> assert false);
-    (* `± I` on the five Stage 3 wrapper types -- ROADMAP.md originally
-       flagged UniformScaling as needing "its own dedicated design" for
-       anything beyond plain Matrix/Vector/Number, but adding a scaled
-       identity only ever touches the DIAGONAL, and every one of these
-       wrapper types can absorb that without densifying at all: real
-       Julia's own `Diagonal(v) + I`, `Symmetric(A) + I`, `UpperTriangular
-       (A) + I`, `LowerTriangular(A) + I`, and `Tridiagonal(dl,d,du) + I`
-       all stay the SAME wrapper kind (only `d`/`diag`/the stored triangle's
-       diagonal changes), cheaper than Matrix's own densify-then-add. No
-       square check needed here (unlike Matrix's own `±I`): Symmetric/
-       UpperTriangular/LowerTriangular are already guaranteed square at
-       construction, and Diagonal/Tridiagonal are square by construction. *)
-    Dispatch.defmethod "+" [ [ "Diagonal" ]; [ "UniformScaling" ] ] (function
-      | [ d; VUniformScaling c ] -> construct "Diagonal" [ VVec (vecbuf_of_array (Array.map (fun x -> x +. c) (vec_field d))) ]
-      | _ -> assert false);
-    Dispatch.defmethod "+" [ [ "UniformScaling" ]; [ "Diagonal" ] ] (function
-      | [ VUniformScaling c; d ] -> construct "Diagonal" [ VVec (vecbuf_of_array (Array.map (fun x -> x +. c) (vec_field d))) ]
-      | _ -> assert false);
-    Dispatch.defmethod "-" [ [ "Diagonal" ]; [ "UniformScaling" ] ] (function
-      | [ d; VUniformScaling c ] -> construct "Diagonal" [ VVec (vecbuf_of_array (Array.map (fun x -> x -. c) (vec_field d))) ]
-      | _ -> assert false);
-    Dispatch.defmethod "-" [ [ "UniformScaling" ]; [ "Diagonal" ] ] (function
-      | [ VUniformScaling c; d ] -> construct "Diagonal" [ VVec (vecbuf_of_array (Array.map (fun x -> c -. x) (vec_field d))) ]
-      | _ -> assert false);
-    List.iter
-      (fun kind ->
-        let add_diag sign rows c =
-          Array.mapi (fun i row -> Array.mapi (fun j x -> if i = j then x +. (sign *. c) else x) row) rows
-        in
-        Dispatch.defmethod "+" [ [ kind ]; [ "UniformScaling" ] ] (function
-          | [ w; VUniformScaling c ] -> construct kind [ VMat (add_diag 1.0 (mat_field w) c) ]
-          | _ -> assert false);
-        Dispatch.defmethod "+" [ [ "UniformScaling" ]; [ kind ] ] (function
-          | [ VUniformScaling c; w ] -> construct kind [ VMat (add_diag 1.0 (mat_field w) c) ]
-          | _ -> assert false);
-        Dispatch.defmethod "-" [ [ kind ]; [ "UniformScaling" ] ] (function
-          | [ w; VUniformScaling c ] -> construct kind [ VMat (add_diag (-1.0) (mat_field w) c) ]
-          | _ -> assert false);
-        Dispatch.defmethod "-" [ [ "UniformScaling" ]; [ kind ] ] (function
-          | [ VUniformScaling c; w ] ->
-            let rows = mat_field w in
-            let negated = Array.map (Array.map ( ~-. )) rows in
-            construct kind [ VMat (add_diag 1.0 negated c) ]
-          | _ -> assert false))
-      [ "Symmetric"; "UpperTriangular"; "LowerTriangular" ];
-    Dispatch.defmethod "+" [ [ "Tridiagonal" ]; [ "UniformScaling" ] ] (function
-      | [ t; VUniformScaling c ] ->
-        let dl, d, du = tridiag_fields t in
-        construct "Tridiagonal" [ VVec (vecbuf_of_array dl); VVec (vecbuf_of_array (Array.map (fun x -> x +. c) d)); VVec (vecbuf_of_array du) ]
-      | _ -> assert false);
-    Dispatch.defmethod "+" [ [ "UniformScaling" ]; [ "Tridiagonal" ] ] (function
-      | [ VUniformScaling c; t ] ->
-        let dl, d, du = tridiag_fields t in
-        construct "Tridiagonal" [ VVec (vecbuf_of_array dl); VVec (vecbuf_of_array (Array.map (fun x -> x +. c) d)); VVec (vecbuf_of_array du) ]
-      | _ -> assert false);
-    Dispatch.defmethod "-" [ [ "Tridiagonal" ]; [ "UniformScaling" ] ] (function
-      | [ t; VUniformScaling c ] ->
-        let dl, d, du = tridiag_fields t in
-        construct "Tridiagonal" [ VVec (vecbuf_of_array dl); VVec (vecbuf_of_array (Array.map (fun x -> x -. c) d)); VVec (vecbuf_of_array du) ]
-      | _ -> assert false);
-    Dispatch.defmethod "-" [ [ "UniformScaling" ]; [ "Tridiagonal" ] ] (function
-      | [ VUniformScaling c; t ] ->
-        let dl, d, du = tridiag_fields t in
-        construct "Tridiagonal"
-          [ VVec (vecbuf_of_array (Array.map ( ~-. ) dl)); VVec (vecbuf_of_array (Array.map (fun x -> c -. x) d)); VVec (vecbuf_of_array (Array.map ( ~-. ) du)) ]
-      | _ -> assert false);
-    (* needed to run mandelperf's own real-benchmark body verbatim:
-       `sum(mandelperf())`, where mandelperf() is a 2D comprehension (a Matrix) *)
-    Dispatch.defmethod "sum" [ [ "Matrix" ] ] (function
-      | [ VMat rows ] -> VFloat (Array.fold_left (fun acc row -> acc +. Array.fold_left ( +. ) 0.0 row) 0.0 rows)
       | _ -> assert false);
     Dispatch.defmethod "sqrt" [ [ "Float" ] ] (function
       | [ VFloat f ] -> VFloat (sqrt f)
@@ -3492,7 +2680,15 @@
     def_math1 "log" log;
     def_math1 "floor" floor;
     def_math1 "ceil" ceil;
-    def_math1 "round" Float.round;
+    (* real Julia's `round` breaks a tie toward the EVEN neighbour
+       (RoundNearest, IEEE-754's default): round(2.5) is 2.0, round(3.5) is
+       4.0. OCaml's own Float.round rounds a tie away from zero, which quietly
+       disagreed on exactly the halves. *)
+    def_math1 "round" (fun x ->
+      let r = Float.round x in
+      if Float.abs (x -. Float.trunc x) <> 0.5 then r
+      else if Float.rem r 2.0 = 0.0 then r
+      else r -. Float.copy_sign 1.0 x);
     Dispatch.defmethod "atan2" [ [ "Number" ]; [ "Number" ] ] (function
       | [ y; x ] -> VFloat (atan2 (as_float y) (as_float x))
       | _ -> assert false);
@@ -3606,6 +2802,33 @@
     Dispatch.defmethod "length" [ [ "Array" ] ] (function
       | [ VArr { cells; _ } ] -> VInt (arrbuf_length cells)
       | _ -> assert false);
+    (* タプルにも長さがある(Julia もそう)。自分で組んだタプルを読み返すとき
+       に要る -- `(1px, :solid, c)` のような、並べて書いたものを数える *)
+    Dispatch.defmethod "length" [ [ "Tuple" ] ] (function
+      | [ VTuple vs ] -> VInt (Array.length vs)
+      | _ -> assert false);
+    (* `a[begin]` and `a[end]`, as ordinary functions -- for when the index is
+       worked out somewhere else. `a[begin + i]` is how an index that came from
+       a 0-origin world (a JS array, Python) is applied without writing the +1
+       by hand, and it says which world the +1 belongs to. Everything indexable
+       here starts at 1, so firstindex is a constant; if that ever stops being
+       true, this is where it stops. *)
+    Dispatch.defmethod "firstindex" [ [ "Vector"; "Array"; "Tuple" ] ] (function
+      | [ _ ] -> VInt 1
+      | _ -> assert false);
+    Dispatch.defmethod "lastindex" [ [ "Vector"; "Array"; "Tuple" ] ] (function
+      | [ VVec r ] -> VInt (vecbuf_length r)
+      | [ VArr { cells; _ } ] -> VInt (arrbuf_length cells)
+      | [ VTuple vs ] -> VInt (Array.length vs)
+      | _ -> assert false);
+    (* a Range knew how to be summed, maximized and iterated, but not how
+       many elements it has -- `length(1:2:9)` raised a MethodError. Counted,
+       never materialized, and empty when the step points away from the stop
+       (`length(5:1)` is 0, same as real Julia). *)
+    Dispatch.defmethod "length" [ [ "Range" ] ] (function
+      | [ VRange (a, s, b) ] -> VInt (if s = 0 then 0 else max 0 (((b - a) / s) + 1))
+      | [ VFRange (a, s, b) ] -> VInt (if s = 0.0 then 0 else max 0 (int_of_float (Float.floor ((b -. a) /. s)) + 1))
+      | _ -> assert false);
     (* Vector(x::Array)/Array(x::Vector): the missing interop between
        Runtime's two collection types -- VVec (flat numeric, what
        draw_rects/get_data/put_data/push!'s fast path all want) and VArr
@@ -3644,6 +2867,25 @@
       | _ -> assert false);
     Dispatch.defmethod "lowercase" [ [ "String" ] ] (function
       | [ VStr s ] -> VStr (String.lowercase_ascii s)
+      | _ -> assert false);
+    Dispatch.defmethod "uppercase" [ [ "String" ] ] (function
+      | [ VStr s ] -> VStr (String.uppercase_ascii s)
+      | _ -> assert false);
+    (* `length` already answered for every container here EXCEPT the one type
+       most likely to be asked -- `length("hello")` raised a MethodError.
+       Bytes, not codepoints, same as real Julia's own `length`-vs-`sizeof`
+       split resolves for ASCII (which is all this lexer accepts in a string
+       literal anyway). *)
+    Dispatch.defmethod "length" [ [ "String" ] ] (function
+      | [ VStr s ] -> VInt (String.length s)
+      | _ -> assert false);
+    (* real Julia concatenates strings with `*`, not `+` (`+` is deliberately
+       NOT defined for strings there at all, since concatenation isn't
+       commutative). Tsubaki's own pre-existing `+` stays -- removing it would
+       break existing programs for no gain -- but `*` is what someone writing
+       Julia reaches for, and its absence made real Julia source stop dead. *)
+    Dispatch.defmethod "*" [ [ "String" ]; [ "String" ] ] (function
+      | [ VStr a; VStr b ] -> VStr (a ^ b)
       | _ -> assert false);
     (* Expr(head, args) -- real Julia's own quoted-syntax constructor,
        letting a macro body BUILD new quoted syntax (not just inspect what

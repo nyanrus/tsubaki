@@ -109,10 +109,37 @@
 
   let patch b pos i = b.instrs.(pos) <- i
 
+  (* Removes the parser's source-position markers (Ast's SLine) from a body,
+     at every nesting level, before any of the compilers in this file look at
+     it. Everything here decides ELIGIBILITY by matching exact statement
+     shapes -- `[ SExpr (EAssign ...) ]`, a body of exactly one statement, and
+     so on -- and a marker sitting between those would not fail loudly, it
+     would silently stop the body from compiling and quietly hand back the
+     tree-walking interpreter instead. Stripping once, at each entry point,
+     means every shape-match below sees exactly the list it saw before line
+     numbers existed. *)
+  let rec strip_lines (body : stmt list) : stmt list =
+    List.filter_map
+      (function
+        | SLine _ -> None
+        | SIf (branches, else_body) ->
+          Some (SIf (List.map (fun (c, b) -> c, strip_lines b) branches, Option.map strip_lines else_body))
+        | SFor (t, e, b) -> Some (SFor (t, e, strip_lines b))
+        | SWhile (c, b) -> Some (SWhile (c, strip_lines b))
+        | STry (b, name, handler) -> Some (STry (strip_lines b, name, strip_lines handler))
+        | SFuncDecl (n, p, kw, b, cache) -> Some (SFuncDecl (n, p, kw, strip_lines b, cache))
+        | SModuleDecl (n, b) -> Some (SModuleDecl (n, strip_lines b))
+        | SMacroDecl (n, p, b) -> Some (SMacroDecl (n, p, strip_lines b))
+        | SMacroCall (n, s) -> Some (SMacroCall (n, List.hd (strip_lines [ s ])))
+        | ( SExpr _ | SReturn _ | SBreak | SContinue | SDestructure _ | SLocalTypedAssign _
+          | SStructDecl _ | SAbstractDecl _ | SUsing _ | SImport _ | SExport _ ) as s -> Some s)
+      body
+
   (* compiles a function body that takes no parameters (see the module
      comment) into bytecode; None if anything in the body falls outside
      the restricted subset above -- never raises to the caller *)
   let try_compile (body : stmt list) : (instr array * int) option =
+    let body = strip_lines body in
     let buf = mk_buf () in
     let slots : (string, int) Hashtbl.t = Hashtbl.create 8 in
     let next_slot = ref 0 in
@@ -466,6 +493,7 @@
       | _ -> failwith (Printf.sprintf "to_wgsl: malformed binding kind %S -- expected \"<kind>\" or \"<kind>:<ElementType>\"" raw)
 
     let try_compile (body : stmt list) (buffers : (string * string) list) : string option =
+      let body = strip_lines body in
       let buffer_info : (string, string * ty) Hashtbl.t = Hashtbl.create 4 in
       List.iter (fun (n, raw) -> Hashtbl.replace buffer_info n (parse_binding raw)) buffers;
       let locals : (string, ty) Hashtbl.t = Hashtbl.create 8 in
@@ -832,6 +860,7 @@
                type_name))
 
     let compile_stage (stage : [ `Vertex | `Fragment ]) (body : stmt list) (uniforms : (string * string) list) : string option =
+      let body = strip_lines body in
       let uniform_ty : (string, ty) Hashtbl.t = Hashtbl.create 4 in
       List.iter (fun (n, t) -> Hashtbl.replace uniform_ty n (parse_uniform_type t)) uniforms;
       let locals : (string, ty) Hashtbl.t = Hashtbl.create 8 in
@@ -1097,10 +1126,10 @@
     | EField (o, f) -> Option.map (fun o' -> EField (o', f)) (subst_expr env o)
     | EBinOp (op, a, b, _) -> (
       match subst_expr env a, subst_expr env b with
-      | Some a', Some b' -> Some (EBinOp (op, a', b', Dispatch.new_cache ()))
+      | Some a', Some b' -> Some (EBinOp (op, a', b', Caches.fresh_call ()))
       | _ -> None)
     | ECall (f, args, [], _) ->
-      Option.map (fun args' -> ECall (f, args', [], Dispatch.new_cache ())) (subst_list args)
+      Option.map (fun args' -> ECall (f, args', [], Caches.fresh_call ())) (subst_list args)
     | ETernary (c, t, f) -> (
       match subst_expr env c, subst_expr env t, subst_expr env f with
       | Some c', Some t', Some f' -> Some (ETernary (c', t', f'))
@@ -1118,10 +1147,12 @@
        a different method entirely. Runaway inlining is bounded at the call
        site instead (inline_depth, below), which costs nothing and can't
        misread a same-named method on other types as recursion. *)
-    let body_expr = match body with [ SExpr e ] -> Some e | [ SReturn (Some e) ] -> Some e | _ -> None in
+    let body_expr =
+      match strip_lines body with [ SExpr e ] -> Some e | [ SReturn (Some e) ] -> Some e | _ -> None
+    in
     match body_expr with
     | Some e when kwparams = [] && params <> [] && List.for_all simple_param params -> (
-      let self = List.map (fun p -> p.pname, EVar (p.pname, Runtime.new_var_cache ())) params in
+      let self = List.map (fun p -> p.pname, EVar (p.pname, Caches.fresh_var ())) params in
       match subst_expr self e with
       | None -> () (* body outside the allowed subset, or captures a global -- never inline *)
       | Some _ ->
@@ -1132,7 +1163,23 @@
         Hashtbl.replace inline_methods name ((sig_, params, e) :: prev))
     | _ -> ()
 
+  (* The operators Eval answers itself, before Dispatch is ever asked (see its
+     own EBinOp cases): short-circuit control flow, a range as a value, and the
+     ones whose meaning is built in rather than carried by a method. HBin goes
+     straight to Dispatch.call_cached, so compiling one of these here asks for
+     a method nobody ever defined -- `f() = "a" => 1` came back as
+     "MethodError: no method matching =>(String, Int)" while the same
+     expression at the top level was a Pair. Not eligible, tree-walk it.
+
+     "&&"/"||" need real lazy control flow, not a plain binop; ":" is only
+     supported as a for-loop's own iterator (see SFor below), not as a
+     standalone value; "=>" is a Pair, "==="/"!==" identity, "<:" a subtype
+     test on two names that are deliberately NOT evaluated, and "in" knows
+     ranges and collections that no method covers. *)
+  let not_a_method = [ "&&"; "||"; ":"; "=>"; "==="; "!=="; "<:"; "in" ]
+
   let try_compile_host (body : stmt list) : (Host.program * int) option =
+    let body = strip_lines body in
     let slots : (string, int) Hashtbl.t = Hashtbl.create 8 in
     let next_slot = ref 0 in
     let slot_for name =
@@ -1400,10 +1447,7 @@
       | EField (obj, name) -> Host.HField (compile_expr obj, name)
       | EArrayLit es -> Host.HMakeArray (List.map compile_expr es)
       | EBinOp (op, a, b, _) ->
-        if op = "&&" || op = "||" || op = ":" then raise Not_eligible
-          (* "&&"/"||" need real lazy control flow, not a plain binop; ":"
-             is only supported as a for-loop's own iterator (see SFor
-             below), not as a standalone value *);
+        if List.mem op not_a_method then raise Not_eligible;
         Host.HBin (op, compile_expr a, compile_expr b, Dispatch.new_cache ())
       (* --- specialized ECS opcodes: skip Dispatch.call_cached's name/
          argument-type resolution entirely for the handful of calls an ECS
@@ -1429,7 +1473,7 @@
              && !inline_depth < 8
              && inline_of c <> None ->
         incr inline_depth;
-        let r = compile_expr (ECall ("add_component!", [ obj; Option.get (inline_of c) ], [], Dispatch.new_cache ())) in
+        let r = compile_expr (ECall ("add_component!", [ obj; Option.get (inline_of c) ], [], Caches.fresh_call ())) in
         decr inline_depth;
         r
       (* SoA write: `add_component!(e, K(args...))` where K is SoA-eligible

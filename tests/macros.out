@@ -1,0 +1,13 @@
+eval of a quoted expression: 3
+@double(3 + 4) = 14
+@double(2) = 4
+@my_max(3, 7) = 7
+@my_max(9, 2) = 9
+outer tmp is still: this must survive untouched
+after @swap!(x, y): x = 2, y = 1
+  repeated
+  repeated
+  repeated
+hello, shiro
+  hinted loop 1
+  hinted loop 2

@@ -1,0 +1,7 @@
+AppState(["a", "b"], "b", 40)
+AppState(["a", "b"], "c", 32)
+AppState(["a", "b"], "a", 40)
+Opts(false, 1, "-")
+Opts(false, 3, "-")
+Opts(true, 1, "-")
+caught

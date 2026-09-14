@@ -56,12 +56,12 @@
 
   let rec resolve_expr s (e : expr) : unit =
     match e with
-    | EInt _ | EFloat _ | EStr _ | EBool _ | ENothing | EEnd | EQuoteSymbol _ | ETypedArrayNew _ | ETypeExpr _ -> ()
+    | EInt _ | EFloat _ | EStr _ | EBool _ | ENothing | EBegin | EEnd | EQuoteSymbol _ | ETypedArrayNew _ | ETypeExpr _ -> ()
     | ETypedArrayUndef (_, n_e) -> resolve_expr s n_e
     | ETypedMatrixUndef (_, m_e, n_e) ->
       resolve_expr s m_e;
       resolve_expr s n_e
-    | EVar (name, cache) -> resolve_var s name cache
+    | EVar (name, cache_id) -> resolve_var s name (Runtime.var_cache_at cache_id)
     | EBinOp (_, a, b, _) ->
       resolve_expr s a;
       resolve_expr s b
@@ -71,10 +71,20 @@
     | EQualifiedCall (_, _, args, kwargs, _) ->
       List.iter (resolve_expr s) args;
       List.iter (fun (_, e) -> resolve_expr s e) kwargs
+    | ESplat e -> resolve_expr s e
+    (* `let` は新しいスコープ。束ねる値は**外**で見て、体は中で見る *)
+    | ELet (binds, body) ->
+      List.iter (fun (_, e) -> resolve_expr s e) binds;
+      let inner = child s in
+      List.iter (fun (n, _) -> know inner n) binds;
+      resolve_stmt_list inner body
     | EField (o, _) -> resolve_expr s o
-    | EAssign (name, rhs, cache) ->
+    | EApply (f, args) ->
+      resolve_expr s f;
+      List.iter (resolve_expr s) args
+    | EAssign (name, rhs, cache_id) ->
       resolve_expr s rhs;
-      resolve_assign s name cache
+      resolve_assign s name (Runtime.var_cache_at cache_id)
     | EFieldAssign (o, _, rhs) ->
       resolve_expr s o;
       resolve_expr s rhs
@@ -85,13 +95,14 @@
       let s' = child s in
       List.iter (know s') params;
       resolve_stmt_list s' body
-    | EComprehension (body_e, clauses) ->
+    | EComprehension (body_e, clauses, cond) ->
       let s' = child s in
       List.iter
         (fun (target, iter_e) ->
           resolve_expr s iter_e;
           match target with FVSingle v -> know s' v | FVTuple names -> List.iter (know s') names)
         clauses;
+      Option.iter (resolve_expr s') cond;
       resolve_expr s' body_e
     | EIndex (o, idx) ->
       resolve_expr s o;
@@ -121,6 +132,9 @@
 
   and resolve_stmt s (st : stmt) : unit =
     match st with
+    | SLine _ -> () (* a source-position marker binds and references nothing *)
+    (* neither binds nor references a name *)
+    | SBreak | SContinue -> ()
     | SExpr e -> resolve_expr s e
     | SIf (branches, else_body) ->
       List.iter
@@ -170,7 +184,7 @@
       List.iter
         (fun (target, _ty) ->
           match target with
-          | EVar (name, cache) -> resolve_assign s name cache
+          | EVar (name, cache_id) -> resolve_assign s name (Runtime.var_cache_at cache_id)
           | (EField _ | EIndex _) as target -> resolve_expr s target
           | _ -> ())
         targets
@@ -227,9 +241,15 @@
     | EInterpAssign (target, rhs) ->
       resolve_expr s target;
       resolve_expr s rhs
-    | EInt _ | EFloat _ | EStr _ | EBool _ | ENothing | EEnd | EQuoteSymbol _
+    | EInt _ | EFloat _ | EStr _ | EBool _ | ENothing | EBegin | EEnd | EQuoteSymbol _
     | ETypedArrayUndef _ | ETypedMatrixUndef _ | EVar _ | ETypeExpr _ -> ()
     | ETypedArrayNew (_, elems) -> List.iter (resolve_quoted_expr s) elems
+    (* quoting one is refused outright (see Eval.expr_to_value); this only
+       walks past it, so an `$(...)` interpolation nested inside still gets
+       resolved before that refusal is ever reached *)
+    | EApply (f, args) ->
+      resolve_quoted_expr s f;
+      List.iter (resolve_quoted_expr s) args
     | EBinOp (_, a, b, _) ->
       resolve_quoted_expr s a;
       resolve_quoted_expr s b
@@ -239,6 +259,10 @@
     | EQualifiedCall (_, _, args, kwargs, _) ->
       List.iter (resolve_quoted_expr s) args;
       List.iter (fun (_, e) -> resolve_quoted_expr s e) kwargs
+    | ESplat e -> resolve_quoted_expr s e
+    | ELet (binds, body) ->
+      List.iter (fun (_, e) -> resolve_quoted_expr s e) binds;
+      ignore body
     | EField (o, _) -> resolve_quoted_expr s o
     | EAssign (_, rhs, _) -> resolve_quoted_expr s rhs
     | EFieldAssign (o, _, rhs) ->
@@ -270,7 +294,7 @@
        splice time by value_to_expr's hygiene rename. Only $(...) splices
        inside the body/iter exprs are ever real, scope-consulting code. *)
     | ELambda (_, body) -> List.iter (resolve_quoted_stmt s) body
-    | EComprehension (body_e, clauses) ->
+    | EComprehension (body_e, clauses, cond) ->
       List.iter (fun (_, iter_e) -> resolve_quoted_expr s iter_e) clauses;
       resolve_quoted_expr s body_e
     | EMacroCall (_, args) -> List.iter (resolve_quoted_expr s) args
@@ -278,6 +302,7 @@
 
   and resolve_quoted_stmt s (st : stmt) : unit =
     match st with
+    | SLine _ -> ()
     | SExpr e -> resolve_quoted_expr s e
     | SIf (branches, else_body) ->
       List.iter
@@ -297,6 +322,7 @@
     | SDestructure (targets, rhs) ->
       resolve_quoted_expr s rhs;
       List.iter (fun (t, _ty) -> resolve_quoted_expr s t) targets
+    | SBreak | SContinue
     | SFuncDecl _ | SStructDecl _ | SAbstractDecl _ | STry _ | SModuleDecl _ | SUsing _ | SImport _
     | SMacroDecl _ | SExport _ | SMacroCall _ | SLocalTypedAssign _ -> ()
     (* not quotable at all -- nothing to resolve *)

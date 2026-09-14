@@ -28,13 +28,26 @@ let read_file path =
    this module is instead loaded as a browser library (e.g. from
    museum.atfedi.de). Node is the only real caller of that CLI surface, so
    gate the whole thing on it actually being Node. *)
+let () = Async.install ()
+let () = Frontend.install ()
+
+(* `include("other.jl")` -- ここで開けている。drop の build は開けない
+   (bin/drop.ml のいちばん上に、そのわけがある) *)
+let () = Eval.install_include ()
+let () = Math.init ()
 let () = CurveBridge.init ()
 let () = GpuBridge.init ()
+let () = JsBridge.init ()
 let () = WebglBridge.init ()
 let () = PhysicsBridge.init ()
 let () = AudioBridge.init ()
 let () = Ecs.init ()
 let () = ParallelBridge.init ()
+
+(* last on purpose: this one tells the host Tsubaki is up, and the host's
+   callback runs Tsubaki code straight away -- so every other registration
+   above must already be in place (see ActorBridge.init's own comment) *)
+let () = ActorBridge.init ()
 
 (* the browser path (`is_node = false`): unlike CurveBridge (a self-
    contained toy that only ever registers f/add), a real Tsubaki PROGRAM
@@ -52,17 +65,45 @@ let () = ParallelBridge.init ()
    line and column); it was just wearing an OCaml uncaught-exception coat.
    Only the CLI path uses this: in a browser, an exception surfacing in the
    console with its stack is the more useful thing. *)
+(* an uncaught runtime error, reported WITH the place it happened: the
+   statement's own file and line (Runtime.current_position, kept current by
+   the SLine markers -- see Ast), then the chain of calls that led there,
+   innermost first. Before this, a runtime error named only what failed
+   ("no method matching describe(String)") and left finding it to the reader.
+   A CAUGHT error is untouched -- `catch e` still sees the same bare value
+   real Julia's own does, with no position glued onto its message. *)
+let report_runtime_error msg =
+  (* nothing unwinds the position or the frames on the way out of a raised
+     error (see Eval's tree_walk_impl), so they are still sitting exactly
+     where it happened *)
+  let where = Runtime.position_of !Runtime.current_file !Runtime.current_line in
+  print_endline (if where = "" then "tsubaki: " ^ msg else Printf.sprintf "tsubaki: %s\n  at %s" msg where);
+  match Runtime.frames_snapshot () with
+  | [] -> ()
+  | frames ->
+    print_endline "  in:";
+    List.iter (fun (name, line) -> print_endline (Printf.sprintf "    %s, called from line %d" name line)) frames
+
+(* --emit-tsb: 何枚かのソースを、一つの .tsb に畳んで書き出す(中身は Tsb)。
+   走らせるのは Rust の VM(tsbvm/)で、そちらは parser を持たない -- drop に
+   配るのはこの形。ビルドのときだけ要るので、bin/tsubakic.ml という道具にも
+   なっている(そちらは走らせる側の言葉を一つも積まない) *)
+let emit_tsb out (files : string list) =
+  let tsb = Tsb.of_files files in
+  Tsb.write_file out tsb;
+  prerr_endline (Printf.sprintf "%s: %d bytes" out (String.length tsb))
+
 let run_or_report src =
   match Eval.run src with
   | () -> ()
-  | exception Parser.Parse_error msg ->
+  | exception Ast.Parse_error msg ->
     print_endline ("tsubaki: " ^ msg);
     exit 1
   | exception Runtime.JuliaError v ->
-    print_endline ("tsubaki: " ^ Runtime.show v);
+    report_runtime_error (Runtime.show v);
     exit 1
   | exception Failure msg ->
-    print_endline ("tsubaki: " ^ msg);
+    report_runtime_error msg;
     exit 1
 
 let rec main () =
@@ -70,13 +111,21 @@ let rec main () =
   let is_node =
     Js.to_bool (Js.Unsafe.js_expr "!!(globalThis.process && globalThis.process.versions && globalThis.process.versions.node)")
   in
-  if not is_node then (
+  (* a host that drives Tsubaki through the actor bridge (tsubakiEval /
+     tsubakiCall) asks for no CLI and no demo *)
+  let embedded = Js.to_bool (Js.Unsafe.js_expr "globalThis.tsubakiEmbedded === true") in
+  if embedded then ()
+  else if not is_node then (
     let has_source = Js.to_bool (Js.Unsafe.js_expr "typeof globalThis.tsubakiSource === 'string'") in
     (* the host page also tells us where that source came from, so `include`
        can resolve a sibling file against it (see Eval's include) *)
     let has_path = Js.to_bool (Js.Unsafe.js_expr "typeof globalThis.tsubakiSourcePath === 'string'") in
-    if has_path then
-      Runtime.current_file_dir := Filename.dirname (Js.to_string (Js.Unsafe.js_expr "globalThis.tsubakiSourcePath"));
+    if has_path then (
+      let p = Js.to_string (Js.Unsafe.js_expr "globalThis.tsubakiSourcePath") in
+      Runtime.current_file_dir := Filename.dirname p;
+      (* so a runtime error in a browser-hosted program names its own file
+         too, the same way it does under the CLI *)
+      Runtime.current_file := p);
     if has_source then Eval.run (Js.to_string (Js.Unsafe.js_expr "globalThis.tsubakiSource")))
   else (
   (* the CLI, parsed as flags-in-any-order rather than by matching Sys.argv's
@@ -84,7 +133,9 @@ let rec main () =
      at all and fall silently through to the embedded demo below -- the demo
      runs, prints happily, and the file you asked for never runs at all. A
      mis-typed CLI must say so, not do something else convincingly. *)
-  let usage = "usage: tsubaki [--frames N] path/to/file.jl" in
+  let usage =
+    "usage: tsubaki [--repl | --emit-tsb out.tsb file.jl... | [--frames N] path/to/file.jl]"
+  in
   let die msg =
     print_endline ("tsubaki: " ^ msg);
     print_endline usage;
@@ -92,8 +143,18 @@ let rec main () =
   in
   let frames = ref None in
   let path = ref None in
+  let repl = ref false in
+  let emit_out = ref None in
+  let more_paths = ref [] in
   let rec parse = function
     | [] -> ()
+    | "--repl" :: rest ->
+      repl := true;
+      parse rest
+    | "--emit-tsb" :: out :: rest ->
+      emit_out := Some out;
+      parse rest
+    | [ "--emit-tsb" ] -> die "--emit-tsb wants a path to write"
     | "--frames" :: n_str :: rest ->
       (match int_of_string_opt n_str with
       | Some n when n >= 0 -> frames := Some n
@@ -102,11 +163,37 @@ let rec main () =
     | [ "--frames" ] -> die "--frames wants a frame count"
     | arg :: _ when String.length arg > 0 && arg.[0] = '-' -> die ("unknown option " ^ arg)
     | arg :: rest ->
-      if !path <> None then die ("more than one script given (" ^ Option.get !path ^ " and " ^ arg ^ ")");
+      (* --emit-tsb だけは何枚も受ける。drop の ops は、順に読まれる何枚かで
+         一つのまとまりなので *)
+      if !path <> None && !emit_out = None then
+        die ("more than one script given (" ^ Option.get !path ^ " and " ^ arg ^ ")");
       path := Some arg;
+      more_paths := arg :: !more_paths;
       parse rest
   in
   parse (List.tl (Array.to_list Sys.argv));
+  (match !emit_out with
+  | Some out -> (
+    match List.rev !more_paths with
+    | [] -> die "--emit-tsb wants at least one file to fold"
+    | files -> (
+      match emit_tsb out files with
+      | () -> exit 0
+      | exception Ast.Parse_error msg ->
+        print_endline ("tsubaki: " ^ msg);
+        exit 1
+      | exception Tocode.Not_yet what ->
+        print_endline ("tsubaki: cannot fold " ^ what ^ " yet (see bin/tocode.ml)");
+        exit 1
+      | exception Sys_error msg ->
+        print_endline ("error: " ^ msg);
+        exit 1))
+  | None -> ());
+  if !repl then (
+    if !path <> None then die "--repl takes no script (it reads from the prompt)";
+    if !frames <> None then die "--repl and --frames are different things to do";
+    Repl.run ())
+  else
   match !path with
   | None ->
     if !frames <> None then die "--frames needs a script to run";
@@ -118,6 +205,7 @@ let rec main () =
       exit 1
     | src -> (
       Runtime.current_file_dir := Filename.dirname path;
+      Runtime.current_file := path;
       run_or_report src;
       match !frames with
       | None ->

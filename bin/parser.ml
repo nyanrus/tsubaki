@@ -2,7 +2,6 @@
   open Ast
   open Lexer
 
-  exception Parse_error of string
 
   (* every statement-level parse error gets recorded here (line, col, message)
      instead of aborting the whole parse on the first one -- see
@@ -19,6 +18,14 @@
     ; line : int array
     ; col : int array
     ; mutable pos : int
+    ; (* how many `[ ... ]` index expressions we are inside. `begin` is two
+         words: inside an index it is the first index (`a[begin + i]`),
+         anywhere else it opens a block (`begin ... end`). `end` needs no such
+         count -- a block's `end` is only ever where a STATEMENT would start,
+         and an index's `end` only ever where an OPERAND would, so those two
+         never meet. Both of `begin`'s meanings want an operand's place, so
+         this is what tells them apart. *)
+      mutable in_index : int
     }
 
   let mk quads =
@@ -27,6 +34,7 @@
     ; line = Array.of_list (List.map (fun (_, _, l, _) -> l) quads)
     ; col = Array.of_list (List.map (fun (_, _, _, c) -> c) quads)
     ; pos = 0
+    ; in_index = 0
     }
 
   let peek st = st.toks.(st.pos)
@@ -127,7 +135,7 @@
   (* ":" is deliberately NOT here -- ranges (a:b and a:step:b) aren't a normal
      left-associative binary operator, they're parsed specially by
      parse_range below, since a:b:c has three operands, not two. *)
-  let prec = function
+  let rec prec = function
     | "||" -> 0
     | "&&" -> 1
     | "==" | "!=" | "<" | "<=" | ">" | ">=" | "===" | "!==" | "<:" -> 2
@@ -135,8 +143,11 @@
        category) and `&` with `*`/`/`/`%` (its "times" category) -- not with
        `&&`/`||`, the common mistake coming from C-family languages *)
     | "+" | "-" | "|" | "\xe2\x8a\xbb" -> 3
-    | "*" | "/" | "//" | "%" | ">>>" | "<<" | ">>" | "\xe2\x8b\x85" | "\\" | "&" -> 4
+    | "*" | "/" | "//" | "%" | ">>>" | "<<" | ">>" | "\xe2\x8b\x85" | "\\" | "&" | "\xc3\xb7" -> 4
     | "^" -> 5
+    (* broadcast(`xs .+ 1`)は、点の無いほうと同じ強さ。`.` 一つだけは
+       field の取り出しなので、ここには来ない *)
+    | s when String.length s > 1 && s.[0] = '.' -> prec (String.sub s 1 (String.length s - 1))
     | _ -> -1
 
   (* consumes an optional `where T [<: Bound]` / `where {T [<: Bound], U, ...}`
@@ -253,7 +264,14 @@
 
   let rec parse_expr st =
     let lhs = parse_range st in
-    if at_op st "?" then (
+    if at_op st "=>" then (
+      (* real Julia's Pair. Right-associative, and lower than every arithmetic
+         and comparison operator, so `"n" => a + 1` pairs the whole right-hand
+         side rather than pairing `a` and then adding. *)
+      advance st;
+      let rhs = parse_expr st in
+      EBinOp ("=>", lhs, rhs, Caches.fresh_call ()))
+    else if at_op st "?" then (
       advance st;
       (* the true-branch deliberately uses parse_binary, not parse_expr/parse_range --
          otherwise a bare ":" ending the true-branch (`cond ? a : b`) gets
@@ -268,7 +286,7 @@
       advance st;
       let rhs = parse_expr st in
       match lhs with
-      | EVar (n, _) -> EAssign (n, rhs, Runtime.new_var_cache ())
+      | EVar (n, _) -> EAssign (n, rhs, Caches.fresh_var ())
       | EField (o, f) -> EFieldAssign (o, f, rhs)
       | EIndex (o, idx) -> EIndexAssign (o, idx, rhs)
       | EInterp inner -> EInterpAssign (inner, rhs)
@@ -279,9 +297,9 @@
          is lost by taking the ETypedArrayNew one: `Float[] = v` was never a
          legal assignment target anyway. *)
       | ETypedArrayNew (name, []) ->
-        ECall ("setindex!", [ EVar (name, Runtime.new_var_cache ()); rhs ], [], Runtime.Dispatch.new_cache ())
+        ECall ("setindex!", [ EVar (name, Caches.fresh_var ()); rhs ], [], Caches.fresh_call ())
       | ECall ("getindex", [ obj ], [], _) ->
-        ECall ("setindex!", [ obj; rhs ], [], Runtime.Dispatch.new_cache ())
+        ECall ("setindex!", [ obj; rhs ], [], Caches.fresh_call ())
       | _ -> raise (Parse_error "invalid assignment target"))
     else
       match peek st with
@@ -289,16 +307,16 @@
         advance st;
         let rhs = parse_expr st in
         let base_op = String.sub op 0 (String.length op - 1) in
-        let combined = EBinOp (base_op, lhs, rhs, Runtime.Dispatch.new_cache ()) in
+        let combined = EBinOp (base_op, lhs, rhs, Caches.fresh_call ()) in
         (match lhs with
-        | EVar (n, _) -> EAssign (n, combined, Runtime.new_var_cache ())
+        | EVar (n, _) -> EAssign (n, combined, Caches.fresh_var ())
         | EField (o, f) -> EFieldAssign (o, f, combined)
         | EIndex (o, idx) -> EIndexAssign (o, idx, combined)
         (* `score[] += hits` -- same two shapes as the plain `=` case above *)
         | ETypedArrayNew (name, []) ->
-          ECall ("setindex!", [ EVar (name, Runtime.new_var_cache ()); combined ], [], Runtime.Dispatch.new_cache ())
+          ECall ("setindex!", [ EVar (name, Caches.fresh_var ()); combined ], [], Caches.fresh_call ())
         | ECall ("getindex", [ obj ], [], _) ->
-          ECall ("setindex!", [ obj; combined ], [], Runtime.Dispatch.new_cache ())
+          ECall ("setindex!", [ obj; combined ], [], Caches.fresh_call ())
         | _ -> raise (Parse_error "invalid compound-assignment target"))
       | _ -> lhs
 
@@ -313,7 +331,7 @@
         advance st;
         let hi = parse_binary st 0 in
         ERangeStep (lo, mid, hi))
-      else EBinOp (":", lo, mid, Runtime.Dispatch.new_cache ()))
+      else EBinOp (":", lo, mid, Caches.fresh_call ()))
     else lo
 
   and parse_binary st min_prec =
@@ -335,7 +353,7 @@
              && (st.pos = 0 || fst (line_col st st.pos) = fst (line_col st (st.pos - 1))) ->
         advance st;
         let rhs = parse_binary st (prec op + 1) in
-        lhs := EBinOp (op, !lhs, rhs, Runtime.Dispatch.new_cache ())
+        lhs := EBinOp (op, !lhs, rhs, Caches.fresh_call ())
       (* `x in y` as an ordinary boolean expression (membership test),
          outside a `for`/comprehension header (which consumes its own `in`
          directly via expect_kw, never reaching here) -- found in Primes.jl,
@@ -350,7 +368,16 @@
         when 2 >= min_prec && (st.pos = 0 || fst (line_col st st.pos) = fst (line_col st (st.pos - 1))) ->
         advance st;
         let rhs = parse_range st in
-        lhs := EBinOp ("in", !lhs, rhs, Runtime.Dispatch.new_cache ())
+        lhs := EBinOp ("in", !lhs, rhs, Caches.fresh_call ())
+      (* `x isa T` -- Julia writes this between the two, and `isa(x, T)` is
+         the same thing. Not a keyword, so `isa(...)` still reads as the
+         ordinary call it always did: only the position decides. Comparison
+         precedence, like `in` just above. *)
+      | TIDENT "isa"
+        when 2 >= min_prec && (st.pos = 0 || fst (line_col st st.pos) = fst (line_col st (st.pos - 1))) ->
+        advance st;
+        let rhs = parse_range st in
+        lhs := ECall ("isa", [ !lhs; rhs ], [], Caches.fresh_call ())
       | _ -> continue_ := false
     done;
     !lhs
@@ -374,7 +401,7 @@
         | TOP op when prec op >= 0 && prec op >= min_prec ->
           advance st;
           let rhs = go (prec op + 1) in
-          lhs := EBinOp (op, !lhs, rhs, Runtime.Dispatch.new_cache ())
+          lhs := EBinOp (op, !lhs, rhs, Caches.fresh_call ())
         | _ -> continue_ := false
       done;
       !lhs
@@ -385,14 +412,19 @@
     if at_op st "-" then (
       advance st;
       let e = parse_unary st in
-      EBinOp ("-", EInt 0, e, Runtime.Dispatch.new_cache ()))
+      EBinOp ("-", EInt 0, e, Caches.fresh_call ()))
     else if at_op st "!" then (
       (* logical not -- reuses ordinary ECall/dispatch (a "!" method on
          Bool) rather than a dedicated AST node, the same way real Julia's
          own `!x` is just a call to the function named `!` *)
       advance st;
       let e = parse_unary st in
-      ECall ("!", [ e ], [], Runtime.Dispatch.new_cache ()))
+      ECall ("!", [ e ], [], Caches.fresh_call ()))
+    else if at_op st "~" then (
+      (* bitwise not -- `!` と同じで、`~` という名前の関数を呼ぶだけ *)
+      advance st;
+      let e = parse_unary st in
+      ECall ("~", [ e ], [], Caches.fresh_call ()))
     else parse_postfix st
 
   and parse_postfix st =
@@ -430,8 +462,9 @@
           let bvar = "##bcast" in
           e :=
             EComprehension
-              ( ECall (name, [ EVar (bvar, Runtime.new_var_cache ()) ], [], Runtime.Dispatch.new_cache ())
-              , [ (FVSingle bvar, container) ] )
+              ( ECall (name, [ EVar (bvar, Caches.fresh_var ()) ], [], Caches.fresh_call ())
+              , [ (FVSingle bvar, container) ]
+              , None )
         | _ -> raise (Parse_error "broadcast dot-call (f.(...)) requires a bare function name"))
       else if at_op st "." then (
         advance st;
@@ -445,7 +478,7 @@
           let args, kwargs = parse_arglist st in
           expect_op st ")";
           let modname = String.concat "." (List.rev !dotted_chain) in
-          e := EQualifiedCall (modname, f, args, kwargs, Runtime.Dispatch.new_cache ());
+          e := EQualifiedCall (modname, f, args, kwargs, Caches.fresh_call ());
           dotted_chain := [])
         else (
           (if !dotted_chain <> [] then dotted_chain := f :: !dotted_chain);
@@ -469,16 +502,19 @@
            was, the same lookup-fails-so-reinterpret dispensation the non-empty
            case gets. Anything that isn't a bare name (`scene.collisions[]`)
            was never a type name, so it can only be this. *)
-        | obj -> e := ECall ("getindex", [ obj ], [], Runtime.Dispatch.new_cache ()))
+        | obj -> e := ECall ("getindex", [ obj ], [], Caches.fresh_call ()))
       else if at_op st "[" then (
         dotted_chain := [];
         advance st;
+        let outer = st.in_index in
+        st.in_index <- outer + 1;
         let first = parse_expr st in
         let rest = ref [] in
         while at_op st "," do
           advance st;
           rest := parse_expr st :: !rest
         done;
+        st.in_index <- outer;
         expect_op st "]";
         (* a single index (`v[i]`) stays a bare expr, unchanged from before;
            `A[i,j]` (only ever a Matrix's own row/col pair here -- Tsubaki has
@@ -495,7 +531,30 @@
            this is unambiguous with no lookahead needed *)
         dotted_chain := [];
         advance st;
-        e := ECall ("transpose", [ !e ], [], Runtime.Dispatch.new_cache ()))
+        e := ECall ("transpose", [ !e ], [], Caches.fresh_call ()))
+      else if at_op st "(" && not (space_before st st.pos) then (
+        (* Calling what the expression so far EVALUATED to: `f()()`,
+           `v[1](x)`, `(x -> x + 1)(3)`.
+
+           A bare `f(x)` never reaches here -- parse_atom's own TIDENT case
+           already took it, as an ECall carrying a name for dispatch to
+           resolve on -- and neither does `Name.member(...)`, taken by the
+           qualified-call branch above while the dotted chain is still a pure
+           run of names. So this only ever fires on shapes that did not parse
+           at all before.
+
+           Requiring NO whitespace before the "(" is what stops it from
+           swallowing a following statement: a line that merely BEGINS with
+           "(" -- `(a, b) = f()` under a preceding expression statement --
+           always has whitespace in front of it, the newline itself. Real
+           Julia draws the same line between `f(x)` and `f (x)`. *)
+        dotted_chain := [];
+        advance st;
+        let args, kwargs = parse_arglist st in
+        expect_op st ")";
+        if kwargs <> [] then
+          raise (Parse_error "keyword arguments need a named function -- a computed callee is a plain closure");
+        e := EApply (!e, args))
       else continue_ := false
     done;
     !e
@@ -503,17 +562,25 @@
   (* real Julia's numeric-literal coefficient juxtaposition (`2x`, `2I`,
      `2(x+1)`): a numeral immediately followed (no space) by an identifier or
      "(" is implicit multiplication. Checked right after the literal atom is
-     produced, and the coefficient's RHS is parsed via parse_postfix (not a
-     wider call) so a further binary operator like `^` still binds around the
-     WHOLE product from the outside -- matching real Julia's own documented
-     `2^3x == 2^(3*x)` / `-2x == -(2*x)` examples exactly, for free, since
-     parse_unary/parse_binary already wrap whatever parse_atom returns. *)
+     produced.
+
+     The coefficient binds TIGHTER than `*`/`+` but LOOSER than `^` -- real
+     Julia's own documented rule ("2x^3 is parsed as 2*(x^3)", alongside
+     "2^3x is parsed as 2^(3x)" and "-2x as -(2x)"). So the RHS is parsed at
+     exactly `^`'s own precedence level: high enough to swallow a following
+     `^`, low enough that a following `*`/`+` still wraps the whole product
+     from the outside, which parse_unary/parse_binary already do.
+
+     This used to call parse_postfix -- one level too tight, which made
+     `3x^2` mean `(3x)^2`: 144 where real Julia says 48. Caught by running
+     the identical file under real Julia 1.12.5 (tests/control.jl, via
+     `make test-julia`), not by reading the code. *)
   and maybe_coeff_mult st lit =
     let tight_follow =
       (match peek st with TIDENT _ -> true | TOP "(" -> true | _ -> false)
       && not (space_before st st.pos)
     in
-    if tight_follow then EBinOp ("*", lit, parse_postfix st, Runtime.Dispatch.new_cache ())
+    if tight_follow then EBinOp ("*", lit, parse_binary st (prec "^"), Caches.fresh_call ())
     else lit
 
   and parse_atom st =
@@ -536,6 +603,38 @@
     | TKW "nothing" ->
       advance st;
       ENothing
+    (* inside `a[ ... ]`: the first index (see the `in_index` comment on state) *)
+    | TKW "begin" when st.in_index > 0 ->
+      advance st;
+      EBegin
+    (* anywhere else: a block, whose value is its last statement's. It does NOT
+       open a scope -- what is assigned inside is assigned outside too, the same
+       as real Julia's `begin` (`let` is the one that opens a scope). *)
+    | TKW "begin" ->
+      advance st;
+      let body = parse_stmt_list st in
+      expect_kw st "end";
+      EBlock body
+    (* `let x = 1, y = 2` ... `end` -- 新しいスコープを開く。`begin` と違って
+       中で置いた名前は外に出ない。束ねるところは「名前 = 式」の並びで、
+       一つも書かなくてもいい(`let ... end` はただのスコープ) *)
+    | TKW "let" ->
+      advance st;
+      let binds = ref [] in
+      if not (at_stmt_start st) then (
+        let one () =
+          let n = ident st in
+          expect_op st "=";
+          binds := (n, parse_expr st) :: !binds
+        in
+        one ();
+        while at_op st "," do
+          advance st;
+          one ()
+        done);
+      let body = parse_stmt_list st in
+      expect_kw st "end";
+      ELet (List.rev !binds, body)
     | TKW "end" ->
       advance st;
       EEnd
@@ -556,6 +655,15 @@
       advance st;
       if is_block_end st || at_op st ";" || at_op st ")" || at_op st "," then EBlock [ SReturn None ]
       else EBlock [ SReturn (Some (parse_expr st)) ]
+    (* Julia では、ほとんどの構文が式です -- `x = if c ... end` も
+       `x = try ... catch ... end` も書ける。読みかたは文のときと同じで、
+       包みかただけが違う: EBlock は「文の並びを式として走らせる」ので、
+       その並びの値(最後の文の値)が、そのまま式の値になる。`begin` の
+       すぐ上と、同じ仕組みです。
+
+       `for` と `while` はここに入れていない -- Julia でも nothing しか
+       返さないので、式の位置に書けても書く意味がない。 *)
+    | TKW ("if" | "try") -> EBlock [ parse_stmt st ]
     | TKW "quote" ->
       advance st;
       let body = parse_stmt_list st in
@@ -570,6 +678,18 @@
         expect_op st ")";
         EQuote e
       | TIDENT name ->
+        advance st;
+        EQuoteSymbol name
+      (* `true` / `false` は、この言語では keyword だが Julia では値そのもの。
+         だから `:true` は Symbol ではなく Bool の true(Julia 1.12.7 で確認) *)
+      | TKW (("true" | "false") as b) ->
+        advance st;
+        EBool (b = "true")
+      (* `:type` `:end` `:where` -- 名前が keyword の綴りをしているのは、この
+         言語の都合であって、そのデータの性質ではない。外から来た Dict の鍵が
+         たまたま "type" という名前だった、というだけのことがある。Julia も
+         keyword をぜんぶ quote する *)
+      | TKW name ->
         advance st;
         EQuoteSymbol name
       | TOP op ->
@@ -599,7 +719,7 @@
         let e = parse_expr st in
         expect_op st ")";
         EInterp e)
-      else EInterp (EVar (ident st, Runtime.new_var_cache ()))
+      else EInterp (EVar (ident st, Caches.fresh_var ()))
     | TKW "function" ->
       (* anonymous, multi-statement form: function (args) ... end -- as
          opposed to the named `function name(args) ... end` declaration,
@@ -697,8 +817,10 @@
             else List.rev acc
           in
           let clauses = loop [] in
+          (* `[x for x in xs if cond]` -- Julia の絞り込み *)
+          let cond = if at_kw st "if" then (advance st; Some (parse_expr st)) else None in
           expect_op st "]";
-          EComprehension (first, clauses))
+          EComprehension (first, clauses, cond))
         else (
           (* a row's remaining elements, real Julia's own way: comma-separated
              (like a Vector literal) AND/OR plain whitespace-separated
@@ -748,9 +870,37 @@
                   else raise (Parse_error "matrix row: not a clean whitespace-sensitive parse"))
             with
             | Some row -> row
-            | None ->
-              used_comma := false; (* position is back where `first`'s own parse left it, a lone element *)
-              [ first ]
+            | None -> (
+              (* The whitespace-sensitive grammar handles none of ternaries,
+                 ranges or pairs, so a row holding one of those lands here --
+                 and until this, a row like `[x, cond ? a : b]` quietly became
+                 the single element `x` and then failed at the comma. If the
+                 row is comma-separated (an ordinary Vector literal, never a
+                 matrix row), the FULL expression grammar can take it, spacing
+                 and all. A trailing comma is allowed here, as real Julia
+                 allows one. *)
+              match
+                try_parse st (fun () ->
+                    restore st start_pos;
+                    let saw_comma = ref false in
+                    let rec loop acc =
+                      let e = parse_expr st in
+                      if at_op st "," then (
+                        saw_comma := true;
+                        advance st;
+                        if at_op st "]" then List.rev (e :: acc) else loop (e :: acc))
+                      else List.rev (e :: acc)
+                    in
+                    let row = loop [] in
+                    if !saw_comma && at_op st "]" then row
+                    else raise (Parse_error "array literal: not a comma-separated row"))
+              with
+              | Some row ->
+                used_comma := true;
+                row
+              | None ->
+                used_comma := false; (* position is back where `first`'s own parse left it, a lone element *)
+                [ first ])
           in
           if at_op st ";" then (
             (* a Matrix literal -- rows are semicolon-separated *)
@@ -816,7 +966,7 @@
         expect_op st "(";
         let args, kwargs = parse_arglist st in
         expect_op st ")";
-        ECall ("new", args, kwargs, Runtime.Dispatch.new_cache ()))
+        ECall ("new", args, kwargs, Caches.fresh_call ()))
       else if at_op st "{" then (
         (* Name{T}(...) / Name{T} -- parsed once, THEN decided by whether a
            call's own "(" actually follows the closing "}": Array{T}()/
@@ -856,7 +1006,7 @@
           | ("Array" | "Vector"), [ elem_ty ], [ EVar ("undef", _); n ] -> ETypedArrayUndef (elem_ty, n)
           | ("Array" | "Vector"), [ elem_ty ], _ ->
             raise (Parse_error (Printf.sprintf "%s{%s}(...): only () or (undef, n) is supported" name elem_ty))
-          | _ -> ECall (name, args, kwargs, Runtime.Dispatch.new_cache ())))
+          | _ -> ECall (name, args, kwargs, Caches.fresh_call ())))
       else if at_op st "->" then (
         advance st;
         let body = parse_expr st in
@@ -872,44 +1022,45 @@
            what a reader coming from Julia expects. Every do-block call site
            today passes no other positional argument (`play() do dt`), so which
            end it lands on is not a change to any of them. *)
-        | Some closure -> ECall (name, closure :: args, kwargs, Runtime.Dispatch.new_cache ())
-        | None -> ECall (name, args, kwargs, Runtime.Dispatch.new_cache ()))
-      else EVar (name, Runtime.new_var_cache ())
+        | Some closure -> ECall (name, closure :: args, kwargs, Caches.fresh_call ())
+        | None -> ECall (name, args, kwargs, Caches.fresh_call ()))
+      else EVar (name, Caches.fresh_var ())
     | _ -> raise (Parse_error (Printf.sprintf "expected expression at %s" (ctx st)))
 
   and parse_arglist st : expr list * (string * expr) list =
-    let positional =
-      if at_op st ")" || at_op st ";" then []
+    (* real Julia: inside a call, `name = value` is ALWAYS a keyword argument,
+       with or without the `;` that may separate them -- `f(a; b = 1)` and
+       `f(a, b = 1)` mean the same thing. Before this, only the `;` form was
+       read as one and the other quietly became a positional ASSIGNMENT
+       expression, which is how `AppState(width = 400)` ended up calling the
+       positional constructor with one argument. Both spellings land in the
+       same two lists here, and a trailing comma is allowed either side. *)
+    let positional = ref [] and kwargs = ref [] in
+    let at_kwarg () = match peek st, peek_at st 1 with TIDENT _, TOP "=" -> true | _ -> false in
+    let parse_one () =
+      if at_kwarg () then (
+        let n = ident st in
+        expect_op st "=";
+        kwargs := (n, parse_expr st) :: !kwargs)
       else (
-        let rec loop acc =
-          let e = parse_expr st in
-          let acc = e :: acc in
-          if at_op st "," then (
-            advance st;
-            loop acc)
-          else List.rev acc
-        in
-        loop [])
+        let e = parse_expr st in
+        (* `f(xs...)` -- 後ろの `...` は、その一つを引数の並びにばらす印 *)
+        let e = if at_op st "..." then (advance st; ESplat e) else e in
+        positional := e :: !positional)
     in
-    let kwargs =
-      if at_op st ";" then (
-        advance st;
-        if at_op st ")" then []
-        else (
-          let rec loop acc =
-            let n = ident st in
-            expect_op st "=";
-            let e = parse_expr st in
-            let acc = (n, e) :: acc in
-            if at_op st "," then (
-              advance st;
-              loop acc)
-            else List.rev acc
-          in
-          loop []))
-      else []
+    let parse_list () =
+      if not (at_op st ")" || at_op st ";") then (
+        parse_one ();
+        while at_op st "," do
+          advance st;
+          if not (at_op st ")" || at_op st ";") then parse_one ()
+        done)
     in
-    positional, kwargs
+    parse_list ();
+    if at_op st ";" then (
+      advance st;
+      parse_list ());
+    List.rev !positional, List.rev !kwargs
 
   (* do-block sugar: a call immediately followed by `do <params>` on the same
      line, then a statement body, then `end`, desugars to appending an
@@ -984,7 +1135,7 @@
         if !depth <> 0 then failwith "unterminated $(...) in string interpolation";
         let inner = String.sub s (!i + 2) (!j - !i - 2) in
         let e = parse_expr (mk (tokenize inner)) in
-        pieces := ECall ("string", [ e ], [], Runtime.Dispatch.new_cache ()) :: !pieces;
+        pieces := ECall ("string", [ e ], [], Caches.fresh_call ()) :: !pieces;
         i := !j + 1)
       else if s.[!i] = '$' && !i + 1 < n && is_ident_start s.[!i + 1] then (
         flush_lit ();
@@ -995,7 +1146,7 @@
         let name = intern (String.sub s (!i + 1) (!j - !i - 1)) in
         pieces :=
           ECall
-            ("string", [ EVar (name, Runtime.new_var_cache ()) ], [], Runtime.Dispatch.new_cache ())
+            ("string", [ EVar (name, Caches.fresh_var ()) ], [], Caches.fresh_call ())
           :: !pieces;
         i := !j)
       else if s.[!i] = '\001' then (
@@ -1010,7 +1161,7 @@
     | [] -> EStr ""
     | [ (EStr _ as only) ] -> only
     | first :: rest ->
-      List.fold_left (fun acc e -> EBinOp ("+", acc, e, Runtime.Dispatch.new_cache ())) first rest
+      List.fold_left (fun acc e -> EBinOp ("+", acc, e, Caches.fresh_call ())) first rest
 
   (* one or more comma-separated expressions -- `a` alone stays a plain expr,
      `a, b, ...` becomes a Tuple. Used by `return a, b` and by the right side
@@ -1119,7 +1270,8 @@
             let pat = parse_type_pattern st in
             let pdefault = if at_op st "=" then (advance st; Some (parse_expr st)) else None in
             let acc =
-              { pname = ""; ptype = [ "Any" ]; pdefault; pdestructure = None; ptypepattern = Some pat } :: acc
+              { pname = ""; ptype = [ "Any" ]; pdefault; pdestructure = None; pslurp = false
+              ; ptypepattern = Some pat } :: acc
             in
             if at_op st "," then (
               advance st;
@@ -1148,8 +1300,15 @@
                 let n, t = parse_typed_ident st in
                 n, t, None)
             in
+            (* `f(a, xs...)` -- 余ったものを集める最後の一つ。後ろに何か
+               続いていたら、そこで止める(Julia も最後だけ) *)
+            let pslurp = if at_op st "..." then (advance st; true) else false in
             let pdefault = if at_op st "=" then (advance st; Some (parse_expr st)) else None in
-            let acc = { pname; ptype; pdefault; pdestructure; ptypepattern = None } :: acc in
+            if pslurp && pdefault <> None then
+              raise (Parse_error "a `...` parameter cannot also have a default");
+            let acc = { pname; ptype; pdefault; pdestructure; pslurp; ptypepattern = None } :: acc in
+            if pslurp && at_op st "," then
+              raise (Parse_error "a `...` parameter must be the last one");
             if at_op st "," then (
               advance st;
               loop acc)
@@ -1197,10 +1356,18 @@
   and parse_stmt_list st =
     let acc = ref [] in
     while not (is_block_end st) do
+      (* a statement never begins inside an index expression; saying so here is
+         what keeps a parse error that gave up mid-`[` from leaving the count
+         high and turning a later `begin` block into a stray 1 *)
+      st.in_index <- 0;
       if at_op st ";" then advance st
       else (
+        (* where this statement STARTS, captured before parsing it -- see
+           Ast's SLine for why the position rides along as its own marker
+           rather than as a field on every statement variant *)
+        let start_line = fst (line_col st st.pos) in
         match (try `Ok (parse_stmt st) with Parse_error msg -> `Err msg) with
-        | `Ok s -> acc := s :: !acc
+        | `Ok s -> acc := s :: SLine start_line :: !acc
         | `Err msg ->
           let line, col = line_col st st.pos in
           parse_errors := (line, col, msg) :: !parse_errors;
@@ -1241,7 +1408,7 @@
       let params = strip_where_param_types where_vars params |> finalize_type_patterns where_vars in
       let body = parse_stmt_list st in
       expect_kw st "end";
-      SFuncDecl (name, params, kwparams, body, Runtime.new_funcdecl_cache ())
+      SFuncDecl (name, params, kwparams, body, Caches.fresh_funcdecl ())
     | TKW "if" ->
       advance st;
       parse_if st
@@ -1267,6 +1434,12 @@
       advance st;
       if is_block_end st || at_op st ";" then SReturn None
       else SReturn (Some (parse_comma_exprs st))
+    | TKW "break" ->
+      advance st;
+      SBreak
+    | TKW "continue" ->
+      advance st;
+      SContinue
     | TKW "try" ->
       advance st;
       let body = parse_stmt_list st in
@@ -1436,7 +1609,7 @@
               name, params, kwparams, e)
         with
         | Some (name, params, kwparams, e) ->
-          SFuncDecl (name, params, kwparams, [ SExpr e ], Runtime.new_funcdecl_cache ())
+          SFuncDecl (name, params, kwparams, [ SExpr e ], Caches.fresh_funcdecl ())
         | None -> (
           (* mid-function typed local assignment: x::T = expr *)
           match

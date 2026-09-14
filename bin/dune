@@ -1,7 +1,77 @@
+; 二本のビルドが、同じモジュールを共有する。片方は CLI と REPL と橋を全部
+; つれてくる開発用、もう片方は drop に積むほう -- actor の戸だけ。
+; ファイルは動かしていない。何がどちらに行くかを、ここで言っているだけ。
+
+; 言語の後ろ半分 -- 値と、dispatch と、AST を走らせるところ。ここに Parser も
+; Compile も居ない(Eval が口を開けていて、Frontend が差し込む)。
+(library
+ (name tsubaki)
+ (wrapped false)
+ (modules hints caches runtime ast bytecode eval async jsBridge actorBridge)
+ (libraries js_of_ocaml))
+
+; 行列とベクトルと線形代数。drop の logic は、こういうものを持たない
+; (ボタンを並べて pref を読む仕事に、固有値分解は要らない)。
+(library
+ (name tsubaki_math)
+ (wrapped false)
+ (modules math)
+ (libraries js_of_ocaml tsubaki))
+
+; ecs の system を、AST を歩かずに走らせるほう(hexpr/hstmt の小さな VM と、
+; SoA の列)。Runtime に居たころは、誰も呼ばなくても一緒に配られていた --
+; 要るのは ecs を使う人だけなので、外に出してある。Ast は知らない
+; (Compile がここに向けて組み立てる)。
+(library
+ (name tsubaki_host)
+ (wrapped false)
+ (modules host)
+ (libraries js_of_ocaml tsubaki))
+
+; 前半分 -- ソースを読んで AST にするところと、AST をもっと速い形に落とす
+; ところ。ビルド時にだけ要るものが、いずれ全部こちら側に来る。
+(library
+ (name tsubaki_frontend)
+ (wrapped false)
+ (modules lexer parser resolve compile tocode tsb frontend)
+ (libraries js_of_ocaml tsubaki tsubaki_host))
+
+; 外の世界につながる橋。drop はどれも使わない。
+(library
+ (name tsubaki_bridges)
+ (wrapped false)
+ (modules
+  curveBridge gpuBridge webglBridge physicsBridge audioBridge
+  parallelBridge ecs)
+ (libraries js_of_ocaml tsubaki tsubaki_host tsubaki_frontend))
+
 (executable
  (name main)
+ (modules main repl)
  (modes byte wasm js)
  (wasm_of_ocaml
   (flags
    (:standard --effects=cps)))
- (libraries js_of_ocaml))
+ (libraries js_of_ocaml tsubaki tsubaki_math tsubaki_host tsubaki_frontend tsubaki_bridges))
+
+(executable
+ (name drop)
+ (modules drop)
+ (modes byte wasm js)
+ (wasm_of_ocaml
+  (flags
+   (:standard --effects=cps)))
+ (libraries js_of_ocaml tsubaki tsubaki_host tsubaki_frontend))
+
+
+; .tsubaki を .tsb に畳むだけの道具。ビルドのときにだけ動くので、走らせる側の
+; 言葉(Eval も Vm も、橋も)は要らない -- registry の build がこれを呼んで、
+; drop の ops を一枚にする。
+(executable
+ (name tsubakic)
+ (modules tsubakic)
+ (modes byte wasm js)
+ (wasm_of_ocaml
+  (flags
+   (:standard --effects=disabled)))
+ (libraries js_of_ocaml tsubaki tsubaki_frontend))

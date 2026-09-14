@@ -1,0 +1,5 @@
+# the other extension a drop's logic is written in
+module Toolbox
+    hammer() = "bang"
+    saw() = "zzz"
+end

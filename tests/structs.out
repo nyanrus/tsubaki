@@ -1,0 +1,11 @@
+p.x = 3, p.y = 4
+c.n = 11
+norm2(p) = 25
+Positive(5).value = 5
+Positive(-1) refused
+n.val = 42, n.next.val = 42
+Box(5).value = 5, Box(3.5).value = 3.5
+an Int box holding 5
+some box holding 3.5
+KV: 1 => one
+segment dx = 3, dy = 4

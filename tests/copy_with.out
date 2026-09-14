@@ -1,0 +1,7 @@
+AppState(panels=["a", "b"], selected="b", width=40)
+AppState(panels=["a", "b"], selected="c", width=32)
+AppState(panels=["a", "b"], selected="a", width=40)
+Opts(loud=false, times=1, label="-")
+Opts(loud=false, times=3, label="-")
+Opts(loud=true, times=1, label="-")
+caught

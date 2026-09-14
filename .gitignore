@@ -1,8 +1,11 @@
 _build/
 kernel/target/
+tsbvm/target/
 physics/target/
 gpu/target/
 gpu/pkg/
+gpu-native/target/
+mlx-native/build/
 rust_parser/target/
 scratch/
 *.install
