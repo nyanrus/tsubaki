@@ -1,4 +1,4 @@
-.PHONY: build run repl test test-julia test-tsbvm check-doors clean build-gpu clean-gpu
+.PHONY: build run repl test test-julia test-tsbvm test-two-sheets check-doors clean build-gpu clean-gpu
 
 # 三本建つ。main は CLI/REPL と橋を全部つれてくる開発用、drop は drop に積む
 # ほう(actor の戸だけ)、tsubakic は .tsubaki を .tsb に畳むだけの道具。
@@ -34,6 +34,12 @@ test-julia: build
 test-tsbvm: build
 	cd tsbvm && cargo build --lib --target wasm32-unknown-unknown --release
 	python3 tools/test.py --tsbvm $(FILTER)
+
+# 二枚に分けて読んだ答えが、一枚に畳んだ答えと同じかどうか(静的 import)。
+# std を lib から一枚だけ配って、drop は自分のぶんだけを持つ -- そのときに
+# 走らせる側がすることを、ここで確かめる。
+test-two-sheets: build
+	tools/two-sheets.sh
 
 # drop に積む build に、外へ出る戸(jsglobal / tojs / include)が残っていないか。
 # 消したことを覚えているのがコメントだけ、では、また戻ってくる。

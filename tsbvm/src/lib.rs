@@ -74,6 +74,33 @@ pub extern "C" fn tsb_run(ptr: *const u8, len: usize) -> i32 {
     code
 }
 
+/// 走っている VM の上に、もう一枚を足して走らせる(静的 import)。一枚目が
+/// `tsb_run`、続きがこちら -- 読む順は、畳んだ側が決めている。
+///
+/// 返すのは `tsb_run` と同じ 0 / 1。出るのは**この一枚が**印字したぶんだけ
+/// (VM の out は溜まりつづけるので、走らせる前の長さを覚えて、伸びたぶんを渡す)。
+#[no_mangle]
+pub extern "C" fn tsb_load(ptr: *const u8, len: usize) -> i32 {
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let (text, code) = VM.with(|cell| match cell.borrow_mut().as_mut() {
+        None => ("tsbvm: nothing has been run yet".to_string(), 1),
+        Some(machine) => {
+            let was = machine.output().len();
+            let r = machine.load(bytes);
+            let mut s = machine.output()[was..].to_string();
+            match r {
+                Ok(_) => (s, 0),
+                Err(e) => {
+                    s.push_str(&format!("tsbvm: {}\n", machine.report(&e)));
+                    (s, 1)
+                }
+            }
+        }
+    });
+    OUT.with(|o| *o.borrow_mut() = text);
+    code
+}
+
 /// Call a function of the program that already ran. The arguments arrive as a
 /// JSON array and the answer leaves as JSON -- see json.rs for what that
 /// carries, and why it is the same meaning the OCaml side hands to JS.

@@ -714,6 +714,32 @@ impl Vm {
         self.exec(main, &env)
     }
 
+    /// もう一枚を、いまの global scope の上に足して走らせる(静的 import)。
+    ///
+    /// std を lib から一枚だけ配って、drop は自分のぶんだけを持つ -- そのための
+    /// 口。読む順は畳んだ側が決めていて、ここは言われたとおりに並べるだけ。
+    ///
+    /// 一枚目の番号はどれも動かない(`tsb::append`)ので、もう作られた closure も
+    /// method も生きたまま。名前は文字で引き直されるので、一枚目が置いた global を
+    /// 二枚目がそのまま引けるし、同じ署名で書き直した method は置きかわる。
+    pub fn load(&mut self, bytes: &[u8]) -> E<Value> {
+        let main = crate::tsb::append(Rc::make_mut(&mut self.p), bytes).map_err(|e| e.to_string())?;
+        // sym_rc は syms と一対一。伸びたぶんだけ伸ばす
+        let from = self.sym_rc.len();
+        for s in &self.p.syms[from..] {
+            self.sym_rc.push(Rc::from(s.as_str()));
+        }
+        let env = match &self.global {
+            Some(e) => e.clone(),
+            None => {
+                let e = Scope::root();
+                self.global = Some(e.clone());
+                e
+            }
+        };
+        self.exec(main, &env)
+    }
+
     /// Call one of the program's functions from outside, after it has run.
     /// This is the `call` a drop's host makes (`ops.call("setup")`).
     pub fn call_toplevel(&mut self, name: &str, args: Vec<Value>) -> E<Value> {

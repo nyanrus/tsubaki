@@ -9,6 +9,8 @@
 //! is not for this side's sake: the writer runs under js_of_ocaml, where an
 //! OCaml `int` is 32 bits, so it never writes a number that crosses the sign.
 
+use std::collections::HashMap;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Lit {
     Int(i64),
@@ -189,9 +191,38 @@ impl std::fmt::Display for BadTsb {
     }
 }
 
+/// もう読んである一枚の上に二枚目を足すとき、二枚目の番号をどこへ動かすか。
+///
+/// 五つの表はうしろに並べるだけなので、長さを足せばいい。syms だけは違って、
+/// **文字で照らして引き直す** -- scope は名前を番号で引く(vm.rs の `Scope`)ので、
+/// 同じ名前が二つの番号を持つと、一枚目が置いたものを二枚目が引けない。
+struct Bases {
+    pool: u32,
+    funcs: u32,
+    structs: u32,
+    lambdas: u32,
+    comps: u32,
+    ireps: u32,
+    /// 二枚目の中の番号 -> 継ぎ足したあとの番号
+    syms: Vec<u32>,
+}
+
+/// 足される側の、読みはじめる前に分かっているぶん。
+struct Prev<'p> {
+    pool: u32,
+    funcs: u32,
+    structs: u32,
+    lambdas: u32,
+    comps: u32,
+    ireps: u32,
+    syms: &'p [String],
+}
+
 struct Reader<'a> {
     b: &'a [u8],
     pos: usize,
+    /// 一枚目なら None -- 番号はそのまま通る。
+    base: Option<Bases>,
 }
 
 type R<T> = Result<T, BadTsb>;
@@ -205,6 +236,9 @@ impl<'a> Reader<'a> {
         }
     }
 
+    /// ただの数。表の番号ではないもの -- 数えたもの、同じ irep の中の行き先
+    /// (`Jump` / `JumpIfFalse` / `IterNext` / `Try`)、行番号、call cache の
+    /// セル(VM は見ていない)、旗。
     fn nat(&mut self) -> R<u32> {
         self.need(4)?;
         let n = u32::from_be_bytes([
@@ -215,6 +249,61 @@ impl<'a> Reader<'a> {
         ]);
         self.pos += 4;
         Ok(n)
+    }
+
+    /// 表の番号。`pick` が、どの表かを言う。
+    fn at(&mut self, pick: fn(&Bases) -> u32) -> R<u32> {
+        let n = self.nat()?;
+        Ok(match &self.base {
+            Some(b) => n + pick(b),
+            None => n,
+        })
+    }
+
+    fn pool(&mut self) -> R<u32> {
+        self.at(|b| b.pool)
+    }
+    fn func(&mut self) -> R<u32> {
+        self.at(|b| b.funcs)
+    }
+    fn strct(&mut self) -> R<u32> {
+        self.at(|b| b.structs)
+    }
+    fn lambda(&mut self) -> R<u32> {
+        self.at(|b| b.lambdas)
+    }
+    fn comp(&mut self) -> R<u32> {
+        self.at(|b| b.comps)
+    }
+    fn irep(&mut self) -> R<u32> {
+        self.at(|b| b.ireps)
+    }
+
+    /// `1 + <irep>`、0 なら「無し」。`Param.default` と `Comp.cond` がこの形
+    /// (`Kwparam.default` と `Strct.kwdefaults` のほうは生の irep -- 「無し」が
+    /// 無いので、sentinel を取っていない)。
+    fn irep1(&mut self) -> R<u32> {
+        let n = self.nat()?;
+        if n == 0 {
+            return Ok(0);
+        }
+        Ok(match &self.base {
+            Some(b) => n + b.ireps,
+            None => n,
+        })
+    }
+
+    /// 名前の番号。足すのではなく、引き直す。
+    fn sym(&mut self) -> R<u32> {
+        let n = self.nat()?;
+        match &self.base {
+            None => Ok(n),
+            Some(b) => b
+                .syms
+                .get(n as usize)
+                .copied()
+                .ok_or_else(|| BadTsb(format!("a name number past the end ({n})"))),
+        }
     }
 
     fn bits(&mut self) -> R<u64> {
@@ -242,11 +331,13 @@ impl<'a> Reader<'a> {
         Ok(s)
     }
 
-    fn nats(&mut self) -> R<Vec<u32>> {
+    /// 名前の番号の並び。`.tsb` の中で並んで書かれる番号は、どれも名前のほう
+    /// (型の名前、keyword の名前、ばらす先の名前、module の member、型引数)。
+    fn syms(&mut self) -> R<Vec<u32>> {
         let n = self.nat()? as usize;
         let mut v = Vec::with_capacity(n);
         for _ in 0..n {
-            v.push(self.nat()?);
+            v.push(self.sym()?);
         }
         Ok(v)
     }
@@ -262,9 +353,9 @@ impl<'a> Reader<'a> {
 
     fn params(&mut self) -> R<Vec<Param>> {
         self.many(|r| {
-            let name = r.nat()?;
-            let types = r.nats()?;
-            let default = r.nat()?;
+            let name = r.sym()?;
+            let types = r.syms()?;
+            let default = r.irep1()?;
             let slurp = r.nat()? != 0;
             Ok(Param { name, types, default, slurp })
         })
@@ -272,9 +363,9 @@ impl<'a> Reader<'a> {
 
     fn kwparams(&mut self) -> R<Vec<Kwparam>> {
         self.many(|r| {
-            let name = r.nat()?;
-            let types = r.nats()?;
-            let default = r.nat()?;
+            let name = r.sym()?;
+            let types = r.syms()?;
+            let default = r.irep()?;
             Ok(Kwparam { name, types, default })
         })
     }
@@ -282,26 +373,26 @@ impl<'a> Reader<'a> {
     fn instr(&mut self) -> R<Instr> {
         use Instr::*;
         Ok(match self.tag()? {
-            0 => Const(self.nat()?),
+            0 => Const(self.pool()?),
             1 => Nothing,
-            2 => Load(self.nat()?, self.nat()?),
-            3 => Store(self.nat()?, self.nat()?),
+            2 => Load(self.sym()?, self.nat()?),
+            3 => Store(self.sym()?, self.nat()?),
             4 => Pop,
-            5 => Binop(self.nat()?, self.nat()?),
-            6 => Call(self.nat()?, self.nat()?, self.nat()?),
+            5 => Binop(self.sym()?, self.nat()?),
+            6 => Call(self.sym()?, self.nat()?, self.nat()?),
             7 => Jump(self.nat()?),
             8 => JumpIfFalse(self.nat()?),
             9 => Println(self.nat()?),
             10 => Print(self.nat()?),
             11 => Enter,
             12 => Leave,
-            13 => Defun(self.nat()?),
+            13 => Defun(self.func()?),
             14 => Ret,
-            15 => Defstruct(self.nat()?),
-            16 => Defabstract(self.nat()?, self.nat()?),
-            17 => Getfield(self.nat()?),
-            18 => Setfield(self.nat()?),
-            19 => Bind(self.nat()?),
+            15 => Defstruct(self.strct()?),
+            16 => Defabstract(self.sym()?, self.sym()?),
+            17 => Getfield(self.sym()?),
+            18 => Setfield(self.sym()?),
+            19 => Bind(self.sym()?),
             20 => Range,
             21 => Range3,
             22 => IterNew,
@@ -309,7 +400,7 @@ impl<'a> Reader<'a> {
             64 => IterDrop,
             24 => Pair,
             25 => Identical(self.nat()?),
-            26 => Subtype(self.nat()?, self.nat()?),
+            26 => Subtype(self.sym()?, self.sym()?),
             27 => In,
             28 => Makearr(self.nat()?),
             29 => Maketuple(self.nat()?),
@@ -319,35 +410,35 @@ impl<'a> Reader<'a> {
             33 => Endmark,
             34 => Typeof,
             35 => Makedict(self.nat()?),
-            36 => Isa(self.nat()?),
-            37 => Using(self.nat()?),
-            38 => Import(self.nat()?, self.nats()?),
-            39 => ModuleEnter(self.nat()?),
+            36 => Isa(self.sym()?),
+            37 => Using(self.sym()?),
+            38 => Import(self.sym()?, self.syms()?),
+            39 => ModuleEnter(self.sym()?),
             40 => ModuleLeave,
-            41 => Makeclosure(self.nat()?),
+            41 => Makeclosure(self.lambda()?),
             42 => Makematrix(self.nat()?, self.nat()?),
-            43 => Qcall(self.nat()?, self.nat()?, self.nat()?, self.nat()?),
+            43 => Qcall(self.sym()?, self.sym()?, self.nat()?, self.nat()?),
             44 => Apply(self.nat()?),
-            45 => ApplyMethod(self.nat()?, self.nat()?),
+            45 => ApplyMethod(self.sym()?, self.nat()?),
             46 => Try(self.nat()?),
             47 => TryEnd,
             48 => Line(self.nat()?),
-            49 => CallKw(self.nat()?, self.nat()?, self.nats()?, self.nat()?),
-            50 => Typedarr(self.nat()?, self.nat()?),
-            51 => TypedarrUndef(self.nat()?),
-            52 => TypedmatUndef(self.nat()?),
-            53 => LoadIndex(self.nat()?, self.nat()?),
-            54 => IndexOrTyped(self.nat()?),
-            55 => BindTuple(self.nats()?),
-            56 => Comprehension(self.nat()?),
-            57 => StorePlain(self.nat()?),
+            49 => CallKw(self.sym()?, self.nat()?, self.syms()?, self.nat()?),
+            50 => Typedarr(self.sym()?, self.nat()?),
+            51 => TypedarrUndef(self.sym()?),
+            52 => TypedmatUndef(self.sym()?),
+            53 => LoadIndex(self.sym()?, self.nat()?),
+            54 => IndexOrTyped(self.sym()?),
+            55 => BindTuple(self.syms()?),
+            56 => Comprehension(self.comp()?),
+            57 => StorePlain(self.sym()?),
             58 => UnpackCheck(self.nat()?),
             59 => Elem(self.nat()?),
             60 => UnpackEnd,
-            61 => Typecheck(self.nat()?, self.nats()?),
-            62 => Symbol(self.nat()?),
-            63 => File(self.nat()?),
-            65 => CallSplat(self.nat()?, self.nat()?, self.nat()?, self.nat()?),
+            61 => Typecheck(self.sym()?, self.syms()?),
+            62 => Symbol(self.sym()?),
+            63 => File(self.sym()?),
+            65 => CallSplat(self.sym()?, self.nat()?, self.nat()?, self.nat()?),
             66 => ApplySplat(self.nat()?, self.nat()?),
             t => return Err(BadTsb(format!("unknown opcode {t}"))),
         })
@@ -355,7 +446,41 @@ impl<'a> Reader<'a> {
 }
 
 pub fn read(bytes: &[u8]) -> R<Program> {
-    let mut r = Reader { b: bytes, pos: 0 };
+    read_with(bytes, None)
+}
+
+/// 二枚目を、もう読んである一枚の上に足す。返すのは二枚目の main の irep 番号。
+///
+/// 一枚目の番号はどれも動かないので、もう作られた closure も method も生きたまま。
+/// 名前だけは引き直すので、std が置いた global を drop 側が引けるし、drop が
+/// std と同じ署名で書き直した method は(Julia と同じに)置きかわる。
+pub fn append(p: &mut Program, bytes: &[u8]) -> R<u32> {
+    let part = read_with(
+        bytes,
+        Some(Prev {
+            pool: p.pool.len() as u32,
+            funcs: p.funcs.len() as u32,
+            structs: p.structs.len() as u32,
+            lambdas: p.lambdas.len() as u32,
+            comps: p.comps.len() as u32,
+            ireps: p.ireps.len() as u32,
+            syms: &p.syms,
+        }),
+    )?;
+    p.pool.extend(part.pool);
+    p.syms.extend(part.syms);
+    p.funcs.extend(part.funcs);
+    p.structs.extend(part.structs);
+    p.lambdas.extend(part.lambdas);
+    p.comps.extend(part.comps);
+    p.ireps.extend(part.ireps);
+    Ok(part.main)
+}
+
+/// `prev` が無ければ、出るのは一枚まるごと。あれば、継ぎ足すぶんだけが入っていて、
+/// 番号はもう直してある(`main` も)。
+fn read_with(bytes: &[u8], prev: Option<Prev>) -> R<Program> {
+    let mut r = Reader { b: bytes, pos: 0, base: None };
     r.need(4)?;
     // 形が変わったら版が上がる(bin/bytecode.ml の magic)。古いものを黙って
     // 読み違えるより、古いと言う
@@ -369,6 +494,7 @@ pub fn read(bytes: &[u8]) -> R<Program> {
         _ => return Err(BadTsb("wrong magic".into())),
     }
     r.pos = 4;
+    // pool は名前を見ないので、番号の直しかたが決まる前に読んでよい
     let pool = r.many(|r| {
         Ok(match r.tag()? {
             0 => Lit::Int(r.bits()? as i64),
@@ -378,54 +504,89 @@ pub fn read(bytes: &[u8]) -> R<Program> {
             t => return Err(BadTsb(format!("unknown literal tag {t}"))),
         })
     })?;
-    let syms = r.many(|r| r.str())?;
+    let read_syms = r.many(|r| r.str())?;
+    // ここで、二枚目の番号の直しかたが決まる。これより後ろの節は名前を指すので、
+    // 一周で足りる
+    let syms = match &prev {
+        None => read_syms,
+        Some(p) => {
+            let mut index: HashMap<String, u32> = HashMap::with_capacity(p.syms.len());
+            for (i, s) in p.syms.iter().enumerate() {
+                index.insert(s.clone(), i as u32);
+            }
+            let mut map = Vec::with_capacity(read_syms.len());
+            let mut fresh: Vec<String> = Vec::new();
+            for s in read_syms {
+                let at = match index.get(&s) {
+                    Some(i) => *i,
+                    None => {
+                        let at = p.syms.len() as u32 + fresh.len() as u32;
+                        index.insert(s.clone(), at);
+                        fresh.push(s);
+                        at
+                    }
+                };
+                map.push(at);
+            }
+            r.base = Some(Bases {
+                pool: p.pool,
+                funcs: p.funcs,
+                structs: p.structs,
+                lambdas: p.lambdas,
+                comps: p.comps,
+                ireps: p.ireps,
+                syms: map,
+            });
+            fresh
+        }
+    };
     let funcs = r.many(|r| {
-        let name = r.nat()?;
+        let name = r.sym()?;
         let params = r.params()?;
         let kwparams = r.kwparams()?;
-        let body = r.nat()?;
+        let body = r.irep()?;
         let cache = r.nat()?;
         Ok(Func { name, params, kwparams, body, cache })
     })?;
     let structs = r.many(|r| {
         let mutable = r.nat()? != 0;
-        let name = r.nat()?;
-        let parent = r.nat()?;
-        let typarams = r.nats()?;
+        let name = r.sym()?;
+        let parent = r.sym()?;
+        let typarams = r.syms()?;
         let fields = r.many(|r| {
-            let name = r.nat()?;
-            let types = r.nats()?;
+            let name = r.sym()?;
+            let types = r.syms()?;
             Ok(Field { name, types })
         })?;
         let ctors = r.many(|r| {
             let params = r.params()?;
             let kwparams = r.kwparams()?;
-            let body = r.nat()?;
+            let body = r.irep()?;
             Ok(Ctor { params, kwparams, body })
         })?;
         let kwdefaults = r.many(|r| {
-            let f = r.nat()?;
-            let irep = r.nat()?;
+            let f = r.sym()?;
+            let irep = r.irep()?;
             Ok((f, irep))
         })?;
         Ok(Strct { mutable, name, parent, typarams, fields, ctors, kwdefaults })
     })?;
     let lambdas = r.many(|r| {
-        let params = r.nats()?;
-        let body = r.nat()?;
+        let params = r.syms()?;
+        let body = r.irep()?;
         Ok(Lambda { params, body })
     })?;
     let comps = r.many(|r| {
         let targets = r.many(|r| {
-            let names = r.nats()?;
+            let names = r.syms()?;
             let tuple = r.nat()? != 0;
             Ok(Target { names, tuple })
         })?;
-        let cond = r.nat()?;
-        let body = r.nat()?;
+        let cond = r.irep1()?;
+        let body = r.irep()?;
         Ok(Comp { targets, cond, body })
     })?;
     let ireps = r.many(|r| r.many(|r| r.instr()))?;
-    let main = r.nat()?;
+    let main = r.irep()?;
     Ok(Program { pool, syms, funcs, structs, lambdas, comps, ireps, main })
 }
