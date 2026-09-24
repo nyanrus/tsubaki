@@ -22,6 +22,14 @@ without expecting to rewrite large parts of it. Everything documented here was
 verified by actually running it — the embedded demo, a real benchmark, or a
 real headless-browser harness — not by reading the code.
 
+**Writing a noraneko drop's logic?** Start at [`docs/for-drops.md`](docs/for-drops.md)
+— the same language, at the depth a drop needs (state, action, `view`, effects),
+with a minimal example and a pointer back to the drop's own rules.
+
+**Just want the language?** [`docs/language.md`](docs/language.md) is the basics
+in one page — values, types, functions and dispatch, control flow, modules,
+macros, and what it deliberately does not do.
+
 ## Benchmarked against real Julia's own microbenchmark suite
 
 `examples/` holds four benchmarks with their algorithm bodies taken verbatim
