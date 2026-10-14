@@ -8,10 +8,13 @@
     | TOP of string
     | TEOF
 
+  (* `where` is not here on purpose: in Julia it is only a keyword after a
+     signature (`f(x::T) where T`), and `where = 3` or `f(where)` is a plain
+     name. The parser tells the clause apart by what follows it (at_where). *)
   let keywords =
     [ "function"; "begin"; "end"; "struct"; "mutable"; "abstract"; "type"; "if"; "elseif"; "else"
     ; "for"; "while"; "true"; "false"; "nothing"; "in"; "return"; "try"; "catch"
-    ; "module"; "using"; "import"; "macro"; "quote"; "export"; "where"; "const"
+    ; "module"; "using"; "import"; "macro"; "quote"; "export"; "const"
     ; "break"; "continue"; "let"
     ]
 

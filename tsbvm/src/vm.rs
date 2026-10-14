@@ -468,6 +468,13 @@ fn lookup(env: &Rc<RefCell<Scope>>, sym: u32) -> Option<Value> {
     }
 }
 
+/// Is the name bound in THIS scope itself (not a parent's)? A keyword
+/// parameter left out of a call takes its own default unless it was named --
+/// a global of the same name must not count as "named".
+fn bound_here(env: &Rc<RefCell<Scope>>, sym: u32) -> bool {
+    env.borrow().vars.iter().any(|(k, _)| *k == sym)
+}
+
 /// Assignment: overwrite wherever the name already lives, else make it here.
 /// The same rule as the OCaml side's `assign`.
 fn assign(env: &Rc<RefCell<Scope>>, sym: u32, v: Value) {
@@ -1356,7 +1363,7 @@ impl Vm {
             }
         }
         for kp in &kwparams {
-            if lookup(&scope, kp.name).is_none() {
+            if !bound_here(&scope, kp.name) {
                 let v = self.exec(kp.default, &scope)?;
                 bind(&scope, kp.name, v);
             }
@@ -2153,7 +2160,7 @@ impl Vm {
         // a keyword parameter the caller did not name takes its own default,
         // made now, in this call's own scope
         for kp in &kwparams {
-            if lookup(&scope, kp.name).is_none() {
+            if !bound_here(&scope, kp.name) {
                 let v = self.exec(kp.default, &scope)?;
                 bind(&scope, kp.name, v);
             }

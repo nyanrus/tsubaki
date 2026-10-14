@@ -117,6 +117,13 @@
   let at_kw st kw = match peek st with TKW k -> k = kw | _ -> false
   let at_eof st = match peek st with TEOF -> true | _ -> false
 
+  (* `where T` / `where {T, ...}`: the clause after a signature. A bare
+     `where` followed by anything else is an ordinary name (see Lexer). *)
+  let at_where st =
+    match peek st, peek_at st 1 with
+    | TIDENT "where", (TIDENT _ | TOP "{") -> true
+    | _ -> false
+
   let is_block_end st =
     at_kw st "end" || at_kw st "else" || at_kw st "elseif" || at_kw st "catch" || at_eof st
 
@@ -164,7 +171,7 @@
       let bound = if at_op st "<:" then (advance st; Some (ident st)) else None in
       t, bound
     in
-    if at_kw st "where" then (
+    if at_where st then (
       advance st;
       if at_op st "{" then (
         advance st;
