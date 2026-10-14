@@ -5,6 +5,7 @@
 //! positional arguments, `if`/`while`, `return`. Everything else says so,
 //! rather than guessing.
 
+use crate::json;
 use crate::tsb::*;
 use std::cell::OnceCell;
 use std::cell::RefCell;
@@ -657,6 +658,25 @@ struct Method {
     constructing: Option<Rc<str>>,
 }
 
+/// What a program may ask of the world outside the VM: `host("fs.read",
+/// path)`. The VM has no files, no network and no environment of its own --
+/// whoever embeds it decides which names exist by giving it a `Host`, so a
+/// drop's logic can be given nothing and a command-line tool everything.
+///
+/// Arguments arrive as one JSON array and the answer leaves as one JSON
+/// value, the same carriage `tsb_call` uses (see json.rs for what crosses).
+pub trait Host {
+    fn call(&mut self, name: &str, args_json: &str) -> Result<String, HostError>;
+}
+
+pub enum HostError {
+    /// An ordinary failure: the program sees an error it can `catch`.
+    Fail(String),
+    /// Stop the whole program with this exit code. Not catchable: a `try`
+    /// around `host("exit", 1)` does not make the program carry on.
+    Exit(i32),
+}
+
 pub struct Vm {
     /// Behind an `Rc` so a running irep can be borrowed while the VM itself
     /// is borrowed mutably. Without it `exec` had to CLONE the instruction
@@ -709,6 +729,10 @@ pub struct Vm {
     /// `function` は、その呼び出しごとの closure としても束ねる -- そこを
     /// 見分けるためだけの数
     depth: u32,
+    /// where `host(...)` goes; none attached means every `host` call fails
+    host: Option<Box<dyn Host>>,
+    /// set when the program asked to stop; checked before any `catch`
+    exit: Option<i32>,
 }
 
 /// `Int` is Julia's own name for `Int64` (`const Int = Int64`), so a program
@@ -802,6 +826,35 @@ impl Vm {
             file: Rc::from(""),
             frames: Vec::new(),
             depth: 0,
+            host: None,
+            exit: None,
+        }
+    }
+
+    /// Give the program a way out. Without one, `host(...)` is an error.
+    pub fn set_host(&mut self, host: Box<dyn Host>) {
+        self.host = Some(host);
+    }
+
+    /// `Some(code)` when the program stopped itself with `host("exit", code)`.
+    pub fn exit_code(&self) -> Option<i32> {
+        self.exit
+    }
+
+    fn host_call(&mut self, name: &str, rest: &[Value]) -> E<Value> {
+        let args = json::to_json(&self.arr_lit(rest.to_vec()))?;
+        let host = self
+            .host
+            .as_mut()
+            .ok_or_else(|| format!("host(\"{name}\"): this VM has no host attached"))?;
+        match host.call(name, &args) {
+            Ok(reply) => json::from_json(&reply)
+                .map_err(|e| format!("host(\"{name}\"): the answer is not JSON: {e}")),
+            Err(HostError::Fail(msg)) => Err(format!("host(\"{name}\"): {msg}")),
+            Err(HostError::Exit(code)) => {
+                self.exit = Some(code);
+                Err(format!("exit {code}"))
+            }
         }
     }
 
@@ -1538,6 +1591,7 @@ impl Vm {
     fn builtin(&mut self, name: &str, args: &[Value]) -> Option<E<Value>> {
         use Value::*;
         Some(match (name, args) {
+            ("host", [Str(name), rest @ ..]) => self.host_call(&name.clone(), rest),
             ("Dict", []) => Ok(Dict(Rc::new(RefCell::new(Vec::new())))),
             ("length", [Arr(a)]) => Ok(Int(a.borrow().len() as i64)),
             ("length", [Tuple(t)]) => Ok(Int(t.len() as i64)),
@@ -2124,6 +2178,7 @@ impl Vm {
     fn index_or_dispatch(&mut self, c: Value, i: Value, env: &Rc<RefCell<Scope>>) -> E<Value> {
         match &c {
             Value::Arr(_) | Value::Tuple(_) | Value::Dict(_) => index_get(&c, &i),
+            Value::Str(_) if matches!(i, Value::Range(..)) => index_get(&c, &i),
             _ => self.call(&Rc::from("getindex"), vec![c, i], env),
         }
     }
@@ -2259,6 +2314,7 @@ impl Vm {
                 from,
             ) {
                 Ok(v) => return Ok(v),
+                Err(e) if self.exit.is_some() => return Err(e),
                 Err(e) => match handlers.pop() {
                     None => return Err(e),
                     Some(h) => {
@@ -2665,6 +2721,7 @@ impl Vm {
                     self.current_end = match v {
                         Value::Arr(a) => a.borrow().len() as i64,
                         Value::Tuple(t) => t.len() as i64,
+                        Value::Str(s) => str_lastindex(s),
                         _ => self.current_end,
                     };
                     pc += 1;
@@ -2710,6 +2767,7 @@ impl Vm {
                             self.current_end = match &v {
                                 Value::Arr(a) => a.borrow().len() as i64,
                                 Value::Tuple(t) => t.len() as i64,
+                                Value::Str(s) => str_lastindex(s),
                                 _ => self.current_end,
                             };
                             stack.push(v);
@@ -3273,7 +3331,7 @@ const BUILTIN_NAMES: &[&str] = &[
     "push!", "pushfirst!", "rem", "repeat", "replace", "reverse", "reverse!", "round",
     "rstrip", "sign", "sin", "sort", "sort!", "split", "sqrt", "startswith", "string",
     "strip", "sum", "tan", "throw", "trunc", "unique", "uppercase", "values", "vcat",
-    "zeros", "zip", "|", "~"
+    "zeros", "zip", "|", "~", "host"
 ];
 
 /// この program が名前を口にしている builtin。**どれを呼ぶか**ではなく
@@ -3592,6 +3650,45 @@ fn dict_set(d: &mut Vec<(Value, Value)>, k: Value, v: Value) {
 }
 
 /// `c[i]`. Everything indexable here starts at 1, the way Julia's does.
+/// String indices are byte positions, as in Julia: `s[a:b]` needs `a` and `b`
+/// to each start a character, and runs through the end of `b`'s character.
+fn str_cont(s: &str, i: i64) -> bool {
+    s.as_bytes()[i as usize - 1] & 0xC0 == 0x80
+}
+
+/// What `end` means inside `s[...]`: where the last character starts
+/// (the length, for ASCII); 0 for the empty string.
+fn str_lastindex(s: &str) -> i64 {
+    let mut i = s.len() as i64;
+    while i > 1 && str_cont(s, i) {
+        i -= 1;
+    }
+    i
+}
+
+fn str_slice(s: &str, a: i64, st: i64, b: i64) -> E<Value> {
+    let n = s.len() as i64;
+    if st != 1 {
+        return Err("String index range with a step is not supported".into());
+    }
+    if b < a {
+        return Ok(Value::Str(Rc::from("")));
+    }
+    if a < 1 || b > n {
+        return Err(format!("BoundsError: index {}", if a < 1 { a } else { b }));
+    }
+    for i in [a, b] {
+        if str_cont(s, i) {
+            return Err(format!("StringIndexError: invalid index [{i}]"));
+        }
+    }
+    let mut e = b;
+    while e < n && str_cont(s, e + 1) {
+        e += 1;
+    }
+    Ok(Value::Str(Rc::from(&s[(a - 1) as usize..e as usize])))
+}
+
 fn index_get(c: &Value, i: &Value) -> E<Value> {
     match (c, i) {
         (Value::Arr(a), Value::Int(n)) => {
@@ -3630,6 +3727,8 @@ fn index_get(c: &Value, i: &Value) -> E<Value> {
             // 切り出したものは、元と同じ何かの並び
             Ok(arr_of(&a.elem, out))
         }
+        // s[2:4] -- a fresh String
+        (Value::Str(s), Value::Range(lo, st, hi)) => str_slice(s, *lo, *st, *hi),
         (Value::Arr(_) | Value::Tuple(_), other) => {
             Err(format!("index must be an Int, got a {}", tag(other)))
         }

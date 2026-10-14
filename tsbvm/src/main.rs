@@ -64,8 +64,13 @@ fn main() {
         return;
     }
     let mut vm = tsbvm::vm::Vm::new(p);
+    vm.set_host(Box::new(tsbvm::host::StdHost));
     let r = vm.run();
     print!("{}", vm.output());
+    // `host("exit", n)`: not a failure of the program, just its chosen end
+    if let Some(code) = vm.exit_code() {
+        std::process::exit(code);
+    }
     if let Err(e) = r {
         eprintln!("tsbvm: {e}");
         std::process::exit(1);

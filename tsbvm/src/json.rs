@@ -33,6 +33,14 @@ pub fn to_json(v: &Value) -> Result<String, String> {
     Ok(s)
 }
 
+/// `x` as a JSON string literal, quotes included. For hosts that build a
+/// reply by hand.
+pub fn quote(x: &str) -> String {
+    let mut s = String::new();
+    write_str(x, &mut s);
+    s
+}
+
 fn write_str(x: &str, out: &mut String) {
     out.push('"');
     for c in x.chars() {

@@ -3,6 +3,14 @@ name = "tsbvm"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# `host("http.post_json", ...)` for the command-line tool. Off by default so
+# the library and the wasm drop stay free of a TLS stack.
+http = ["dep:ureq"]
+
+[dependencies]
+ureq = { version = "2", optional = true, default-features = false, features = ["tls"] }
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 
