@@ -2016,6 +2016,7 @@ impl Vm {
     fn index_or_dispatch(&mut self, c: Value, i: Value, env: &Rc<RefCell<Scope>>) -> E<Value> {
         match &c {
             Value::Arr(_) | Value::Tuple(_) | Value::Dict(_) => index_get(&c, &i),
+            Value::Str(_) if matches!(i, Value::Range(..)) => index_get(&c, &i),
             _ => self.call(&Rc::from("getindex"), vec![c, i], env),
         }
     }
@@ -2553,6 +2554,7 @@ impl Vm {
                     self.current_end = match v {
                         Value::Arr(a) => a.borrow().len() as i64,
                         Value::Tuple(t) => t.len() as i64,
+                        Value::Str(s) => str_lastindex(s),
                         _ => self.current_end,
                     };
                     pc += 1;
@@ -2598,6 +2600,7 @@ impl Vm {
                             self.current_end = match &v {
                                 Value::Arr(a) => a.borrow().len() as i64,
                                 Value::Tuple(t) => t.len() as i64,
+                                Value::Str(s) => str_lastindex(s),
                                 _ => self.current_end,
                             };
                             stack.push(v);
@@ -3480,6 +3483,45 @@ fn dict_set(d: &mut Vec<(Value, Value)>, k: Value, v: Value) {
 }
 
 /// `c[i]`. Everything indexable here starts at 1, the way Julia's does.
+/// String indices are byte positions, as in Julia: `s[a:b]` needs `a` and `b`
+/// to each start a character, and runs through the end of `b`'s character.
+fn str_cont(s: &str, i: i64) -> bool {
+    s.as_bytes()[i as usize - 1] & 0xC0 == 0x80
+}
+
+/// What `end` means inside `s[...]`: where the last character starts
+/// (the length, for ASCII); 0 for the empty string.
+fn str_lastindex(s: &str) -> i64 {
+    let mut i = s.len() as i64;
+    while i > 1 && str_cont(s, i) {
+        i -= 1;
+    }
+    i
+}
+
+fn str_slice(s: &str, a: i64, st: i64, b: i64) -> E<Value> {
+    let n = s.len() as i64;
+    if st != 1 {
+        return Err("String index range with a step is not supported".into());
+    }
+    if b < a {
+        return Ok(Value::Str(Rc::from("")));
+    }
+    if a < 1 || b > n {
+        return Err(format!("BoundsError: index {}", if a < 1 { a } else { b }));
+    }
+    for i in [a, b] {
+        if str_cont(s, i) {
+            return Err(format!("StringIndexError: invalid index [{i}]"));
+        }
+    }
+    let mut e = b;
+    while e < n && str_cont(s, e + 1) {
+        e += 1;
+    }
+    Ok(Value::Str(Rc::from(&s[(a - 1) as usize..e as usize])))
+}
+
 fn index_get(c: &Value, i: &Value) -> E<Value> {
     match (c, i) {
         (Value::Arr(a), Value::Int(n)) => {
@@ -3518,6 +3560,8 @@ fn index_get(c: &Value, i: &Value) -> E<Value> {
             // 切り出したものは、元と同じ何かの並び
             Ok(arr_of(&a.elem, out))
         }
+        // s[2:4] -- a fresh String
+        (Value::Str(s), Value::Range(lo, st, hi)) => str_slice(s, *lo, *st, *hi),
         (Value::Arr(_) | Value::Tuple(_), other) => {
             Err(format!("index must be an Int, got a {}", tag(other)))
         }
