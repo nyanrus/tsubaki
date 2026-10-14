@@ -15,7 +15,7 @@
     [ "function"; "begin"; "end"; "struct"; "mutable"; "abstract"; "type"; "if"; "elseif"; "else"
     ; "for"; "while"; "true"; "false"; "nothing"; "in"; "return"; "try"; "catch"
     ; "module"; "using"; "import"; "macro"; "quote"; "export"; "const"
-    ; "break"; "continue"; "let"
+    ; "break"; "continue"; "let"; "global"
     ]
 
   (* every identifier occurrence with the SAME text becomes the SAME

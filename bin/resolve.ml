@@ -26,9 +26,14 @@
    existed. *)
   open Ast
 
-  type scope = { mutable known : string list; parent : scope option }
+  (* fn: a function/lambda body. is_global: the top level (the root). declared:
+     the names a `global` in this function body made global. Assigning from
+     inside a function to a name that is only known at a global scope does not
+     reach it -- it makes a local, as Eval.assign does. *)
+  type scope = { mutable known : string list; parent : scope option; fn : bool; is_global : bool; mutable declared : string list }
 
-  let child parent = { known = []; parent = Some parent }
+  let child parent = { known = []; parent = Some parent; fn = false; is_global = false; declared = [] }
+  let fn_child parent = { (child parent) with fn = true }
   let know s name = if not (List.mem name s.known) then s.known <- name :: s.known
 
   (* Some d: name is already bound d scopes up (an assignment there mutates
@@ -45,14 +50,28 @@
     | Some d -> cache.Runtime.depth <- d
     | None -> () (* UndefVarError at runtime regardless -- nothing to cache *)
 
+  (* the scope a `global` written in `s` belongs to: the enclosing function
+     body, or the top level *)
+  let rec decl_scope s = if s.fn || s.parent = None then s else match s.parent with Some p -> decl_scope p | None -> s
+
   let resolve_assign s name (cache : Runtime.var_cache) =
-    match find_depth s name 0 with
-    | Some d -> cache.Runtime.depth <- d
-    | None ->
+    let rec go sc d crossed =
+      let visible = not (sc.is_global && crossed) in
+      if visible && List.mem name sc.declared then `Declared
+      else if visible && List.mem name sc.known then `Found d
+      else
+        match sc.parent with
+        | Some p -> go p (d + 1) (crossed || sc.fn)
+        | None -> `Nowhere
+    in
+    match go s 0 false with
+    | `Found d -> cache.Runtime.depth <- d
+    | `Declared -> () (* the runtime walk finds the global one *)
+    | `Nowhere ->
       cache.Runtime.depth <- 0;
       know s name
 
-  let global_scope : scope = { known = [ "pi"; "I" ]; parent = None }
+  let global_scope : scope = { known = [ "pi"; "I" ]; parent = None; fn = false; is_global = true; declared = [] }
 
   let rec resolve_expr s (e : expr) : unit =
     match e with
@@ -92,7 +111,7 @@
     | ELambda (params, body) ->
       (* a nested closure: a snapshot of `s` as it stands right here, not
          live -- see the module comment *)
-      let s' = child s in
+      let s' = fn_child s in
       List.iter (know s') params;
       resolve_stmt_list s' body
     | EComprehension (body_e, clauses, cond) ->
@@ -135,6 +154,9 @@
     | SLine _ -> () (* a source-position marker binds and references nothing *)
     (* neither binds nor references a name *)
     | SBreak | SContinue -> ()
+    | SGlobal names ->
+      let d = decl_scope s in
+      d.declared <- names @ d.declared
     | SExpr e -> resolve_expr s e
     | SIf (branches, else_body) ->
       List.iter
@@ -153,7 +175,7 @@
       resolve_stmt_list (child s) body
     | SFuncDecl (_, params, kwparams, body, _) ->
       (* like ELambda: a snapshot of `s` at the declaration site, not live *)
-      let s' = child s in
+      let s' = fn_child s in
       List.iter
         (fun p ->
           (match p.pdefault with Some d -> resolve_expr s d | None -> ());
@@ -322,7 +344,7 @@
     | SDestructure (targets, rhs) ->
       resolve_quoted_expr s rhs;
       List.iter (fun (t, _ty) -> resolve_quoted_expr s t) targets
-    | SBreak | SContinue
+    | SBreak | SContinue | SGlobal _
     | SFuncDecl _ | SStructDecl _ | SAbstractDecl _ | STry _ | SModuleDecl _ | SUsing _ | SImport _
     | SMacroDecl _ | SExport _ | SMacroCall _ | SLocalTypedAssign _ -> ()
     (* not quotable at all -- nothing to resolve *)

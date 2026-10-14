@@ -1,9 +1,6 @@
-# Not julia-compatible, for one reason: assigning to a name that already
-# exists at the top level (`counter = counter + 1` inside `bump()` below)
-# writes the GLOBAL here, where real Julia would make it a fresh local and
-# raise UndefVarError. That is a deliberate simplification, not an accident --
-# see tests/known_gaps.jl. Every numeric answer in this file was still checked
-# against real Julia by hand.
+# The numeric answers in this file were checked against real Julia by hand.
+# `bump()` below says `global counter`, as real Julia needs it to: without it,
+# assigning inside a function makes a local (see tests/global_scope.jl).
 #
 # The second execution path: a zero-parameter function whose whole body is
 # restricted-numeric gets compiled to bytecode and run by the Rust kernel's
@@ -71,6 +68,7 @@ println("while_loop() = ", while_loop())
 # 1, 1, 0 once -- a wrong answer, with nothing to signal it.
 counter = 0
 function bump()
+    global counter
     counter = counter + 1
     return counter
 end

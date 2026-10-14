@@ -44,6 +44,10 @@ type instr =
   | Bind of int (* 積まれている値を取って、いまのスコープに syms[名前] で置く *)
   | Bind_tuple of int array (* 同じ。ただしタプルをばらして、名前の数だけ *)
   | Store_plain of int (* syms[名前] へ代入。cache を持たない場所のため *)
+  | Global of int
+    (* `global x` -- この関数(か、トップ)の中では、syms[名前] への代入は
+       グローバルのほうへ行く。宣言しない限り、関数の中でグローバルと同じ
+       名前に代入すると、ローカルができる(Julia と同じ) *)
   | Unpack_check of int
     (* 積まれているものが n 個のタプルであることを確かめて、覚えておく
        (取り出すのは Elem)。値はそのまま残る -- 分解代入そのものの値なので *)
@@ -352,6 +356,7 @@ let to_bytes (p : program) : string =
           | Ret -> op buf 14 []
           | Bind a -> op buf 19 [ a ]
           | Store_plain a -> op buf 57 [ a ]
+          | Global a -> op buf 67 [ a ]
           | Unpack_check a -> op buf 58 [ a ]
           | Elem a -> op buf 59 [ a ]
           | Unpack_end -> op buf 60 []

@@ -471,6 +471,7 @@ and compile_stmt b cb (s : stmt) : unit =
     emit cb (Defabstract (sym_index b name, sym_index b (Option.value parent ~default:"Any")))
   (* いちばん内側のループへ。途中で開いたスコープはその数だけ閉じる --
      例外で飛ぶ eval と違って、こちらは自分で戻さないと深さが合わなくなる *)
+  | SGlobal names -> List.iter (fun n -> emit cb (Global (sym_index b n))) names
   | SBreak | SContinue -> (
     match b.loops with
     | [] ->
@@ -645,7 +646,7 @@ and fold_struct b cb ~mutable_ ~name ~parent ~type_params ~fields ~constructors 
 and stmt_pushes (s : stmt) : bool =
   match s with
   | SLine _ | SFuncDecl _ | SStructDecl _ | SAbstractDecl _ | SUsing _ | SImport _
-  | SModuleDecl _ ->
+  | SModuleDecl _ | SGlobal _ ->
     false
   | SMacroCall ("kwdef", SStructDecl _) -> false
   | SMacroCall (name, inner) when Hints.is_inert_hint_macro name -> stmt_pushes inner
