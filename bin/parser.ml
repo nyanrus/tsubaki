@@ -1441,6 +1441,22 @@
       advance st;
       if is_block_end st || at_op st ";" then SReturn None
       else SReturn (Some (parse_comma_exprs st))
+    | TKW "global" ->
+      advance st;
+      (* global x / global x, y / global x = e *)
+      let rec names acc =
+        let acc = ident st :: acc in
+        if at_op st "," then (advance st; names acc) else List.rev acc
+      in
+      let ns = names [] in
+      if at_op st "=" then (
+        match ns with
+        | [ n ] ->
+          advance st;
+          let rhs = parse_expr st in
+          SExpr (EBlock [ SGlobal ns; SExpr (EAssign (n, rhs, Caches.fresh_var ())) ])
+        | _ -> raise (Parse_error (Printf.sprintf "global with several names cannot assign at %s" (ctx st))))
+      else SGlobal ns
     | TKW "break" ->
       advance st;
       SBreak

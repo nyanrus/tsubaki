@@ -250,6 +250,11 @@
         }
     | SAbstractDecl of string * string option
     | SReturn of expr option
+    | SGlobal of string list
+      (* global x, y -- inside a function, these names are the GLOBAL ones for
+         every assignment in it (without it, assigning a name that is only
+         global makes a local, as in Julia). `global x = e` is parsed as this
+         followed by the assignment. *)
     | SBreak
       (* leave the innermost `for`/`while` -- only meaningful inside one, and
          the folding side (Tocode) is where that is checked: it is the one

@@ -124,6 +124,8 @@ pub enum Instr {
     Bind(u32),
     BindTuple(Vec<u32>),
     StorePlain(u32),
+    /// `global x` -- assignments to the name, in this function, go to the global one
+    Global(u32),
     Range,
     Range3,
     IterNew,
@@ -341,6 +343,7 @@ impl<'a> Reader<'a> {
             55 => BindTuple(self.nats()?),
             56 => Comprehension(self.nat()?),
             57 => StorePlain(self.nat()?),
+            67 => Global(self.nat()?),
             58 => UnpackCheck(self.nat()?),
             59 => Elem(self.nat()?),
             60 => UnpackEnd,

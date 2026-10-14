@@ -38,11 +38,12 @@ println(d)
 #   real Julia: -0.0
 println(-0.0)
 
-# ---- 5. assignment inside a function writes the global ----
-# Tsubaki has no local-by-default rule and no `global` keyword: assigning to a
-# name that already exists at the top level updates it. Real Julia treats the
-# assignment as declaring a fresh local, so the read on the right-hand side
-# has nothing to read.
+# ---- 5. a function reads a global, then assigns the same name ----
+# Assigning inside a function makes a local unless the function says `global`
+# (tests/global_scope.jl), as in Julia. What is still different is the READ
+# on the right-hand side: Julia knows the whole body makes `hits` local, so
+# `hits + 1` has nothing to read and raises; here the read still finds the
+# global, and the new local starts from it. The global itself stays 0.
 #   real Julia: UndefVarError: `hits` not defined in local scope
 hits = 0
 function record()
