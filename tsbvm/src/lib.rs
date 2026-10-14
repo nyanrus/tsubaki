@@ -10,6 +10,10 @@
 //! (`Unsupported`) rather than guessing -- the same shape as Tocode's
 //! `Not_yet` on the folding side.
 
+// the command-line host reaches files and the environment; a wasm drop has
+// neither, so it does not carry the code that would
+#[cfg(not(target_arch = "wasm32"))]
+pub mod host;
 pub mod json;
 pub mod tsb;
 pub mod vm;

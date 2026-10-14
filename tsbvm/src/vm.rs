@@ -5,6 +5,7 @@
 //! positional arguments, `if`/`while`, `return`. Everything else says so,
 //! rather than guessing.
 
+use crate::json;
 use crate::tsb::*;
 use std::cell::OnceCell;
 use std::cell::RefCell;
@@ -549,6 +550,25 @@ struct Method {
     constructing: Option<Rc<str>>,
 }
 
+/// What a program may ask of the world outside the VM: `host("fs.read",
+/// path)`. The VM has no files, no network and no environment of its own --
+/// whoever embeds it decides which names exist by giving it a `Host`, so a
+/// drop's logic can be given nothing and a command-line tool everything.
+///
+/// Arguments arrive as one JSON array and the answer leaves as one JSON
+/// value, the same carriage `tsb_call` uses (see json.rs for what crosses).
+pub trait Host {
+    fn call(&mut self, name: &str, args_json: &str) -> Result<String, HostError>;
+}
+
+pub enum HostError {
+    /// An ordinary failure: the program sees an error it can `catch`.
+    Fail(String),
+    /// Stop the whole program with this exit code. Not catchable: a `try`
+    /// around `host("exit", 1)` does not make the program carry on.
+    Exit(i32),
+}
+
 pub struct Vm {
     /// Behind an `Rc` so a running irep can be borrowed while the VM itself
     /// is borrowed mutably. Without it `exec` had to CLONE the instruction
@@ -601,6 +621,10 @@ pub struct Vm {
     /// `function` は、その呼び出しごとの closure としても束ねる -- そこを
     /// 見分けるためだけの数
     depth: u32,
+    /// where `host(...)` goes; none attached means every `host` call fails
+    host: Option<Box<dyn Host>>,
+    /// set when the program asked to stop; checked before any `catch`
+    exit: Option<i32>,
 }
 
 /// `Int` is Julia's own name for `Int64` (`const Int = Int64`), so a program
@@ -694,6 +718,35 @@ impl Vm {
             file: Rc::from(""),
             frames: Vec::new(),
             depth: 0,
+            host: None,
+            exit: None,
+        }
+    }
+
+    /// Give the program a way out. Without one, `host(...)` is an error.
+    pub fn set_host(&mut self, host: Box<dyn Host>) {
+        self.host = Some(host);
+    }
+
+    /// `Some(code)` when the program stopped itself with `host("exit", code)`.
+    pub fn exit_code(&self) -> Option<i32> {
+        self.exit
+    }
+
+    fn host_call(&mut self, name: &str, rest: &[Value]) -> E<Value> {
+        let args = json::to_json(&self.arr_lit(rest.to_vec()))?;
+        let host = self
+            .host
+            .as_mut()
+            .ok_or_else(|| format!("host(\"{name}\"): this VM has no host attached"))?;
+        match host.call(name, &args) {
+            Ok(reply) => json::from_json(&reply)
+                .map_err(|e| format!("host(\"{name}\"): the answer is not JSON: {e}")),
+            Err(HostError::Fail(msg)) => Err(format!("host(\"{name}\"): {msg}")),
+            Err(HostError::Exit(code)) => {
+                self.exit = Some(code);
+                Err(format!("exit {code}"))
+            }
         }
     }
 
@@ -1430,6 +1483,7 @@ impl Vm {
     fn builtin(&mut self, name: &str, args: &[Value]) -> Option<E<Value>> {
         use Value::*;
         Some(match (name, args) {
+            ("host", [Str(name), rest @ ..]) => self.host_call(&name.clone(), rest),
             ("Dict", []) => Ok(Dict(Rc::new(RefCell::new(Vec::new())))),
             ("length", [Arr(a)]) => Ok(Int(a.borrow().len() as i64)),
             ("length", [Tuple(t)]) => Ok(Int(t.len() as i64)),
@@ -2151,6 +2205,7 @@ impl Vm {
                 from,
             ) {
                 Ok(v) => return Ok(v),
+                Err(e) if self.exit.is_some() => return Err(e),
                 Err(e) => match handlers.pop() {
                     None => return Err(e),
                     Some(h) => {
@@ -3161,7 +3216,7 @@ const BUILTIN_NAMES: &[&str] = &[
     "push!", "pushfirst!", "rem", "repeat", "replace", "reverse", "reverse!", "round",
     "rstrip", "sign", "sin", "sort", "sort!", "split", "sqrt", "startswith", "string",
     "strip", "sum", "tan", "throw", "trunc", "unique", "uppercase", "values", "vcat",
-    "zeros", "zip", "|", "~"
+    "zeros", "zip", "|", "~", "host"
 ];
 
 /// この program が名前を口にしている builtin。**どれを呼ぶか**ではなく
