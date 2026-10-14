@@ -144,8 +144,32 @@
      から」右辺を見ているため -- 添字が範囲の外なら、右辺は評価されない。
      命令列の道は右辺をもう積んでいるので、そこだけ順が違う(答えは同じ。
      違うのは、範囲外のときに右辺の副作用が起きるかどうか)。 *)
+  (* 文字列の添字は Julia と同じに、バイトの位置。`end` は最後の文字の
+     はじまり(ASCII なら長さと同じ)。 *)
+  let str_cont s i = Char.code s.[i - 1] land 0xC0 = 0x80
+
+  let str_lastindex s =
+    let i = ref (String.length s) in
+    while !i > 1 && str_cont s !i do decr i done;
+    !i
+
+  (* s[a:b] -- a fresh String. a and b must each start a character; the
+     slice runs through the end of b's character. Only a step of 1. *)
+  let str_slice s a st b =
+    let n = String.length s in
+    if st <> 1 then failwith "String index range with a step is not supported"
+    else if b < a then ""
+    else if a < 1 || b > n then failwith (Printf.sprintf "BoundsError: index %d" (if a < 1 then a else b))
+    else if str_cont s a then failwith (Printf.sprintf "StringIndexError: invalid index [%d]" a)
+    else if str_cont s b then failwith (Printf.sprintf "StringIndexError: invalid index [%d]" b)
+    else (
+      let e = ref b in
+      while !e < n && str_cont s (!e + 1) do incr e done;
+      String.sub s (a - 1) (!e - a + 1))
+
   let set_end_from container =
     match container with
+    | VStr s -> current_end := if s = "" then 0 else str_lastindex s
     | VVec r -> current_end := vecbuf_length r
     | VArr { cells; _ } -> current_end := arrbuf_length cells
     | VTuple vs -> current_end := Array.length vs
@@ -153,6 +177,7 @@
 
   let index_get container idx =
     match container, idx with
+    | VStr s, VRange (a, st, b) -> VStr (str_slice s a st b)
     | VVec r, VInt i ->
       if i < 1 || i > vecbuf_length r then failwith (Printf.sprintf "BoundsError: index %d" i)
       else VFloat (vecbuf_get r (i - 1)) (* Julia is 1-indexed *)
