@@ -1597,6 +1597,7 @@ impl Vm {
             ("length", [Tuple(t)]) => Ok(Int(t.len() as i64)),
             ("length", [Dict(d)]) => Ok(Int(d.borrow().len() as i64)),
             ("length", [Str(s)]) => Ok(Int(s.chars().count() as i64)),
+            ("ncodeunits", [Str(s)]) | ("sizeof", [Str(s)]) => Ok(Int(s.len() as i64)),
             ("length", [Range(a, st, b)]) => Ok(Int(if *st == 0 {
                 0
             } else {
@@ -1787,7 +1788,7 @@ impl Vm {
             ("lastindex", [coll]) => match coll {
                 Arr(a) => Ok(Int(a.borrow().len() as i64)),
                 Tuple(t) => Ok(Int(t.len() as i64)),
-                Str(s) => Ok(Int(s.chars().count() as i64)),
+                Str(s) => Ok(Int(str_lastindex(s))),
                 other => Err(format!("lastindex: not indexable, a {}", tag(other))),
             },
             ("abs", [Int(n)]) => Ok(Int(n.abs())),
@@ -3327,9 +3328,9 @@ const BUILTIN_NAMES: &[&str] = &[
     "findfirst", "first", "firstindex", "fld", "floor", "get", "haskey", "hypot",
     "identity", "in", "insert!", "isempty", "isqrt", "join", "keys", "last", "lastindex",
     "length", "log", "log10", "log2", "lowercase", "lstrip", "map", "max", "maximum",
-    "min", "minimum", "mod", "occursin", "ones", "parse", "pop!", "popfirst!", "prod",
+    "min", "minimum", "mod", "ncodeunits", "occursin", "ones", "parse", "pop!", "popfirst!", "prod",
     "push!", "pushfirst!", "rem", "repeat", "replace", "reverse", "reverse!", "round",
-    "rstrip", "sign", "sin", "sort", "sort!", "split", "sqrt", "startswith", "string",
+    "rstrip", "sign", "sin", "sizeof", "sort", "sort!", "split", "sqrt", "startswith", "string",
     "strip", "sum", "tan", "throw", "trunc", "unique", "uppercase", "values", "vcat",
     "zeros", "zip", "|", "~", "host"
 ];
