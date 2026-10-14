@@ -2873,11 +2873,28 @@
       | _ -> assert false);
     (* `length` already answered for every container here EXCEPT the one type
        most likely to be asked -- `length("hello")` raised a MethodError.
-       Bytes, not codepoints, same as real Julia's own `length`-vs-`sizeof`
-       split resolves for ASCII (which is all this lexer accepts in a string
-       literal anyway). *)
+       Characters, not bytes, as in Julia: `length("é")` is 1 and
+       `ncodeunits("é")` / `sizeof("é")` are 2 (below). *)
     Dispatch.defmethod "length" [ [ "String" ] ] (function
+      | [ VStr s ] ->
+        (* characters, as in Julia: every byte that does not continue one *)
+        let n = ref 0 in
+        String.iter (fun c -> if Char.code c land 0xC0 <> 0x80 then incr n) s;
+        VInt !n
+      | _ -> assert false);
+    (* the byte counts: what the string takes, and what `s[a:b]` is indexed by *)
+    Dispatch.defmethod "ncodeunits" [ [ "String" ] ] (function
       | [ VStr s ] -> VInt (String.length s)
+      | _ -> assert false);
+    Dispatch.defmethod "sizeof" [ [ "String" ] ] (function
+      | [ VStr s ] -> VInt (String.length s)
+      | _ -> assert false);
+    (* where the last character starts -- the `end` of `s[a:end]` *)
+    Dispatch.defmethod "lastindex" [ [ "String" ] ] (function
+      | [ VStr s ] ->
+        let i = ref (String.length s) in
+        while !i > 1 && Char.code s.[!i - 1] land 0xC0 = 0x80 do decr i done;
+        VInt !i
       | _ -> assert false);
     (* real Julia concatenates strings with `*`, not `+` (`+` is deliberately
        NOT defined for strings there at all, since concatenation isn't
