@@ -354,15 +354,27 @@
      bucket array every time; an empty list is a zero-cost `[]` until
      something is actually bound into it. Linear scan is fine at this size,
      and it's what actually got measured to matter (see README benchmarks). *)
-  type env = { mutable vars : (string * value ref) list; parent : env option }
+  (* is_fn: a function/lambda call's own scope. is_global: the top level, or a
+     module body. globals: names a `global` declaration in this scope made
+     global. Assignment from inside a function does not reach a name that
+     lives only at a global scope (it makes a local, as in Julia) unless the
+     function said `global` -- see assign_site. *)
+  type env =
+    { mutable vars : (string * value ref) list
+    ; parent : env option
+    ; is_fn : bool
+    ; is_global : bool
+    ; mutable globals : string list
+    }
 
-  let new_scope parent = { vars = []; parent = Some parent }
+  let new_scope parent = { vars = []; parent = Some parent; is_fn = false; is_global = false; globals = [] }
+  let new_fn_scope parent = { (new_scope parent) with is_fn = true }
 
   (* the one scope with no parent -- every lookup that walks off the top of
      its chain ends up here. Defined this early (before `bind`) so `bind`
      itself can recognize a write landing directly into it -- see
      `global_generation` below. *)
-  let global = { vars = []; parent = None }
+  let global = { vars = []; parent = None; is_fn = false; is_global = true; globals = [] }
 
   (* bumped only when `bind` adds a genuinely NEW key into `global` itself
      (never for any other scope, and never for an overwrite of an existing
@@ -525,15 +537,34 @@
      local in every function body -- i, j in a quicksort, for instance --
      silently became one shared global, so recursive calls stomped on each
      other's supposedly-local state instead of getting their own. *)
-  let assign env name v =
-    let rec walk_and_set e =
-      match str_assoc_opt name e.vars with
-      | Some cell ->
-        cell := v;
-        true
-      | None -> ( match e.parent with Some p -> walk_and_set p | None -> false)
+  (* Where an assignment to `name`, written in `env`, lands. Walking up from
+     env: a name that a `global` declaration made global goes to the nearest
+     global scope; a name bound in a scope is overwritten there -- except a
+     binding at a global scope that the walk reached by passing through a
+     function: from inside a function, a global is only a global to READ, so
+     the walk goes on as if it were not there and the assignment ends up
+     making a local (in `env`, the scope it is written in). The depth is how
+     many parents up the cell was, for the cache. *)
+  type assign_site = AssignCell of value ref * int | AssignGlobal of env | AssignLocal
+
+  let assign_site env name =
+    let rec nearest_global e = if e.is_global then e else match e.parent with Some p -> nearest_global p | None -> e in
+    let rec go e d crossed =
+      let visible = not (e.is_global && crossed) in
+      if visible && e.globals <> [] && List.mem name e.globals then AssignGlobal (nearest_global e)
+      else
+        match (if visible then str_assoc_opt name e.vars else None) with
+        | Some cell -> AssignCell (cell, d)
+        | None -> (
+          match e.parent with Some p -> go p (d + 1) (crossed || e.is_fn) | None -> AssignLocal)
     in
-    if not (walk_and_set env) then bind env name v
+    go env 0 false
+
+  let assign env name v =
+    match assign_site env name with
+    | AssignCell (cell, _) -> cell := v
+    | AssignGlobal g -> bind g name v
+    | AssignLocal -> bind env name v
 
   (* same depth-cache trick as lookup_cached, for the write side: `s += ...`
      both reads AND writes `s` every time, so leaving assign uncached would
@@ -545,17 +576,14 @@
       if n <= 0 then Some e else match e.parent with Some p -> nth_parent p (n - 1) | None -> None
     in
     let full_walk () =
-      let rec walk e d =
-        match str_assoc_opt name e.vars with
-        | Some cell ->
-          cache.depth <- d;
-          cell := v;
-          true
-        | None -> ( match e.parent with Some p -> walk p (d + 1) | None -> false)
-      in
-      if not (walk env 0) then (
+      match assign_site env name with
+      | AssignCell (cell, d) ->
+        cache.depth <- d;
+        cell := v
+      | AssignGlobal g -> bind g name v
+      | AssignLocal ->
         cache.depth <- 0;
-        bind env name v)
+        bind env name v
     in
     match nth_parent env cache.depth with
     | Some target -> (
@@ -961,7 +989,7 @@
       VClosure
         ( List.length params,
           fun argv ->
-          let call_env = new_scope env in
+          let call_env = new_fn_scope env in
           List.iter2 (fun p v -> bind call_env p v) params argv;
           let run_body () = try exec_stmt_list call_env body with Return_exc v -> v in
           if def_prefix = "" then run_body ()
@@ -1415,7 +1443,7 @@
             |]
         }
     | SFuncDecl _ | SStructDecl _ | SAbstractDecl _ | STry _ | SModuleDecl _ | SUsing _ | SImport _
-    | SBreak | SContinue
+    | SBreak | SContinue | SGlobal _
     | SMacroDecl _ | SExport _ | SMacroCall _ | SLocalTypedAssign _ ->
       failwith
         "quoting this kind of statement isn't supported (function/struct/abstract-type/module/macro \
@@ -1721,6 +1749,11 @@
       current_line := n;
       VNothing
     | SExpr e -> eval_expr env e
+    | SGlobal names ->
+      let rec decl e = if e.is_fn || e.is_global then e else match e.parent with Some p -> decl p | None -> e in
+      let d = decl env in
+      List.iter (fun n -> if not (List.mem n d.globals) then d.globals <- n :: d.globals) names;
+      VNothing
     | SBreak -> raise Break_exc
     | SContinue -> raise Continue_exc
     | SReturn None -> raise (Return_exc VNothing)
@@ -1802,7 +1835,7 @@
           let sig_ = List.map param_sig_alt params in
           let n_required, n_total = param_arity_range params in
           let impl argv =
-            let call_env = new_scope def_env in
+            let call_env = new_fn_scope def_env in
             bind_params call_env params argv;
             List.iter (bind_kwparam call_env) kwparams;
             let saved = !current_constructing_struct in
@@ -1846,7 +1879,7 @@
          neither. *)
       let def_file = !current_file in
       let tree_walk_impl argv =
-        let call_env = new_scope def_env in
+        let call_env = new_fn_scope def_env in
         bind_params call_env params argv;
         List.iter (bind_kwparam call_env) kwparams;
         let inner () = try exec_stmt_list call_env body with Return_exc v -> v in
@@ -2035,7 +2068,7 @@
       let saved = !current_module_prefix in
       let prefix = saved ^ name ^ "." in
       current_module_prefix := prefix;
-      let scope = new_scope env in
+      let scope = { (new_scope env) with is_global = true } in
       ignore (exec_stmt_list scope body);
       current_module_prefix := saved;
       List.iter (fun (n, cell) -> Hashtbl.replace module_values (prefix ^ n) !cell) scope.vars;

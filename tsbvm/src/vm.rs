@@ -442,15 +442,47 @@ pub fn show_elem(v: &Value) -> String {
 pub struct Scope {
     vars: Vec<(u32, Value)>,
     parent: Option<Rc<RefCell<Scope>>>,
+    /// a function/lambda call's own scope
+    is_fn: bool,
+    /// the top level, or a module body
+    is_global: bool,
+    /// names a `global` declaration in this scope made global
+    globals: Vec<u32>,
 }
 
 impl Scope {
     fn root() -> Rc<RefCell<Scope>> {
-        Rc::new(RefCell::new(Scope { vars: Vec::new(), parent: None }))
+        Rc::new(RefCell::new(Scope {
+            vars: Vec::new(),
+            parent: None,
+            is_fn: false,
+            is_global: true,
+            globals: Vec::new(),
+        }))
     }
 
     fn child(parent: &Rc<RefCell<Scope>>) -> Rc<RefCell<Scope>> {
-        Rc::new(RefCell::new(Scope { vars: Vec::new(), parent: Some(parent.clone()) }))
+        Rc::new(RefCell::new(Scope {
+            vars: Vec::new(),
+            parent: Some(parent.clone()),
+            is_fn: false,
+            is_global: false,
+            globals: Vec::new(),
+        }))
+    }
+
+    /// the scope a call to a function (or a lambda) runs in
+    fn fn_child(parent: &Rc<RefCell<Scope>>) -> Rc<RefCell<Scope>> {
+        let s = Scope::child(parent);
+        s.borrow_mut().is_fn = true;
+        s
+    }
+
+    /// the scope of a `module M ... end` body
+    fn module_child(parent: &Rc<RefCell<Scope>>) -> Rc<RefCell<Scope>> {
+        let s = Scope::child(parent);
+        s.borrow_mut().is_global = true;
+        s
     }
 }
 
@@ -474,33 +506,102 @@ fn bound_here(env: &Rc<RefCell<Scope>>, sym: u32) -> bool {
     env.borrow().vars.iter().any(|(k, _)| *k == sym)
 }
 
-/// Assignment: overwrite wherever the name already lives, else make it here.
-/// The same rule as the OCaml side's `assign`.
-fn assign(env: &Rc<RefCell<Scope>>, sym: u32, v: Value) {
-    {
-        let mut s = env.borrow_mut();
-        for (k, slot) in s.vars.iter_mut().rev() {
-            if *k == sym {
-                *slot = v;
-                return;
-            }
-        }
-        let parent = s.parent.clone();
-        match parent {
-            None => {
-                s.vars.push((sym, v));
-                return;
-            }
-            Some(p) => {
-                drop(s);
-                if lookup(&p, sym).is_some() {
-                    assign(&p, sym, v);
-                } else {
-                    env.borrow_mut().vars.push((sym, v));
+/// The scope an assignment to `sym`, written in `env`, writes into; None
+/// means "make a local here". Walking up from env: a name a `global`
+/// declaration made global goes to the nearest global scope; a name bound in
+/// a scope is overwritten there -- except a binding at a global scope the walk
+/// reached by passing through a function. From inside a function a global is
+/// only a global to READ (Julia): the walk goes on as if it were not there,
+/// and the assignment makes a local. The same rule as the OCaml side's
+/// `assign_site`.
+fn assign_target(env: &Rc<RefCell<Scope>>, sym: u32) -> Option<Rc<RefCell<Scope>>> {
+    let mut crossed_fn = false;
+    let mut cur = env.clone();
+    loop {
+        let next = {
+            let s = cur.borrow();
+            let visible = !(s.is_global && crossed_fn);
+            if visible {
+                if s.globals.contains(&sym) {
+                    drop(s);
+                    return Some(nearest_global(&cur));
                 }
-                return;
+                if s.vars.iter().any(|(k, _)| *k == sym) {
+                    drop(s);
+                    return Some(cur);
+                }
             }
+            if s.is_fn {
+                crossed_fn = true;
+            }
+            s.parent.clone()
+        };
+        match next {
+            Some(p) => cur = p,
+            None => return None,
         }
+    }
+}
+
+fn nearest_global(env: &Rc<RefCell<Scope>>) -> Rc<RefCell<Scope>> {
+    let mut cur = env.clone();
+    loop {
+        let next = {
+            let s = cur.borrow();
+            if s.is_global {
+                None
+            } else {
+                s.parent.clone()
+            }
+        };
+        match next {
+            Some(p) => cur = p,
+            None => return cur,
+        }
+    }
+}
+
+/// Overwrite `sym` in exactly this scope, or add it.
+fn set_here(scope: &Rc<RefCell<Scope>>, sym: u32, v: Value) {
+    let mut s = scope.borrow_mut();
+    for (k, slot) in s.vars.iter_mut().rev() {
+        if *k == sym {
+            *slot = v;
+            return;
+        }
+    }
+    s.vars.push((sym, v));
+}
+
+/// Assignment. The same rule as the OCaml side's `assign`.
+fn assign(env: &Rc<RefCell<Scope>>, sym: u32, v: Value) {
+    match assign_target(env, sym) {
+        Some(t) => set_here(&t, sym, v),
+        None => bind(env, sym, v),
+    }
+}
+
+/// `global x`: from here, in this function (or at the top level), assignments
+/// to x go to the global one.
+fn declare_global(env: &Rc<RefCell<Scope>>, sym: u32) {
+    let mut cur = env.clone();
+    loop {
+        let next = {
+            let s = cur.borrow();
+            if s.is_fn || s.is_global {
+                None
+            } else {
+                s.parent.clone()
+            }
+        };
+        match next {
+            Some(p) => cur = p,
+            None => break,
+        }
+    }
+    let mut s = cur.borrow_mut();
+    if !s.globals.contains(&sym) {
+        s.globals.push(sym);
     }
 }
 
@@ -1294,7 +1395,7 @@ impl Vm {
                 m.def_file.clone(),
             )
         };
-        let scope = Scope::child(&def_env);
+        let scope = Scope::fn_child(&def_env);
         let given = self.bind_args(&params, slurp, args, &scope);
         if given < params.len() {
             self.bind_defaults(&params, &defaults, given, &scope)?;
@@ -1999,7 +2100,7 @@ impl Vm {
                         return self.call(&name, args, &env);
                     }
                 }
-                let scope = Scope::child(&c.env);
+                let scope = Scope::fn_child(&c.env);
                 for (k, v) in c.params.iter().zip(args) {
                     bind(&scope, *k, v);
                 }
@@ -2098,7 +2199,7 @@ impl Vm {
                 m.def_file.clone(),
             )
         };
-        let scope = Scope::child(&def_env);
+        let scope = Scope::fn_child(&def_env);
         let given = self.bind_args(&params, slurp, args, &scope);
         if given < params.len() {
             self.bind_defaults(&params, &defaults, given, &scope)?;
@@ -2254,6 +2355,10 @@ impl Vm {
                 Instr::Store(s, _) => {
                     let v = stack.last().ok_or("vm: Store with an empty stack")?.clone();
                     assign(env, *s, v);
+                    pc += 1;
+                }
+                Instr::Global(s) => {
+                    declare_global(env, *s);
                     pc += 1;
                 }
                 Instr::StorePlain(s) => {
@@ -2504,7 +2609,7 @@ impl Vm {
                 Instr::ModuleEnter(s) => {
                     self.outer_prefixes.push(self.prefix.clone());
                     self.prefix = format!("{}{}.", self.prefix, self.sym(*s));
-                    *env = Scope::child(env);
+                    *env = Scope::module_child(env);
                     pc += 1;
                 }
                 Instr::ModuleLeave => {
@@ -3225,7 +3330,7 @@ fn kind_of(i: &Instr) -> &'static str {
     use Instr::*;
     match i {
         Const(..) => "Const", Nothing => "Nothing", Load(..) => "Load", Store(..) => "Store",
-        StorePlain(..) => "StorePlain", Pop => "Pop", Binop(..) => "Binop", Call(..) => "Call",
+        StorePlain(..) => "StorePlain", Global(..) => "Global", Pop => "Pop", Binop(..) => "Binop", Call(..) => "Call",
         CallKw(..) => "CallKw", Qcall(..) => "Qcall", Apply(..) => "Apply",
         CallSplat(..) => "CallSplat", ApplySplat(..) => "ApplySplat",
         ApplyMethod(..) => "ApplyMethod", Jump(..) => "Jump", JumpIfFalse(..) => "JumpIfFalse",
@@ -3250,7 +3355,7 @@ fn kind_of(i: &Instr) -> &'static str {
 fn unsupported_kind(i: &Instr) -> Option<&'static str> {
     use Instr::*;
     Some(match i {
-        Const(..) | Nothing | Load(..) | Store(..) | StorePlain(..) | Bind(..) | Pop
+        Const(..) | Nothing | Load(..) | Store(..) | StorePlain(..) | Global(..) | Bind(..) | Pop
         | Binop(..) | Call(..) | Jump(..) | JumpIfFalse(..) | Println(..) | Print(..) | Enter
         | Leave | Line(..) | File(..) | Defun(..) | Ret | Makearr(..) | Maketuple(..)
         | Makedict(..) | Pair | Symbol(..) | Identical(..) | Defstruct(..) | Defabstract(..)
