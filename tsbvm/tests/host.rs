@@ -56,6 +56,18 @@ fn fs_env_and_json_capabilities() {
 }
 
 #[test]
+fn fs_files_lists_every_file_below_sorted_and_skips_empty_dirs() {
+    let dir = temp_dir("files");
+    let o = run("host_files", &[("HOST_TEST_DIR", dir.to_str().unwrap())]);
+    assert!(o.status.success(), "stderr: {}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(
+        stdout(&o),
+        "/t/a.txt\n/t/b.txt\n/t/sub/c.ex\n/t/sub/deeper/d.ex\nmissing dir is an error: yes\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn exit_ends_the_program_with_that_code_and_cannot_be_caught() {
     let o = run("host_exit", &[]);
     assert_eq!(o.status.code(), Some(3));

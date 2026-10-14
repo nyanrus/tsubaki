@@ -10,6 +10,8 @@
 //!
 //!   env.get(name, default)            string | default
 //!   fs.dirs(path)                     [string]   sub-directories, sorted
+//!   fs.files(path)                    [string]   every file below it, as
+//!                                                path + "/" + relative; sorted
 //!   fs.exists(path)                   bool
 //!   fs.read(path)                     string
 //!   fs.write(path, text)              nothing
@@ -72,6 +74,14 @@ impl Host for StdHost {
                 }
                 names.sort();
                 let quoted: Vec<String> = names.iter().map(|n| json::quote(n)).collect();
+                Ok(format!("[{}]", quoted.join(",")))
+            }
+            "fs.files" => {
+                let path = text(&args, 0, "path")?;
+                let mut found = Vec::new();
+                walk(Path::new(&path), &mut found).or_else(|e| fail(format!("walk {path}: {e}")))?;
+                found.sort();
+                let quoted: Vec<String> = found.iter().map(|n| json::quote(n)).collect();
                 Ok(format!("[{}]", quoted.join(",")))
             }
             "fs.exists" => {
@@ -143,6 +153,22 @@ impl Host for StdHost {
             other => fail(format!("no such capability: {other}")),
         }
     }
+}
+
+/// Every regular file below `dir`, depth first. A symlink to a directory is
+/// not followed (a loop would never end), but a symlink to a file is listed.
+fn walk(dir: &Path, out: &mut Vec<String>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            walk(&path, out)?;
+        } else {
+            out.push(path.to_string_lossy().into_owned());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "http")]
